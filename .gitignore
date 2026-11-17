@@ -1,0 +1,11 @@
+# OS metadata
+.DS_Store
+Thumbs.db
+
+# Test artifacts
+*.test
+bridge_test.exe
+
+# Build temp
+*.tmp
+*.log
