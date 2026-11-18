@@ -254,14 +254,17 @@ func (ps *PrintService) processJob(job PrintJob) {
 			strings.ReplaceAll(job.FilePath, `'`, `''`),
 		)
 		cmd := exec.CommandContext(ctx, "powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", psScript)
+		hideCmd(cmd)
 		out, err = cmd.CombinedOutput()
 		if err != nil && ps.sumatraPath != "" && fileExists(ps.sumatraPath) {
 			log.Printf("[Printer] ReachFramework XPS spool failed (%v), falling back to SumatraPDF...", err)
 			cmd = exec.CommandContext(ctx, ps.sumatraPath, "-print-to", targetPrinter, "-silent", job.FilePath)
+			hideCmd(cmd)
 			out, err = cmd.CombinedOutput()
 		}
 	} else if ps.sumatraPath != "" && fileExists(ps.sumatraPath) {
 		cmd := exec.CommandContext(ctx, ps.sumatraPath, "-print-to", targetPrinter, "-silent", job.FilePath)
+		hideCmd(cmd)
 		out, err = cmd.CombinedOutput()
 	} else {
 		// Fallback: Attempt printing via PowerShell / Windows shell PrintTo
@@ -270,8 +273,9 @@ func (ps *PrintService) processJob(job PrintJob) {
 			`$p = Start-Process -FilePath '%s' -Verb PrintTo -ArgumentList '"%s"' -PassThru; Start-Sleep -Seconds 4; if ($p -and -not $p.HasExited) { $p.Kill() }`,
 			strings.ReplaceAll(job.FilePath, `'`, `''`),
 			strings.ReplaceAll(targetPrinter, `'`, `''`),
-		)
+			)
 		cmd := exec.CommandContext(ctx, "powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", psScript)
+		hideCmd(cmd)
 		out, err = cmd.CombinedOutput()
 	}
 

@@ -8,12 +8,15 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 )
 
 // IsElevated stub.
 func IsElevated() bool {
 	return true
 }
+
+func hideCmd(cmd *exec.Cmd) {}
 
 // SelfElevate stub.
 func SelfElevate(args []string) error {
@@ -113,3 +116,52 @@ func RegisterInteractiveStartup() error {
 
 // UnregisterInteractiveStartup stub.
 func UnregisterInteractiveStartup() {}
+
+var (
+	mockInteractiveHeld bool
+	mockServiceHeld     bool
+	mockMu              sync.Mutex
+)
+
+// AcquireInteractiveLock stub with simulated state tracking for testing.
+func AcquireInteractiveLock() bool {
+	mockMu.Lock()
+	defer mockMu.Unlock()
+	if mockInteractiveHeld {
+		BringDashboardToFront()
+		return false
+	}
+	mockInteractiveHeld = true
+	return true
+}
+
+// ReleaseInteractiveLock stub.
+func ReleaseInteractiveLock() {
+	mockMu.Lock()
+	defer mockMu.Unlock()
+	mockInteractiveHeld = false
+}
+
+// BringDashboardToFront stub.
+func BringDashboardToFront() {}
+
+// SetDashboardConsoleTitle stub.
+func SetDashboardConsoleTitle(title string) {}
+
+// AcquireServiceLock stub with simulated state tracking for testing.
+func AcquireServiceLock() bool {
+	mockMu.Lock()
+	defer mockMu.Unlock()
+	if mockServiceHeld {
+		return false
+	}
+	mockServiceHeld = true
+	return true
+}
+
+// ReleaseServiceLock stub.
+func ReleaseServiceLock() {
+	mockMu.Lock()
+	defer mockMu.Unlock()
+	mockServiceHeld = false
+}

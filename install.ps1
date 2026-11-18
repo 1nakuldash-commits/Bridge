@@ -243,24 +243,23 @@ Write-Host "`n[5/5] Registering Interactive Startup, Virtual Printer & Shortcuts
 # Remove legacy Session 0 scheduled task so it won't block Session 1 tray icon
 Unregister-ScheduledTask -TaskName "BridgeSystemService" -Confirm:$false -ErrorAction SilentlyContinue | Out-Null
 
-# Register HKCU and HKLM Run keys for Session 1 startup
-Set-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" -Name "BridgeApp" -Value "C:\BridgeApp\bridge.exe" -Force
-Set-ItemProperty -Path "HKLM:\Software\Microsoft\Windows\CurrentVersion\Run" -Name "BridgeApp" -Value "C:\BridgeApp\bridge.exe" -Force -ErrorAction SilentlyContinue
-
-# Register User and Common Startup folder shortcuts
-$wscript = New-Object -ComObject WScript.Shell
-$startupDirs = @(
+# Clean up legacy duplicate startup registrations (HKLM, User Startup, Common Startup)
+Remove-ItemProperty -Path "HKLM:\Software\Microsoft\Windows\CurrentVersion\Run" -Name "BridgeApp" -ErrorAction SilentlyContinue | Out-Null
+Remove-ItemProperty -Path "HKLM:\Software\Microsoft\Windows\CurrentVersion\Run" -Name "Bridge" -ErrorAction SilentlyContinue | Out-Null
+Remove-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" -Name "BridgeApp" -ErrorAction SilentlyContinue | Out-Null
+Remove-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" -Name "Bridge" -ErrorAction SilentlyContinue | Out-Null
+$legacyStartupDirs = @(
     (Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs\Startup"),
     "C:\ProgramData\Microsoft\Windows\Start Menu\Programs\Startup"
 )
-foreach ($sd in $startupDirs) {
+foreach ($sd in $legacyStartupDirs) {
     if (Test-Path $sd) {
-        $startLnk = $wscript.CreateShortcut((Join-Path $sd "BridgeApp.lnk"))
-        $startLnk.TargetPath = "C:\BridgeApp\bridge.exe"
-        $startLnk.Description = "Bridge System Tray & Sync"
-        $startLnk.Save()
+        Get-ChildItem $sd -Filter "*bridge*.lnk" -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue | Out-Null
     }
 }
+
+# Register ONLY HKCU Run key with -autostart flag for clean Session 1 tray startup
+Set-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" -Name "BridgeApp" -Value '"C:\BridgeApp\bridge.exe" -autostart' -Force
 
 # Register Windows Virtual Printer for Ctrl+P Native Printing
 $portName = 'Bridge_Port_9101'
@@ -318,10 +317,9 @@ if ($existingDefault -and -not ($existingDefault -like "Print on *")) {
         (New-Object -ComObject WScript.Network).SetDefaultPrinter($printerName)
     }
 }
-    }
-}
 
 # Create Desktop Shortcuts (Public, User, and OneDrive) - ONLY ONE shared folder shortcut
+$wscript = New-Object -ComObject WScript.Shell
 $desktopDirs = @([Environment]::GetFolderPath("Desktop"), "C:\Users\Public\Desktop")
 if ($env:USERPROFILE) {
     $desktopDirs += (Join-Path $env:USERPROFILE "OneDrive\Desktop")
@@ -335,13 +333,13 @@ $desktopDirs = $desktopDirs | Select-Object -Unique
 foreach ($d in $desktopDirs) {
     if (Test-Path $d) {
         # Remove legacy shortcuts and any drop-to-print shortcuts
-        Remove-Item (Join-Path $d "Bridge Shared Folder.lnk") -ErrorAction SilentlyContinue
         Remove-Item (Join-Path $d "Bridge Print Folder.lnk") -ErrorAction SilentlyContinue
         Get-ChildItem $d -Filter "* - Drop to Print.lnk" -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+        Get-ChildItem $d -Filter "* - Shared Folder.lnk" -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
 
-        $s1 = $wscript.CreateShortcut((Join-Path $d "$PeerName - Shared Folder.lnk"))
+        $s1 = $wscript.CreateShortcut((Join-Path $d "Bridge Shared Folder.lnk"))
         $s1.TargetPath = "C:\Bridge\Shared"
-        $s1.Description = "Bridge Two-Way Shared Folder with $PeerName"
+        $s1.Description = "Bridge Multi-Device Two-Way Shared Folder (Global Mesh)"
         $s1.Save()
     }
 }
@@ -351,17 +349,17 @@ $sendToDir = Join-Path $env:APPDATA "Microsoft\Windows\SendTo"
 if (Test-Path $sendToDir) {
     $sendToShortcut = $wscript.CreateShortcut((Join-Path $sendToDir "Print on $PeerName.lnk"))
     $sendToShortcut.TargetPath = "C:\BridgeApp\bridge.exe"
-    $sendToShortcut.Arguments = "-send-print"
+    $sendToShortcut.Arguments = "-send-print -target `"$PeerName`""
     $sendToShortcut.Description = "Send file to print on $PeerName"
     $sendToShortcut.Save()
 }
 
-Write-Host "Dynamic Desktop shortcut created ('$PeerName - Shared Folder')." -ForegroundColor Green
+Write-Host "Canonical Desktop shortcut created ('Bridge Shared Folder')." -ForegroundColor Green
 Write-Host "Direct Printing ready: Select 'Print on $PeerName' in any print dialog (Ctrl+P)." -ForegroundColor Green
 Write-Host "SendTo right-click shortcut created ('Print on $PeerName')." -ForegroundColor Green
 
-# Launch bridge.exe in current interactive session (Session 1)
-Start-Process "C:\BridgeApp\bridge.exe"
+# Launch bridge.exe in current interactive session with tray icon (Session 1)
+Start-Process "C:\BridgeApp\bridge.exe" -ArgumentList "-autostart"
 
 # 6. Post-Install Verification Report
 Start-Sleep -Seconds 2

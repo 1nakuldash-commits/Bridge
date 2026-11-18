@@ -4,6 +4,7 @@ package tray
 
 import (
 	"fmt"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"syscall"
@@ -21,6 +22,7 @@ var (
 
 	procGetConsoleWindow      = kernel32.NewProc("GetConsoleWindow")
 	procGetConsoleProcessList = kernel32.NewProc("GetConsoleProcessList")
+	procFreeConsole           = kernel32.NewProc("FreeConsole")
 	procShowWindow            = user32.NewProc("ShowWindow")
 
 	procRegisterClassExW       = user32.NewProc("RegisterClassExW")
@@ -44,6 +46,15 @@ var (
 	procShell_NotifyIconW      = shell32.NewProc("Shell_NotifyIconW")
 	procGetOpenFileNameW       = comdlg32.NewProc("GetOpenFileNameW")
 	procRegisterWindowMessageW = user32.NewProc("RegisterWindowMessageW")
+	procGetSystemMetrics       = user32.NewProc("GetSystemMetrics")
+
+	procOpenClipboard    = user32.NewProc("OpenClipboard")
+	procCloseClipboard   = user32.NewProc("CloseClipboard")
+	procEmptyClipboard   = user32.NewProc("EmptyClipboard")
+	procSetClipboardData = user32.NewProc("SetClipboardData")
+	procGlobalAlloc      = kernel32.NewProc("GlobalAlloc")
+	procGlobalLock       = kernel32.NewProc("GlobalLock")
+	procGlobalUnlock     = kernel32.NewProc("GlobalUnlock")
 
 	wmTaskbarCreated uint32
 )
@@ -92,6 +103,8 @@ const (
 	CmdPrintFileDefault
 	CmdStatus
 	CmdResync
+	CmdCopyIP
+	CmdOpenLogs
 	CmdExit
 	CmdPrintFilePeerBase = 2000
 )
@@ -186,9 +199,19 @@ func NewTrayManager(iconDir, nodeName, peerName string, cb TrayCallbacks) (*Tray
 }
 
 func (tm *TrayManager) loadIconHandles() {
+	// Query current system small icon metrics to scale crisply across 100%, 125%, 150%, 200% High-DPI taskbars
+	cx, _, _ := procGetSystemMetrics.Call(49) // SM_CXSMICON
+	cy, _, _ := procGetSystemMetrics.Call(50) // SM_CYSMICON
+	if cx == 0 {
+		cx = 16
+	}
+	if cy == 0 {
+		cy = 16
+	}
+
 	loadIco := func(path string) uintptr {
 		p, _ := syscall.UTF16PtrFromString(path)
-		h, _, _ := procLoadImageW.Call(0, uintptr(unsafe.Pointer(p)), IMAGE_ICON, 16, 16, LR_LOADFROMFILE)
+		h, _, _ := procLoadImageW.Call(0, uintptr(unsafe.Pointer(p)), IMAGE_ICON, cx, cy, LR_LOADFROMFILE)
 		return h
 	}
 
@@ -371,22 +394,26 @@ func (tm *TrayManager) UpdateNetworkStatus(nodeName string, peers []config.PeerD
 	if total == 0 {
 		tip = fmt.Sprintf("Bridge: %s (Waiting for peers to connect)", nodeName)
 		state = StateOffline
-	} else if onlineCount == total {
-		state = StateConnected
-		tip = fmt.Sprintf("Bridge: %s (All %d devices online & ready)", nodeName, total)
 	} else if onlineCount > 0 {
-		state = StateSyncing // Yellow dot: partial mesh or sync active
-		tip = fmt.Sprintf("Bridge: %s (%d/%d devices online)", nodeName, onlineCount, total)
+		state = StateConnected
+		if onlineCount == total {
+			tip = fmt.Sprintf("Bridge: %s (All %d devices online & ready)", nodeName, total)
+		} else {
+			tip = fmt.Sprintf("Bridge: %s (%d/%d devices online)", nodeName, onlineCount, total)
+		}
 	} else {
 		state = StateOffline
 		tip = fmt.Sprintf("Bridge: %s (All %d peer devices offline)", nodeName, total)
 	}
 
+	// Avoid Windows taskbar re-render flickering: Only update if state or tip changed!
 	if !tm.stopped && tm.hwnd != 0 {
-		tm.currentState = state
-		tm.currentTip = tip
-		nid := tm.buildNotifyData(state, tip)
-		procShell_NotifyIconW.Call(NIM_MODIFY, uintptr(unsafe.Pointer(&nid)))
+		if tm.currentState != state || tm.currentTip != tip {
+			tm.currentState = state
+			tm.currentTip = tip
+			nid := tm.buildNotifyData(state, tip)
+			procShell_NotifyIconW.Call(NIM_MODIFY, uintptr(unsafe.Pointer(&nid)))
+		}
 	}
 }
 
@@ -408,7 +435,7 @@ func trayWndProc(hwnd uintptr, msg uint32, wparam, lparam uintptr) uintptr {
 	switch msg {
 	case WM_TRAYMESSAGE:
 		switch lparam {
-		case WM_RBUTTONUP:
+		case WM_LBUTTONUP, WM_RBUTTONUP:
 			tm.showContextMenu()
 		case WM_LBUTTONDBLCLK:
 			if tm.callbacks.OnOpenShared != nil {
@@ -443,6 +470,10 @@ func trayWndProc(hwnd uintptr, msg uint32, wparam, lparam uintptr) uintptr {
 			if tm.callbacks.OnResync != nil {
 				go tm.callbacks.OnResync()
 			}
+		case cmdID == CmdCopyIP:
+			go tm.handleCopyIP()
+		case cmdID == CmdOpenLogs:
+			go tm.handleOpenLogs()
 		case cmdID == CmdExit:
 			if tm.callbacks.OnExit != nil {
 				go tm.callbacks.OnExit()
@@ -524,9 +555,11 @@ func (tm *TrayManager) showContextMenu() {
 		}
 	}
 
-	// 4. Status, Resync, Exit
-	appendMenuItem(CmdStatus, "ℹ️  Device Network Status", MF_STRING)
+	// 4. Multi-Function Quick Actions
+	appendMenuItem(CmdCopyIP, "📋  Copy My Tailscale IP", MF_STRING)
+	appendMenuItem(CmdStatus, "📊  Device Network Status", MF_STRING)
 	appendMenuItem(CmdResync, "🔄  Sync Now", MF_STRING)
+	appendMenuItem(CmdOpenLogs, "📂  Open Service Logs", MF_STRING)
 	procAppendMenuW.Call(menu, MF_SEPARATOR, 0, 0)
 	appendMenuItem(CmdExit, "❌  Exit Bridge", MF_STRING)
 
@@ -534,6 +567,30 @@ func (tm *TrayManager) showContextMenu() {
 	procGetCursorPos.Call(uintptr(unsafe.Pointer(&pt)))
 	procSetForegroundWindow.Call(tm.hwnd)
 	procTrackPopupMenu.Call(menu, TPM_BOTTOMALIGN|TPM_LEFTALIGN, uintptr(pt.X), uintptr(pt.Y), 0, tm.hwnd, 0)
+}
+
+func (tm *TrayManager) handleCopyIP() {
+	ip := ""
+	if tm.callbacks.OnCopyIP != nil {
+		ip = tm.callbacks.OnCopyIP()
+	}
+	if ip == "" {
+		tm.ShowBalloon("Tailscale IP", "Tailscale IP is not yet connected or available.")
+		return
+	}
+	if err := SetClipboardText(ip); err == nil {
+		tm.ShowBalloon("IP Copied", fmt.Sprintf("Copied %s to clipboard!", ip))
+	} else {
+		tm.ShowBalloon("Tailscale IP", fmt.Sprintf("Local IP: %s", ip))
+	}
+}
+
+func (tm *TrayManager) handleOpenLogs() {
+	if tm.callbacks.OnOpenLogs != nil {
+		tm.callbacks.OnOpenLogs()
+	} else {
+		_ = exec.Command("explorer.exe", `C:\Bridge\Logs`).Start()
+	}
 }
 
 func (tm *TrayManager) handlePrintFileDialog(targetPeer string) {
@@ -591,16 +648,18 @@ func OpenFilePicker(title string) (string, error) {
 	return syscall.UTF16ToString(fileBuf), nil
 }
 
+// HideConsole unconditionally hides and detaches any console window for background execution.
+func HideConsole() {
+	hwnd, _, _ := procGetConsoleWindow.Call()
+	if hwnd != 0 {
+		procShowWindow.Call(hwnd, 0) // SW_HIDE
+	}
+	procFreeConsole.Call()
+}
+
 // HideConsoleIfDedicated hides the console window if this process was spawned in a dedicated console.
 func HideConsoleIfDedicated() {
-	var pids [2]uint32
-	r, _, _ := procGetConsoleProcessList.Call(uintptr(unsafe.Pointer(&pids[0])), 2)
-	if r == 1 {
-		hwnd, _, _ := procGetConsoleWindow.Call()
-		if hwnd != 0 {
-			procShowWindow.Call(hwnd, 0) // SW_HIDE
-		}
-	}
+	HideConsole()
 }
 
 // FlashComplete changes dot to blue, shows a balloon notification, and reverts to green.
@@ -616,4 +675,35 @@ func (tm *TrayManager) FlashComplete(title, message string) {
 		tm.mu.Unlock()
 		tm.UpdateNetworkStatus(nodeName, peers)
 	}()
+}
+
+// SetClipboardText places plain unicode text onto the Windows system clipboard.
+func SetClipboardText(text string) error {
+	text16, err := syscall.UTF16FromString(text)
+	if err != nil {
+		return err
+	}
+	r, _, _ := procOpenClipboard.Call(0)
+	if r == 0 {
+		return fmt.Errorf("failed to open clipboard")
+	}
+	defer procCloseClipboard.Call()
+
+	procEmptyClipboard.Call()
+
+	cb := len(text16) * 2
+	hMem, _, _ := procGlobalAlloc.Call(0x0002 /* GMEM_MOVEABLE */, uintptr(cb))
+	if hMem == 0 {
+		return fmt.Errorf("global memory allocation failed")
+	}
+
+	ptr, _, _ := procGlobalLock.Call(hMem)
+	if ptr == 0 {
+		return fmt.Errorf("global memory lock failed")
+	}
+	copy((*[1 << 30]byte)(unsafe.Pointer(ptr))[:cb], (*[1 << 30]byte)(unsafe.Pointer(&text16[0]))[:cb])
+	procGlobalUnlock.Call(hMem)
+
+	procSetClipboardData.Call(13 /* CF_UNICODETEXT */, hMem)
+	return nil
 }

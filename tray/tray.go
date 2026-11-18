@@ -24,6 +24,8 @@ type TrayCallbacks struct {
 	OnPrintFileToPeer  func(peerName string, filePath string)
 	OnShowStatus       func() string
 	OnResync           func()
+	OnCopyIP           func() string
+	OnOpenLogs         func()
 	OnExit             func()
 }
 

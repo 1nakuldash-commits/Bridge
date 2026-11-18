@@ -9,6 +9,7 @@ import (
 	"log"
 	"os/exec"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 	"unsafe"
@@ -85,14 +86,42 @@ func hasPhysicalPrinter(printers []WindowsPrinter) bool {
 	return false
 }
 
+var (
+	cachedPrinters   []WindowsPrinter
+	lastPrinterQuery time.Time
+	printerQueryMu   sync.Mutex
+)
+
+// hideCmd configures Windows subprocess execution to be completely invisible.
+func hideCmd(cmd *exec.Cmd) {
+	if cmd != nil {
+		cmd.SysProcAttr = &syscall.SysProcAttr{
+			HideWindow:    true,
+			CreationFlags: 0x08000000, // CREATE_NO_WINDOW
+		}
+	}
+}
+
 func queryWindowsPrinters() ([]WindowsPrinter, error) {
+	printerQueryMu.Lock()
+	defer printerQueryMu.Unlock()
+
+	// 15-second debounce cache prevents repeated registry/CIM queries on rapid health checks
+	if len(cachedPrinters) > 0 && time.Since(lastPrinterQuery) < 15*time.Second {
+		return cachedPrinters, nil
+	}
+
 	printers, err := queryPrintersFromRegistry()
-	if err == nil && hasPhysicalPrinter(printers) {
+	if err == nil && len(printers) > 0 {
+		cachedPrinters = printers
+		lastPrinterQuery = time.Now()
 		return printers, nil
 	}
 
 	cimPrinters, cimErr := queryPrintersFromCim()
 	if cimErr == nil && len(cimPrinters) > 0 {
+		cachedPrinters = cimPrinters
+		lastPrinterQuery = time.Now()
 		return cimPrinters, nil
 	}
 
@@ -136,6 +165,7 @@ func queryPrintersFromCim() ([]WindowsPrinter, error) {
 
 	cmd := exec.CommandContext(ctx, "powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
 		"-Command", "@(Get-CimInstance Win32_Printer -ErrorAction SilentlyContinue | Select-Object Name, PortName, Default) | ConvertTo-Json -Compress")
+	hideCmd(cmd)
 	out, err := cmd.Output()
 	if err != nil {
 		return nil, err

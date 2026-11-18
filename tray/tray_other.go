@@ -61,5 +61,8 @@ func OpenFilePicker(title string) (string, error) {
 	return "", nil
 }
 
+// HideConsole stub.
+func HideConsole() {}
+
 // HideConsoleIfDedicated stub.
 func HideConsoleIfDedicated() {}

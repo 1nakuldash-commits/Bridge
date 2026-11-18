@@ -8,11 +8,38 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
+	"unsafe"
 
 	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/registry"
 )
+
+var (
+	kernel32DLL = syscall.NewLazyDLL("kernel32.dll")
+	user32DLL   = syscall.NewLazyDLL("user32.dll")
+
+	procFindWindowW         = user32DLL.NewProc("FindWindowW")
+	procShowWindow          = user32DLL.NewProc("ShowWindow")
+	procSetForegroundWindow = user32DLL.NewProc("SetForegroundWindow")
+	procSetConsoleTitleW    = kernel32DLL.NewProc("SetConsoleTitleW")
+	procEnumWindows         = user32DLL.NewProc("EnumWindows")
+	procGetWindowTextW      = user32DLL.NewProc("GetWindowTextW")
+
+	interactiveMutex windows.Handle
+	serviceMutex     windows.Handle
+)
+
+// hideCmd configures the command to run completely invisibly without spawning a console window.
+func hideCmd(cmd *exec.Cmd) {
+	if cmd != nil {
+		cmd.SysProcAttr = &syscall.SysProcAttr{
+			HideWindow:    true,
+			CreationFlags: 0x08000000, // CREATE_NO_WINDOW
+		}
+	}
+}
 
 // IsElevated checks whether current process has administrative privileges.
 func IsElevated() bool {
@@ -84,6 +111,7 @@ func FindTailscale() string {
 func InstallTailscale() (string, error) {
 	fmt.Println("[*] Downloading and installing Tailscale silently via winget...")
 	cmd := exec.Command("winget", "install", "-e", "--id", "Tailscale.Tailscale", "--accept-package-agreements", "--accept-source-agreements", "--silent")
+	hideCmd(cmd)
 	out, err := cmd.CombinedOutput()
 	if err == nil {
 		for i := 0; i < 15; i++ {
@@ -104,6 +132,7 @@ Start-Process -FilePath $installer -ArgumentList "/quiet" -Wait
 Remove-Item $installer -Force -ErrorAction SilentlyContinue
 `
 	dlCmd := exec.Command("powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", psCmd)
+	hideCmd(dlCmd)
 	_ = dlCmd.Run()
 
 	for i := 0; i < 15; i++ {
@@ -144,6 +173,7 @@ func GetTailscaleIP() string {
 		return ""
 	}
 	cmd := exec.Command(bin, "ip", "-4")
+	hideCmd(cmd)
 	out, err := cmd.Output()
 	if err != nil {
 		return ""
@@ -182,6 +212,7 @@ func FindSumatraPDF() string {
 func InstallSumatraPDF() (string, error) {
 	fmt.Println("[*] Installing SumatraPDF silently via winget...")
 	cmd := exec.Command("winget", "install", "-e", "--id", "SumatraPDF.SumatraPDF", "--accept-package-agreements", "--accept-source-agreements", "--silent")
+	hideCmd(cmd)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return "", fmt.Errorf("winget install SumatraPDF failed: %w (%s)", err, string(out))
@@ -213,14 +244,14 @@ func GetAllDesktopDirs() []string {
 		}
 	}
 
-	// 1. Public Desktop
-	addDir(`C:\Users\Public\Desktop`)
-
-	// 2. Current user's desktop and OneDrive desktop
+	// 1. Current user's desktop and OneDrive desktop
 	if u := os.Getenv("USERPROFILE"); u != "" {
 		addDir(filepath.Join(u, "Desktop"))
 		addDir(filepath.Join(u, "OneDrive", "Desktop"))
 	}
+
+	// 2. Public Desktop
+	addDir(`C:\Users\Public\Desktop`)
 
 	// 3. User Shell Folders registry key
 	k, err := registry.OpenKey(registry.CURRENT_USER, `Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders`, registry.QUERY_VALUE)
@@ -267,6 +298,11 @@ func escapeVBS(s string) string {
 
 // CreateDesktopShortcut creates a Windows .lnk shortcut using VBScript.
 func CreateDesktopShortcut(targetPath, lnkPath, description, arguments string) error {
+	// Fast-path: If shortcut already exists on disk, avoid spawning wscript
+	if fi, err := os.Stat(lnkPath); err == nil && fi.Size() > 0 {
+		return nil
+	}
+
 	vbsContent := fmt.Sprintf(`Set oWS = WScript.CreateObject("WScript.Shell")
 Set oLink = oWS.CreateShortcut("%s")
 oLink.TargetPath = "%s"
@@ -281,7 +317,8 @@ oLink.Save
 	}
 	defer os.Remove(tmpVbs)
 
-	cmd := exec.Command("cscript", "//nologo", tmpVbs)
+	cmd := exec.Command("wscript", "//B", "//nologo", tmpVbs)
+	hideCmd(cmd)
 	return cmd.Run()
 }
 
@@ -295,10 +332,27 @@ func InstallVirtualPrinter(peerName string, port int) error {
 	printerName := fmt.Sprintf("Print on %s", cleanPeer)
 	portName := fmt.Sprintf("Bridge_Port_%d", port)
 
+	// In-Process Fast Registry Check (0 subprocesses, <1ms):
+	// Check if printer already exists in Windows Registry with matching port.
+	k, err := registry.OpenKey(registry.LOCAL_MACHINE, `SOFTWARE\Microsoft\Windows NT\CurrentVersion\Print\Printers\`+printerName, registry.QUERY_VALUE)
+	if err == nil {
+		defer k.Close()
+		portVal, _, err := k.GetStringValue("Port")
+		if err == nil && strings.EqualFold(strings.TrimSpace(portVal), portName) {
+			return nil // Already installed and configured properly!
+		}
+	}
+
 	psScript := fmt.Sprintf(`
 $portName = '%s'
 $portNumber = %d
 $printerName = '%s'
+
+# Fast-path idempotency: If virtual printer and port already exist, return immediately without changes
+$existing = Get-Printer -Name $printerName -ErrorAction SilentlyContinue
+if ($existing -and ($existing.PortName -eq $portName)) {
+    exit 0
+}
 
 # 1. Protect Windows default printer mode
 Set-ItemProperty "HKCU:\Software\Microsoft\Windows NT\CurrentVersion\Windows" -Name "LegacyDefaultPrinterMode" -Value 1 -Type DWord -ErrorAction SilentlyContinue
@@ -381,6 +435,7 @@ if ($isPhysicalDefault) {
 `, portName, port, printerName)
 
 	cmd := exec.Command("powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", psScript)
+	hideCmd(cmd)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("virtual printer setup failed for %s on port %d: %w (%s)", printerName, port, err, strings.TrimSpace(string(out)))
@@ -400,6 +455,7 @@ Get-PrinterPort -ErrorAction SilentlyContinue | Where-Object {
 } | Remove-PrinterPort -ErrorAction SilentlyContinue
 `
 	cmd := exec.Command("powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", psScript)
+	hideCmd(cmd)
 	return cmd.Run()
 }
 
@@ -408,57 +464,164 @@ Get-PrinterPort -ErrorAction SilentlyContinue | Where-Object {
 func KillOtherBridgeProcesses() {
 	currPid := os.Getpid()
 	filter := fmt.Sprintf("PID ne %d", currPid)
-	_ = exec.Command("taskkill", "/F", "/FI", filter, "/IM", "bridge.exe").Run()
+	cmd := exec.Command("taskkill", "/F", "/FI", filter, "/IM", "bridge.exe")
+	hideCmd(cmd)
+	_ = cmd.Run()
 }
 
-// RegisterInteractiveStartup ensures bridge.exe starts in Session 1 at user logon.
+// AcquireInteractiveLock attempts to acquire a named mutex ensuring only one interactive dashboard/setup terminal runs.
+// If another instance is already running, it brings that instance's console window to the foreground and returns false.
+func AcquireInteractiveLock() bool {
+	mutexName, _ := windows.UTF16PtrFromString("Local\\BridgeApp_Interactive_Mutex")
+	h, err := windows.CreateMutex(nil, false, mutexName)
+	if err != nil {
+		return true // Fallback: allow launch if mutex creation fails
+	}
+	if windows.GetLastError() == windows.ERROR_ALREADY_EXISTS {
+		BringDashboardToFront()
+		_ = windows.CloseHandle(h)
+		return false
+	}
+	interactiveMutex = h
+	return true
+}
+
+// ReleaseInteractiveLock releases the interactive dashboard mutex.
+func ReleaseInteractiveLock() {
+	if interactiveMutex != 0 {
+		_ = windows.CloseHandle(interactiveMutex)
+		interactiveMutex = 0
+	}
+}
+
+// BringDashboardToFront finds the running dashboard console window and brings it to the foreground.
+// It uses both direct title lookup and EnumWindows fallback to locate windows across conhost, Windows Terminal, and PowerShell.
+func BringDashboardToFront() {
+	var hwnd uintptr
+
+	// 1. Exact title check
+	titlePtr, _ := windows.UTF16PtrFromString("Bridge Multi-Device Dashboard")
+	hwnd, _, _ = procFindWindowW.Call(0, uintptr(unsafe.Pointer(titlePtr)))
+
+	if hwnd == 0 {
+		setupTitlePtr, _ := windows.UTF16PtrFromString("Bridge Multi-Device Setup")
+		hwnd, _, _ = procFindWindowW.Call(0, uintptr(unsafe.Pointer(setupTitlePtr)))
+	}
+
+	// 2. Fuzzy window title match (handles Windows Terminal, PowerShell, or shells appending suffix)
+	if hwnd == 0 {
+		cb := syscall.NewCallback(func(h uintptr, lparam uintptr) uintptr {
+			var buf [512]uint16
+			r, _, _ := procGetWindowTextW.Call(h, uintptr(unsafe.Pointer(&buf[0])), 512)
+			if r > 0 {
+				title := windows.UTF16ToString(buf[:r])
+				if strings.Contains(title, "Bridge Multi-Device Dashboard") || strings.Contains(title, "Bridge Multi-Device Setup") {
+					hwnd = h
+					return 0 // Stop enumeration
+				}
+			}
+			return 1 // Continue enumeration
+		})
+		procEnumWindows.Call(cb, 0)
+	}
+
+	if hwnd != 0 {
+		procShowWindow.Call(hwnd, 9) // SW_RESTORE
+		procSetForegroundWindow.Call(hwnd)
+	}
+}
+
+// SetDashboardConsoleTitle sets the console window title so it can be located and brought to front.
+func SetDashboardConsoleTitle(title string) {
+	titlePtr, _ := windows.UTF16PtrFromString(title)
+	procSetConsoleTitleW.Call(uintptr(unsafe.Pointer(titlePtr)))
+}
+
+// AcquireServiceLock ensures only one background service runs.
+// It checks the Global namespace first, with fallback to Local namespace for unprivileged standard user accounts.
+func AcquireServiceLock() bool {
+	mutexName, _ := windows.UTF16PtrFromString("Global\\BridgeApp_Service_Mutex")
+	h, err := windows.CreateMutex(nil, false, mutexName)
+	if err != nil {
+		// Fallback for non-admin tokens without SeCreateGlobalPrivilege
+		localName, _ := windows.UTF16PtrFromString("Local\\BridgeApp_Service_Mutex")
+		h, err = windows.CreateMutex(nil, false, localName)
+		if err != nil {
+			return true
+		}
+	}
+	if windows.GetLastError() == windows.ERROR_ALREADY_EXISTS {
+		_ = windows.CloseHandle(h)
+		return false
+	}
+	serviceMutex = h
+	return true
+}
+
+// ReleaseServiceLock releases the background service mutex.
+func ReleaseServiceLock() {
+	if serviceMutex != 0 {
+		_ = windows.CloseHandle(serviceMutex)
+		serviceMutex = 0
+	}
+}
+
+// RegisterInteractiveStartup ensures bridge.exe starts silently in Session 1 at user logon.
+// It aggressively purges legacy duplicate entries (HKLM, User Startup folder, Common Startup folder)
+// and registers ONLY a single canonical HKCU Run entry with the -autostart flag so that exactly ONE
+// instance starts with the system tray icon, and ZERO terminal windows open on boot.
 func RegisterInteractiveStartup() error {
-	// 1. HKCU Run Key (Session 1 User)
-	k, err := registry.OpenKey(registry.CURRENT_USER, `Software\Microsoft\Windows\CurrentVersion\Run`, registry.SET_VALUE)
+	// 1. Purge all duplicate/legacy startup locations
+	UnregisterInteractiveStartup()
+
+	// 2. Register ONLY HKCU Run Key with -autostart flag
+	k, _, err := registry.CreateKey(registry.CURRENT_USER, `Software\Microsoft\Windows\CurrentVersion\Run`, registry.SET_VALUE)
 	if err == nil {
-		_ = k.SetStringValue("BridgeApp", TargetExe)
+		runCmd := fmt.Sprintf(`"%s" -autostart`, TargetExe)
+		_ = k.SetStringValue("BridgeApp", runCmd)
 		k.Close()
 	}
-
-	// 2. HKLM Run Key (Machine-wide fallback for any logged-in user)
-	kAdmin, err := registry.OpenKey(registry.LOCAL_MACHINE, `Software\Microsoft\Windows\CurrentVersion\Run`, registry.SET_VALUE)
-	if err == nil {
-		_ = kAdmin.SetStringValue("BridgeApp", TargetExe)
-		kAdmin.Close()
-	}
-
-	// 3. User Startup Folder Shortcut
-	startupDir := filepath.Join(os.Getenv("APPDATA"), "Microsoft", "Windows", "Start Menu", "Programs", "Startup")
-	if _, err := os.Stat(startupDir); err == nil {
-		_ = CreateDesktopShortcut(TargetExe, filepath.Join(startupDir, "BridgeApp.lnk"), "Bridge System Tray & Sync", "")
-	}
-
-	// 4. Common Startup Folder (All Users)
-	commonStartup := `C:\ProgramData\Microsoft\Windows\Start Menu\Programs\Startup`
-	if _, err := os.Stat(commonStartup); err == nil {
-		_ = CreateDesktopShortcut(TargetExe, filepath.Join(commonStartup, "BridgeApp.lnk"), "Bridge System Tray & Sync", "")
-	}
-
 	return nil
 }
 
-// UnregisterInteractiveStartup removes startup entries.
+// UnregisterInteractiveStartup cleanly removes startup entries across all possible locations.
 func UnregisterInteractiveStartup() {
+	// 1. HKCU Run Key (purge BridgeApp and legacy Bridge keys)
 	k, err := registry.OpenKey(registry.CURRENT_USER, `Software\Microsoft\Windows\CurrentVersion\Run`, registry.SET_VALUE)
 	if err == nil {
 		_ = k.DeleteValue("BridgeApp")
+		_ = k.DeleteValue("Bridge")
 		k.Close()
 	}
 
+	// 2. HKLM Run Key (purge duplicate)
 	kAdmin, err := registry.OpenKey(registry.LOCAL_MACHINE, `Software\Microsoft\Windows\CurrentVersion\Run`, registry.SET_VALUE)
 	if err == nil {
 		_ = kAdmin.DeleteValue("BridgeApp")
+		_ = kAdmin.DeleteValue("Bridge")
 		kAdmin.Close()
 	}
 
-	startupLnk := filepath.Join(os.Getenv("APPDATA"), "Microsoft", "Windows", "Start Menu", "Programs", "Startup", "BridgeApp.lnk")
-	_ = os.Remove(startupLnk)
+	// 3. User & Common Startup Folder Shortcuts (purge any shortcuts containing bridge)
+	startupDirs := []string{
+		filepath.Join(os.Getenv("APPDATA"), "Microsoft", "Windows", "Start Menu", "Programs", "Startup"),
+		`C:\ProgramData\Microsoft\Windows\Start Menu\Programs\Startup`,
+	}
+	for _, sd := range startupDirs {
+		if sd != "" {
+			if entries, err := os.ReadDir(sd); err == nil {
+				for _, e := range entries {
+					low := strings.ToLower(e.Name())
+					if strings.Contains(low, "bridge") && strings.HasSuffix(low, ".lnk") {
+						_ = os.Remove(filepath.Join(sd, e.Name()))
+					}
+				}
+			}
+		}
+	}
 
-	commonStartupLnk := filepath.Join(`C:\ProgramData\Microsoft\Windows\Start Menu\Programs\Startup`, "BridgeApp.lnk")
-	_ = os.Remove(commonStartupLnk)
+	// 4. Legacy Session 0 Scheduled Task (purge)
+	cmdSch := exec.Command("schtasks", "/Delete", "/TN", TaskName, "/F")
+	hideCmd(cmdSch)
+	_ = cmdSch.Run()
 }

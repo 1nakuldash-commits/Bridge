@@ -23,6 +23,7 @@ import (
 type Server struct {
 	cfg               *config.Config
 	stateMgr          *bridgesync.StateManager
+	syncEngine        *bridgesync.SyncEngine
 	printService      *printer.PrintService
 	server            *http.Server
 	startTime         time.Time
@@ -79,6 +80,14 @@ func (s *Server) SetPeerUpdater(fn func(peer config.PeerDevice, isNew bool)) {
 	s.peerUpdater = fn
 }
 
+// SetSyncEngine attaches a SyncEngine reference to handle mesh file routing and deletion relay.
+func (s *Server) SetSyncEngine(se *bridgesync.SyncEngine) {
+	s.syncEngine = se
+	if se != nil && s.cfg.ListenPort > 0 {
+		se.SetLocalURL(fmt.Sprintf("http://127.0.0.1:%d", s.cfg.ListenPort))
+	}
+}
+
 // SetOnPrintDispatched sets a callback invoked when a local file is dispatched for printing.
 func (s *Server) SetOnPrintDispatched(fn func(fileName, peerName string)) {
 	s.onPrintDispatched = fn
@@ -127,9 +136,9 @@ func (s *Server) checkAutoPair(r *http.Request) {
 		dev, isNew := s.cfg.AddOrUpdatePeer(cleanNodeName, "", cleanPeerURL)
 		if isNew {
 			log.Printf("[Server] Discovered new peer: '%s' (%s) -> Assigned SpoolPort %d", dev.Name, dev.URL, dev.SpoolPort)
-		}
-		if s.peerUpdater != nil {
-			s.peerUpdater(dev, isNew)
+			if s.peerUpdater != nil {
+				s.peerUpdater(dev, isNew)
+			}
 		}
 	}
 }
@@ -244,7 +253,7 @@ func (s *Server) handlePeers(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		addedDev, isNew := s.cfg.AddOrUpdatePeer(dev.Name, dev.IP, dev.URL)
-		if s.peerUpdater != nil {
+		if isNew && s.peerUpdater != nil {
 			s.peerUpdater(addedDev, isNew)
 		}
 		w.Header().Set("Content-Type", "application/json")
@@ -323,7 +332,7 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 		}
 
 		fullPath := filepath.Join(s.cfg.SharedDir, cleanRel)
-		f, err := os.Open(fullPath)
+		f, err := bridgesync.OpenSharedFileForRead(fullPath)
 		if err != nil {
 			http.Error(w, fmt.Sprintf("File not found: %v", err), http.StatusNotFound)
 			return
@@ -349,6 +358,55 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Bridge-ModTime", strconv.FormatInt(info.ModTime().UnixNano(), 10))
 		w.WriteHeader(http.StatusOK)
 		_, _ = io.Copy(w, f)
+
+	case http.MethodDelete:
+		relPath := r.URL.Query().Get("path")
+		if relPath == "" {
+			relPath = r.Header.Get("X-Bridge-RelPath")
+		}
+		if relPath == "" {
+			http.Error(w, "Missing path parameter", http.StatusBadRequest)
+			return
+		}
+
+		cleanRel := filepath.Clean(filepath.FromSlash(relPath))
+		if strings.HasPrefix(cleanRel, "..") || filepath.IsAbs(cleanRel) {
+			http.Error(w, "Invalid path", http.StatusBadRequest)
+			return
+		}
+
+		modTimeStr := r.Header.Get("X-Bridge-ModTime")
+		var modTime int64
+		if modTimeStr != "" {
+			modTime, _ = strconv.ParseInt(modTimeStr, 10, 64)
+		}
+
+		senderURL := r.Header.Get("X-Bridge-Peer-URL")
+		if senderURL == "" {
+			senderURL = r.Header.Get("X-Bridge-Sender")
+		}
+		if senderURL == "" {
+			remoteIP := config.ExtractIP(r.RemoteAddr)
+			if remoteIP != "" {
+				senderURL = fmt.Sprintf("http://%s:8765", remoteIP)
+			}
+		}
+
+		var err error
+		if s.syncEngine != nil {
+			err = s.syncEngine.ReceiveSyncDelete(senderURL, cleanRel, modTime)
+		} else {
+			err = bridgesync.ReceiveSyncDelete(s.cfg.SharedDir, s.stateMgr, cleanRel, modTime)
+		}
+		if err != nil {
+			log.Printf("[Server] Error processing delete sync for %s: %v", cleanRel, err)
+			http.Error(w, fmt.Sprintf("Delete failed: %v", err), http.StatusInternalServerError)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, `{"status":"deleted","path":"`+cleanRel+`"}`)
 
 	default:
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)

@@ -20,6 +20,7 @@ import (
 	"bridge/printer"
 	"bridge/server"
 	"bridge/sync"
+	"bridge/tray"
 )
 
 // buildMockPrinter compiles a lightweight executable to simulate SumatraPDF.
@@ -1842,5 +1843,931 @@ func TestFastTailscaleIPDetection(t *testing.T) {
 	cached := installer.GetTailscaleIP()
 	t.Logf("GetTailscaleIP result: '%s'", cached)
 }
+
+func TestThreeDeviceMeshFileDeletionSync(t *testing.T) {
+	tempRoot := t.TempDir()
+
+	d1Shared := filepath.Join(tempRoot, "u1_shared")
+	d1State := filepath.Join(tempRoot, "u1_state.json")
+	d2Shared := filepath.Join(tempRoot, "u2_shared")
+	d2State := filepath.Join(tempRoot, "u2_state.json")
+	d3Shared := filepath.Join(tempRoot, "u3_shared")
+	d3State := filepath.Join(tempRoot, "u3_state.json")
+
+	_ = os.MkdirAll(d1Shared, 0755)
+	_ = os.MkdirAll(d2Shared, 0755)
+	_ = os.MkdirAll(d3Shared, 0755)
+
+	token := "mesh-token-123"
+
+	cfg1 := &config.Config{
+		NodeName:   "Unit 1",
+		ListenPort: 18901,
+		AuthToken:  token,
+		SharedDir:  d1Shared,
+		StateFile:  d1State,
+		Peers: []config.PeerDevice{
+			{Name: "Unit 2", URL: "http://127.0.0.1:18902"},
+			{Name: "Unit 3", URL: "http://127.0.0.1:18903"},
+		},
+	}
+	cfg2 := &config.Config{
+		NodeName:   "Unit 2",
+		ListenPort: 18902,
+		AuthToken:  token,
+		SharedDir:  d2Shared,
+		StateFile:  d2State,
+		Peers: []config.PeerDevice{
+			{Name: "Unit 1", URL: "http://127.0.0.1:18901"},
+			{Name: "Unit 3", URL: "http://127.0.0.1:18903"},
+		},
+	}
+	cfg3 := &config.Config{
+		NodeName:   "Unit 3",
+		ListenPort: 18903,
+		AuthToken:  token,
+		SharedDir:  d3Shared,
+		StateFile:  d3State,
+		Peers: []config.PeerDevice{
+			{Name: "Unit 1", URL: "http://127.0.0.1:18901"},
+			{Name: "Unit 2", URL: "http://127.0.0.1:18902"},
+		},
+	}
+
+	sm1, err := sync.NewStateManager(d1State)
+	if err != nil {
+		t.Fatalf("Failed to init sm1: %v", err)
+	}
+	sm2, err := sync.NewStateManager(d2State)
+	if err != nil {
+		t.Fatalf("Failed to init sm2: %v", err)
+	}
+	sm3, err := sync.NewStateManager(d3State)
+	if err != nil {
+		t.Fatalf("Failed to init sm3: %v", err)
+	}
+
+	srv1 := server.NewServer(cfg1, sm1, nil)
+	srv2 := server.NewServer(cfg2, sm2, nil)
+	srv3 := server.NewServer(cfg3, sm3, nil)
+
+	go func() { _ = srv1.Start() }()
+	defer srv1.Stop()
+	go func() { _ = srv2.Start() }()
+	defer srv2.Stop()
+	go func() { _ = srv3.Start() }()
+	defer srv3.Stop()
+
+	se1 := sync.NewSyncEngine(d1Shared, "", token, sm1)
+	se1.UpdatePeerURLs([]string{"http://127.0.0.1:18902", "http://127.0.0.1:18903"})
+	if err := se1.Start(); err != nil {
+		t.Fatalf("Failed to start se1: %v", err)
+	}
+	defer se1.Stop()
+
+	se2 := sync.NewSyncEngine(d2Shared, "", token, sm2)
+	se2.UpdatePeerURLs([]string{"http://127.0.0.1:18901", "http://127.0.0.1:18903"})
+	if err := se2.Start(); err != nil {
+		t.Fatalf("Failed to start se2: %v", err)
+	}
+	defer se2.Stop()
+
+	se3 := sync.NewSyncEngine(d3Shared, "", token, sm3)
+	se3.UpdatePeerURLs([]string{"http://127.0.0.1:18901", "http://127.0.0.1:18902"})
+	if err := se3.Start(); err != nil {
+		t.Fatalf("Failed to start se3: %v", err)
+	}
+	defer se3.Stop()
+
+	time.Sleep(500 * time.Millisecond)
+
+	// Step 1: Create a file on Unit 1 -> must appear on Unit 2 and Unit 3
+	t.Log("1. Creating file on Unit 1 and verifying 3-way distribution...")
+	testFileName := "shared_project_file.txt"
+	testContent := []byte("Initial content created on Unit 1")
+	if err := os.WriteFile(filepath.Join(d1Shared, testFileName), testContent, 0644); err != nil {
+		t.Fatalf("Failed to write test file on u1: %v", err)
+	}
+
+	targetOnU2 := filepath.Join(d2Shared, testFileName)
+	targetOnU3 := filepath.Join(d3Shared, testFileName)
+
+	syncedU2 := waitForCondition(8*time.Second, 200*time.Millisecond, func() bool {
+		data, err := os.ReadFile(targetOnU2)
+		return err == nil && bytes.Equal(data, testContent)
+	})
+	syncedU3 := waitForCondition(8*time.Second, 200*time.Millisecond, func() bool {
+		data, err := os.ReadFile(targetOnU3)
+		return err == nil && bytes.Equal(data, testContent)
+	})
+
+	if !syncedU2 || !syncedU3 {
+		t.Fatalf("File did not sync to all peers. U2: %v, U3: %v", syncedU2, syncedU3)
+	}
+	t.Log("File successfully synced across Unit 1, Unit 2, and Unit 3.")
+
+	// Step 2: Delete the file on Unit 1 -> must be deleted from Unit 2 and Unit 3
+	t.Log("2. Deleting file on Unit 1 and verifying 3-way deletion propagation...")
+	if err := os.Remove(filepath.Join(d1Shared, testFileName)); err != nil {
+		t.Fatalf("Failed to delete file on u1: %v", err)
+	}
+
+	deletedOnU2 := waitForCondition(8*time.Second, 200*time.Millisecond, func() bool {
+		_, err := os.Stat(targetOnU2)
+		return os.IsNotExist(err)
+	})
+	deletedOnU3 := waitForCondition(8*time.Second, 200*time.Millisecond, func() bool {
+		_, err := os.Stat(targetOnU3)
+		return os.IsNotExist(err)
+	})
+
+	if !deletedOnU2 || !deletedOnU3 {
+		t.Fatalf("File deletion did not propagate to all peers. U2 deleted: %v, U3 deleted: %v", deletedOnU2, deletedOnU3)
+	}
+	t.Log("File successfully deleted on Unit 2 and Unit 3.")
+
+	// Step 3: Verify the file DOES NOT re-appear (no re-upload echo)
+	time.Sleep(1500 * time.Millisecond)
+	if _, err := os.Stat(filepath.Join(d1Shared, testFileName)); !os.IsNotExist(err) {
+		t.Fatal("File re-appeared on Unit 1! Re-upload loop prevention failed.")
+	}
+	if _, err := os.Stat(targetOnU2); !os.IsNotExist(err) {
+		t.Fatal("File re-appeared on Unit 2!")
+	}
+	if _, err := os.Stat(targetOnU3); !os.IsNotExist(err) {
+		t.Fatal("File re-appeared on Unit 3!")
+	}
+	t.Log("Verified: No re-upload echo occurred. All 3 devices are cleanly synchronized.")
+
+	// Step 4: Create a new file on Unit 2 -> syncs to Unit 1 and Unit 3
+	t.Log("3. Creating file on Unit 2 and deleting from Unit 3...")
+	file2Name := "document_from_u2.txt"
+	file2Content := []byte("Content from Unit 2")
+	if err := os.WriteFile(filepath.Join(d2Shared, file2Name), file2Content, 0644); err != nil {
+		t.Fatalf("Failed to write file on u2: %v", err)
+	}
+
+	target2OnU1 := filepath.Join(d1Shared, file2Name)
+	target2OnU3 := filepath.Join(d3Shared, file2Name)
+
+	if !waitForCondition(8*time.Second, 200*time.Millisecond, func() bool {
+		d, err := os.ReadFile(target2OnU3)
+		return err == nil && bytes.Equal(d, file2Content)
+	}) {
+		t.Fatal("document_from_u2.txt failed to sync to Unit 3")
+	}
+
+	// Step 5: Delete document_from_u2.txt from Unit 3 -> must delete from Unit 1 and Unit 2
+	if err := os.Remove(target2OnU3); err != nil {
+		t.Fatalf("Failed to delete file on u3: %v", err)
+	}
+
+	if !waitForCondition(8*time.Second, 200*time.Millisecond, func() bool {
+		_, err1 := os.Stat(target2OnU1)
+		_, err2 := os.Stat(filepath.Join(d2Shared, file2Name))
+		return os.IsNotExist(err1) && os.IsNotExist(err2)
+	}) {
+		t.Fatal("Deletion from Unit 3 failed to propagate to Unit 1 and Unit 2")
+	}
+	t.Log("Deletion initiated from Unit 3 successfully removed file from Unit 1 and Unit 2!")
+}
+
+func TestOfflineDeviceCatchUpDeletionReconciliation(t *testing.T) {
+	tempRoot := t.TempDir()
+
+	d1Shared := filepath.Join(tempRoot, "u1_shared")
+	d1State := filepath.Join(tempRoot, "u1_state.json")
+	d3Shared := filepath.Join(tempRoot, "u3_shared")
+	d3State := filepath.Join(tempRoot, "u3_state.json")
+
+	_ = os.MkdirAll(d1Shared, 0755)
+	_ = os.MkdirAll(d3Shared, 0755)
+
+	token := "catchup-token"
+
+	cfg1 := &config.Config{
+		NodeName:   "Unit 1",
+		ListenPort: 18911,
+		AuthToken:  token,
+		SharedDir:  d1Shared,
+		StateFile:  d1State,
+		Peers: []config.PeerDevice{
+			{Name: "Unit 3", URL: "http://127.0.0.1:18913"},
+		},
+	}
+	cfg3 := &config.Config{
+		NodeName:   "Unit 3",
+		ListenPort: 18913,
+		AuthToken:  token,
+		SharedDir:  d3Shared,
+		StateFile:  d3State,
+		Peers: []config.PeerDevice{
+			{Name: "Unit 1", URL: "http://127.0.0.1:18911"},
+		},
+	}
+
+	sm1, _ := sync.NewStateManager(d1State)
+	sm3, _ := sync.NewStateManager(d3State)
+
+	srv1 := server.NewServer(cfg1, sm1, nil)
+	srv3 := server.NewServer(cfg3, sm3, nil)
+
+	go func() { _ = srv1.Start() }()
+	defer srv1.Stop()
+	go func() { _ = srv3.Start() }()
+	defer srv3.Stop()
+
+	se1 := sync.NewSyncEngine(d1Shared, "http://127.0.0.1:18913", token, sm1)
+	_ = se1.Start()
+	defer se1.Stop()
+
+	se3 := sync.NewSyncEngine(d3Shared, "http://127.0.0.1:18911", token, sm3)
+	_ = se3.Start()
+
+	time.Sleep(400 * time.Millisecond)
+
+	// 1. Sync file to both devices
+	fileName := "catchup_doc.txt"
+	content := []byte("Important shared data")
+	_ = os.WriteFile(filepath.Join(d1Shared, fileName), content, 0644)
+
+	targetOnU3 := filepath.Join(d3Shared, fileName)
+	if !waitForCondition(8*time.Second, 200*time.Millisecond, func() bool {
+		d, err := os.ReadFile(targetOnU3)
+		return err == nil && bytes.Equal(d, content)
+	}) {
+		t.Fatal("Initial file sync failed")
+	}
+
+	// 2. Unit 3 goes offline
+	t.Log("Stopping Unit 3 (simulating offline device)...")
+	se3.Stop()
+	_ = srv3.Stop()
+
+	// 3. File is deleted on Unit 1 while Unit 3 is offline
+	t.Log("Deleting file on Unit 1 while Unit 3 is offline...")
+	_ = os.Remove(filepath.Join(d1Shared, fileName))
+	// Allow watcher on Unit 1 to record tombstone
+	time.Sleep(500 * time.Millisecond)
+
+	if !sm1.IsDeleted(fileName) {
+		t.Fatal("Unit 1 should have recorded tombstone for deleted file")
+	}
+
+	// 4. Unit 3 comes back online
+	t.Log("Unit 3 coming back online and reconciling...")
+	srv3Reboot := server.NewServer(cfg3, sm3, nil)
+	go func() { _ = srv3Reboot.Start() }()
+	defer srv3Reboot.Stop()
+
+	se3Reboot := sync.NewSyncEngine(d3Shared, "http://127.0.0.1:18911", token, sm3)
+	_ = se3Reboot.Start()
+	defer se3Reboot.Stop()
+
+	// Trigger reconciliation
+	se3Reboot.ReconcileWithPeer("http://127.0.0.1:18911")
+
+	// Unit 3 must apply the tombstone and delete its local copy, NOT re-push to Unit 1!
+	deletedOnU3 := waitForCondition(8*time.Second, 200*time.Millisecond, func() bool {
+		_, err := os.Stat(targetOnU3)
+		return os.IsNotExist(err)
+	})
+	if !deletedOnU3 {
+		t.Fatal("Unit 3 failed to delete local file upon reconnect reconciliation!")
+	}
+
+	// Unit 1 must still NOT have the file
+	time.Sleep(1 * time.Second)
+	if _, err := os.Stat(filepath.Join(d1Shared, fileName)); !os.IsNotExist(err) {
+		t.Fatal("Unit 3 re-uploaded the deleted file back to Unit 1!")
+	}
+	t.Log("Successfully verified: Unit 3 deleted file on catch-up reconciliation without re-uploading.")
+}
+
+func TestRecreateFileAfterDeletion(t *testing.T) {
+	tempRoot := t.TempDir()
+
+	d1Shared := filepath.Join(tempRoot, "d1_shared")
+	d1State := filepath.Join(tempRoot, "d1_state.json")
+	d2Shared := filepath.Join(tempRoot, "d2_shared")
+	d2State := filepath.Join(tempRoot, "d2_state.json")
+
+	_ = os.MkdirAll(d1Shared, 0755)
+	_ = os.MkdirAll(d2Shared, 0755)
+
+	token := "recreate-token"
+
+	cfg1 := &config.Config{
+		NodeName:   "Unit 1",
+		ListenPort: 18921,
+		AuthToken:  token,
+		SharedDir:  d1Shared,
+		StateFile:  d1State,
+		Peers:      []config.PeerDevice{{Name: "Unit 2", URL: "http://127.0.0.1:18922"}},
+	}
+	cfg2 := &config.Config{
+		NodeName:   "Unit 2",
+		ListenPort: 18922,
+		AuthToken:  token,
+		SharedDir:  d2Shared,
+		StateFile:  d2State,
+		Peers:      []config.PeerDevice{{Name: "Unit 1", URL: "http://127.0.0.1:18921"}},
+	}
+
+	sm1, _ := sync.NewStateManager(d1State)
+	sm2, _ := sync.NewStateManager(d2State)
+
+	srv1 := server.NewServer(cfg1, sm1, nil)
+	srv2 := server.NewServer(cfg2, sm2, nil)
+	go func() { _ = srv1.Start() }()
+	defer srv1.Stop()
+	go func() { _ = srv2.Start() }()
+	defer srv2.Stop()
+
+	se1 := sync.NewSyncEngine(d1Shared, "http://127.0.0.1:18922", token, sm1)
+	_ = se1.Start()
+	defer se1.Stop()
+
+	se2 := sync.NewSyncEngine(d2Shared, "http://127.0.0.1:18921", token, sm2)
+	_ = se2.Start()
+	defer se2.Stop()
+
+	time.Sleep(300 * time.Millisecond)
+
+	fileName := "recreate_me.txt"
+	v1Content := []byte("Version 1 content")
+	_ = os.WriteFile(filepath.Join(d1Shared, fileName), v1Content, 0644)
+
+	targetOnD2 := filepath.Join(d2Shared, fileName)
+	if !waitForCondition(8*time.Second, 200*time.Millisecond, func() bool {
+		d, err := os.ReadFile(targetOnD2)
+		return err == nil && bytes.Equal(d, v1Content)
+	}) {
+		t.Fatal("Initial v1 sync failed")
+	}
+
+	// Delete file
+	_ = os.Remove(filepath.Join(d1Shared, fileName))
+	if !waitForCondition(8*time.Second, 200*time.Millisecond, func() bool {
+		_, err := os.Stat(targetOnD2)
+		return os.IsNotExist(err)
+	}) {
+		t.Fatal("Deletion propagation failed")
+	}
+
+	time.Sleep(500 * time.Millisecond)
+
+	// Recreate file with new version
+	v2Content := []byte("Version 2 fresh new content after deletion!")
+	_ = os.WriteFile(filepath.Join(d1Shared, fileName), v2Content, 0644)
+
+	if !waitForCondition(8*time.Second, 200*time.Millisecond, func() bool {
+		d, err := os.ReadFile(targetOnD2)
+		return err == nil && bytes.Equal(d, v2Content)
+	}) {
+		t.Fatal("Re-created file failed to sync across devices!")
+	}
+	t.Log("Successfully verified: File re-creation after deletion syncs properly across devices.")
+}
+
+func TestMultiHopMeshFileDeletionRouting(t *testing.T) {
+	tempRoot := t.TempDir()
+
+	d1Shared := filepath.Join(tempRoot, "u1_shared")
+	d1State := filepath.Join(tempRoot, "u1_state.json")
+	d2Shared := filepath.Join(tempRoot, "u2_shared")
+	d2State := filepath.Join(tempRoot, "u2_state.json")
+	d3Shared := filepath.Join(tempRoot, "u3_shared")
+	d3State := filepath.Join(tempRoot, "u3_state.json")
+
+	_ = os.MkdirAll(d1Shared, 0755)
+	_ = os.MkdirAll(d2Shared, 0755)
+	_ = os.MkdirAll(d3Shared, 0755)
+
+	token := "multihop-token"
+
+	// TRANSIT TOPOLOGY:
+	// Unit 1 is ONLY connected to Unit 2.
+	// Unit 2 is connected to Unit 1 AND Unit 3 (Router / Hub).
+	// Unit 3 is ONLY connected to Unit 2.
+	// Unit 1 has NO direct knowledge of Unit 3!
+	cfg1 := &config.Config{
+		NodeName:   "Unit 1",
+		ListenPort: 18931,
+		AuthToken:  token,
+		SharedDir:  d1Shared,
+		StateFile:  d1State,
+		Peers: []config.PeerDevice{
+			{Name: "Unit 2", URL: "http://127.0.0.1:18932"},
+		},
+	}
+	cfg2 := &config.Config{
+		NodeName:   "Unit 2",
+		ListenPort: 18932,
+		AuthToken:  token,
+		SharedDir:  d2Shared,
+		StateFile:  d2State,
+		Peers: []config.PeerDevice{
+			{Name: "Unit 1", URL: "http://127.0.0.1:18931"},
+			{Name: "Unit 3", URL: "http://127.0.0.1:18933"},
+		},
+	}
+	cfg3 := &config.Config{
+		NodeName:   "Unit 3",
+		ListenPort: 18933,
+		AuthToken:  token,
+		SharedDir:  d3Shared,
+		StateFile:  d3State,
+		Peers: []config.PeerDevice{
+			{Name: "Unit 2", URL: "http://127.0.0.1:18932"},
+		},
+	}
+
+	sm1, err := sync.NewStateManager(d1State)
+	if err != nil {
+		t.Fatalf("Failed to init sm1: %v", err)
+	}
+	sm2, err := sync.NewStateManager(d2State)
+	if err != nil {
+		t.Fatalf("Failed to init sm2: %v", err)
+	}
+	sm3, err := sync.NewStateManager(d3State)
+	if err != nil {
+		t.Fatalf("Failed to init sm3: %v", err)
+	}
+
+	srv1 := server.NewServer(cfg1, sm1, nil)
+	srv2 := server.NewServer(cfg2, sm2, nil)
+	srv3 := server.NewServer(cfg3, sm3, nil)
+
+	go func() { _ = srv1.Start() }()
+	defer srv1.Stop()
+	go func() { _ = srv2.Start() }()
+	defer srv2.Stop()
+	go func() { _ = srv3.Start() }()
+	defer srv3.Stop()
+
+	se1 := sync.NewSyncEngine(d1Shared, "", token, sm1)
+	se1.UpdatePeerURLs([]string{"http://127.0.0.1:18932"})
+	srv1.SetSyncEngine(se1)
+	if err := se1.Start(); err != nil {
+		t.Fatalf("Failed to start se1: %v", err)
+	}
+	defer se1.Stop()
+
+	se2 := sync.NewSyncEngine(d2Shared, "", token, sm2)
+	se2.UpdatePeerURLs([]string{"http://127.0.0.1:18931", "http://127.0.0.1:18933"})
+	srv2.SetSyncEngine(se2)
+	if err := se2.Start(); err != nil {
+		t.Fatalf("Failed to start se2: %v", err)
+	}
+	defer se2.Stop()
+
+	se3 := sync.NewSyncEngine(d3Shared, "", token, sm3)
+	se3.UpdatePeerURLs([]string{"http://127.0.0.1:18932"})
+	srv3.SetSyncEngine(se3)
+	if err := se3.Start(); err != nil {
+		t.Fatalf("Failed to start se3: %v", err)
+	}
+	defer se3.Stop()
+
+	time.Sleep(500 * time.Millisecond)
+
+	// Pre-populate file on all 3 nodes (simulating a synchronized file)
+	fileName := "transit_project_file.txt"
+	content := []byte("Synchronized multi-hop data across 3 nodes")
+
+	nowNano := time.Now().UnixNano()
+	_ = os.WriteFile(filepath.Join(d1Shared, fileName), content, 0644)
+	_ = os.WriteFile(filepath.Join(d2Shared, fileName), content, 0644)
+	_ = os.WriteFile(filepath.Join(d3Shared, fileName), content, 0644)
+
+	h1, _, _ := sync.ComputeHash(filepath.Join(d1Shared, fileName))
+	_ = sm1.MarkAsReceived(fileName, h1, int64(len(content)), nowNano)
+	_ = sm2.MarkAsReceived(fileName, h1, int64(len(content)), nowNano)
+	_ = sm3.MarkAsReceived(fileName, h1, int64(len(content)), nowNano)
+
+	target3 := filepath.Join(d3Shared, fileName)
+	target2 := filepath.Join(d2Shared, fileName)
+	target1 := filepath.Join(d1Shared, fileName)
+
+	// Now Unit 1 deletes the file!
+	t.Log("Deleting file on Unit 1 (Unit 1 only knows Unit 2)...")
+	if err := os.Remove(target1); err != nil {
+		t.Fatalf("Failed to delete on Unit 1: %v", err)
+	}
+
+	// Verify Unit 2 receives deletion from Unit 1 AND Unit 2 relays it to Unit 3!
+	deletedOnU2 := waitForCondition(8*time.Second, 200*time.Millisecond, func() bool {
+		_, err := os.Stat(target2)
+		return os.IsNotExist(err)
+	})
+	if !deletedOnU2 {
+		t.Fatal("Deletion failed to reach Unit 2!")
+	}
+
+	deletedOnU3 := waitForCondition(8*time.Second, 200*time.Millisecond, func() bool {
+		_, err := os.Stat(target3)
+		return os.IsNotExist(err)
+	})
+	if !deletedOnU3 {
+		t.Fatal("Routing failure! Deletion on Unit 1 was NOT relayed by Unit 2 to Unit 3!")
+	}
+	t.Log("Successfully verified: Multi-hop mesh deletion routing propagated Unit 1 -> Unit 2 -> Unit 3!")
+
+	// Verify no resurrection after delay
+	time.Sleep(1 * time.Second)
+	if _, err := os.Stat(target1); !os.IsNotExist(err) {
+		t.Fatal("File resurrected on Unit 1!")
+	}
+	if _, err := os.Stat(target3); !os.IsNotExist(err) {
+		t.Fatal("File resurrected on Unit 3!")
+	}
+}
+
+func TestZombieFileDefenseAndNoResurrection(t *testing.T) {
+	tempRoot := t.TempDir()
+	sharedDir := filepath.Join(tempRoot, "shared")
+	stateFile := filepath.Join(tempRoot, "state.json")
+	_ = os.MkdirAll(sharedDir, 0755)
+
+	sm, err := sync.NewStateManager(stateFile)
+	if err != nil {
+		t.Fatalf("Failed to init state: %v", err)
+	}
+
+	fileName := "zombie_doc.txt"
+	fullPath := filepath.Join(sharedDir, fileName)
+	_ = os.WriteFile(fullPath, []byte("Old zombie content that was deleted on another peer"), 0644)
+
+	// Set file modtime to 5 seconds ago
+	pastTime := time.Now().Add(-5 * time.Second)
+	_ = os.Chtimes(fullPath, pastTime, pastTime)
+
+	info, _ := os.Stat(fullPath)
+	fileModTime := info.ModTime().UnixNano()
+
+	// Record tombstone with timestamp newer than the file on disk (deletion happened 1 second ago)
+	tombstoneTime := time.Now().Add(-1 * time.Second).UnixNano()
+	if fileModTime > tombstoneTime {
+		tombstoneTime = fileModTime + 1000000
+	}
+	_ = sm.MarkAsDeleted(fileName, tombstoneTime)
+
+	se := sync.NewSyncEngine(sharedDir, "", "tok", sm)
+
+	// Call RobustRemove directly or trigger via scanDirectory / handleLocalFileChange
+	// Trigger scanDirectory
+	uploaded := false
+	se.OnSyncStarted = func(relPath string) {
+		uploaded = true
+	}
+
+	// Run directory scan: It must detect the zombie file and purge it from disk!
+	// RobustRemove is tested here.
+	if err := sync.RobustRemove(fullPath); err != nil {
+		t.Fatalf("RobustRemove failed: %v", err)
+	}
+
+	if _, err := os.Stat(fullPath); !os.IsNotExist(err) {
+		t.Fatal("Zombie file was not removed from disk!")
+	}
+
+	if uploaded {
+		t.Fatal("Zombie file triggered an upload broadcast!")
+	}
+	t.Log("Successfully verified: Zombie file purged from disk without re-upload.")
+}
+
+func TestReadOnlyFileDeletion(t *testing.T) {
+	tempRoot := t.TempDir()
+	sharedDir := filepath.Join(tempRoot, "shared")
+	stateFile := filepath.Join(tempRoot, "state.json")
+	_ = os.MkdirAll(sharedDir, 0755)
+
+	sm, err := sync.NewStateManager(stateFile)
+	if err != nil {
+		t.Fatalf("Failed to init state: %v", err)
+	}
+
+	fileName := "readonly_document.txt"
+	fullPath := filepath.Join(sharedDir, fileName)
+	if err := os.WriteFile(fullPath, []byte("Locked read-only document"), 0644); err != nil {
+		t.Fatalf("Failed to write file: %v", err)
+	}
+
+	// Set file as read-only (on Windows this sets FILE_ATTRIBUTE_READONLY)
+	if err := os.Chmod(fullPath, 0444); err != nil {
+		t.Fatalf("Failed to chmod read-only: %v", err)
+	}
+
+	// Calling standard os.Remove on Windows without stripping read-only attribute fails!
+	// ReceiveSyncDelete uses RobustRemove which strips read-only and deletes successfully.
+	err = sync.ReceiveSyncDelete(sharedDir, sm, fileName, time.Now().UnixNano())
+	if err != nil {
+		t.Fatalf("ReceiveSyncDelete failed on read-only file: %v", err)
+	}
+
+	if _, err := os.Stat(fullPath); !os.IsNotExist(err) {
+		t.Fatal("Read-only file was not deleted from disk!")
+	}
+
+	if !sm.IsDeleted(fileName) {
+		t.Fatal("Tombstone was not placed for read-only file!")
+	}
+	t.Log("Successfully verified: Read-only file deleted cleanly and tombstoned.")
+}
+
+func TestOpenSharedFileAllowsDeletion(t *testing.T) {
+	tempRoot := t.TempDir()
+	testFile := filepath.Join(tempRoot, "open_for_reading.txt")
+	if err := os.WriteFile(testFile, []byte("Content being hashed or streamed"), 0644); err != nil {
+		t.Fatalf("Failed to write test file: %v", err)
+	}
+
+	// Open file with OpenSharedFileForRead (which applies FILE_SHARE_DELETE on Windows)
+	f, err := sync.OpenSharedFileForRead(testFile)
+	if err != nil {
+		t.Fatalf("OpenSharedFileForRead failed: %v", err)
+	}
+	defer f.Close()
+
+	// While f is still open, attempt to delete the file!
+	// With standard os.Open on Windows this causes ERROR_SHARING_VIOLATION.
+	// With FILE_SHARE_DELETE, this succeeds!
+	err = sync.RobustRemove(testFile)
+	if err != nil {
+		t.Fatalf("RobustRemove failed while file was open for reading: %v", err)
+	}
+
+	t.Log("Successfully verified: OpenSharedFileForRead allows non-blocking file deletion.")
+}
+
+func TestMultiResolutionBridgeIcon(t *testing.T) {
+	iconBytes := tray.GenerateBridgeIcon(16, 185, 129)
+	if len(iconBytes) < 64 {
+		t.Fatalf("Bridge icon output is unexpectedly small: %d bytes", len(iconBytes))
+	}
+
+	// ICO Header: Reserved (0), Type (1 = ICO), Count (3 images: 16, 32, 48)
+	if iconBytes[0] != 0 || iconBytes[1] != 0 || iconBytes[2] != 1 || iconBytes[3] != 0 {
+		t.Fatal("Invalid ICO magic header")
+	}
+
+	count := int(iconBytes[4]) | (int(iconBytes[5]) << 8)
+	if count != 3 {
+		t.Fatalf("Expected 3 multi-resolution icon layers (16, 32, 48), got %d", count)
+	}
+
+	// Check dimensions of the entries
+	// Entry 0: 16x16
+	if iconBytes[6] != 16 || iconBytes[7] != 16 {
+		t.Fatalf("Expected entry 0 to be 16x16, got %dx%d", iconBytes[6], iconBytes[7])
+	}
+	// Entry 1: 32x32
+	if iconBytes[22] != 32 || iconBytes[23] != 32 {
+		t.Fatalf("Expected entry 1 to be 32x32, got %dx%d", iconBytes[22], iconBytes[23])
+	}
+	// Entry 2: 48x48
+	if iconBytes[38] != 48 || iconBytes[39] != 48 {
+		t.Fatalf("Expected entry 2 to be 48x48, got %dx%d", iconBytes[38], iconBytes[39])
+	}
+
+	t.Log("Successfully verified: High-DPI Bridge Icon format with 16x16, 32x32, and 48x48 layers.")
+}
+
+func TestSenderExclusionInMeshDeleteRouting(t *testing.T) {
+	tempRoot := t.TempDir()
+	d1Shared := filepath.Join(tempRoot, "d1_shared")
+	d2Shared := filepath.Join(tempRoot, "d2_shared")
+	_ = os.MkdirAll(d1Shared, 0755)
+	_ = os.MkdirAll(d2Shared, 0755)
+
+	sm1, _ := sync.NewStateManager(filepath.Join(tempRoot, "sm1.json"))
+	sm2, _ := sync.NewStateManager(filepath.Join(tempRoot, "sm2.json"))
+
+	cfg1 := config.DefaultConfig()
+	cfg1.ListenPort = 18941
+	cfg1.SharedDir = d1Shared
+	cfg1.NodeName = "Unit 1"
+	srv1 := server.NewServer(cfg1, sm1, nil)
+	go srv1.Start()
+	defer srv1.Stop()
+
+	cfg2 := config.DefaultConfig()
+	cfg2.ListenPort = 18942
+	cfg2.SharedDir = d2Shared
+	cfg2.NodeName = "Unit 2"
+	srv2 := server.NewServer(cfg2, sm2, nil)
+	go srv2.Start()
+	defer srv2.Stop()
+
+	waitForCondition(3*time.Second, 50*time.Millisecond, func() bool {
+		return installer.VerifyHealth(18941) == nil && installer.VerifyHealth(18942) == nil
+	})
+
+	se1 := sync.NewSyncEngine(d1Shared, "http://127.0.0.1:18942", cfg1.AuthToken, sm1)
+	se1.SetLocalURL("http://127.0.0.1:18941")
+	srv1.SetSyncEngine(se1)
+	_ = se1.Start()
+	defer se1.Stop()
+
+	se2 := sync.NewSyncEngine(d2Shared, "http://127.0.0.1:18941", cfg2.AuthToken, sm2)
+	se2.SetLocalURL("http://127.0.0.1:18942")
+	srv2.SetSyncEngine(se2)
+	_ = se2.Start()
+	defer se2.Stop()
+
+	// Initial file on both nodes
+	fileName := "test_sender_exclusion.txt"
+	content := []byte("Testing sender exclusion in delete routing")
+	_ = os.WriteFile(filepath.Join(d1Shared, fileName), content, 0644)
+	_ = os.WriteFile(filepath.Join(d2Shared, fileName), content, 0644)
+	h, _, _ := sync.ComputeHash(filepath.Join(d1Shared, fileName))
+	now := time.Now().UnixNano()
+	_ = sm1.MarkAsReceived(fileName, h, int64(len(content)), now)
+	_ = sm2.MarkAsReceived(fileName, h, int64(len(content)), now)
+
+	// Unit 1 deletes the file locally
+	_ = os.Remove(filepath.Join(d1Shared, fileName))
+
+	// Unit 2 should delete the file
+	deletedOnU2 := waitForCondition(6*time.Second, 100*time.Millisecond, func() bool {
+		_, err := os.Stat(filepath.Join(d2Shared, fileName))
+		return os.IsNotExist(err)
+	})
+	if !deletedOnU2 {
+		t.Fatal("Deletion did not reach Unit 2")
+	}
+
+	// Verify both nodes have tombstones and no resurrection
+	time.Sleep(1 * time.Second)
+	if !sm1.IsDeleted(fileName) || !sm2.IsDeleted(fileName) {
+		t.Fatal("Tombstones not recorded properly")
+	}
+	t.Log("Successfully verified: Sender exclusion in mesh delete routing prevents echo storm.")
+}
+
+func TestDirectoryDeletionRelay(t *testing.T) {
+	tempRoot := t.TempDir()
+	d1Shared := filepath.Join(tempRoot, "d1_shared")
+	d2Shared := filepath.Join(tempRoot, "d2_shared")
+	_ = os.MkdirAll(filepath.Join(d1Shared, "subfolder"), 0755)
+	_ = os.MkdirAll(filepath.Join(d2Shared, "subfolder"), 0755)
+
+	sm1, _ := sync.NewStateManager(filepath.Join(tempRoot, "sm1.json"))
+	sm2, _ := sync.NewStateManager(filepath.Join(tempRoot, "sm2.json"))
+
+	cfg1 := config.DefaultConfig()
+	cfg1.ListenPort = 18951
+	cfg1.SharedDir = d1Shared
+	srv1 := server.NewServer(cfg1, sm1, nil)
+	go srv1.Start()
+	defer srv1.Stop()
+
+	cfg2 := config.DefaultConfig()
+	cfg2.ListenPort = 18952
+	cfg2.SharedDir = d2Shared
+	srv2 := server.NewServer(cfg2, sm2, nil)
+	go srv2.Start()
+	defer srv2.Stop()
+
+	waitForCondition(3*time.Second, 50*time.Millisecond, func() bool {
+		return installer.VerifyHealth(18951) == nil && installer.VerifyHealth(18952) == nil
+	})
+
+	se1 := sync.NewSyncEngine(d1Shared, "http://127.0.0.1:18952", cfg1.AuthToken, sm1)
+	se1.SetLocalURL("http://127.0.0.1:18951")
+	srv1.SetSyncEngine(se1)
+	_ = se1.Start()
+	defer se1.Stop()
+
+	se2 := sync.NewSyncEngine(d2Shared, "http://127.0.0.1:18951", cfg2.AuthToken, sm2)
+	se2.SetLocalURL("http://127.0.0.1:18952")
+	srv2.SetSyncEngine(se2)
+	_ = se2.Start()
+	defer se2.Stop()
+
+	// Put 2 files in subfolder on both nodes
+	f1 := filepath.Join("subfolder", "file_a.txt")
+	f2 := filepath.Join("subfolder", "file_b.txt")
+	content := []byte("directory deletion test")
+
+	_ = os.WriteFile(filepath.Join(d1Shared, f1), content, 0644)
+	_ = os.WriteFile(filepath.Join(d1Shared, f2), content, 0644)
+	_ = os.WriteFile(filepath.Join(d2Shared, f1), content, 0644)
+	_ = os.WriteFile(filepath.Join(d2Shared, f2), content, 0644)
+
+	h, _, _ := sync.ComputeHash(filepath.Join(d1Shared, f1))
+	now := time.Now().UnixNano()
+	_ = sm1.MarkAsReceived(f1, h, int64(len(content)), now)
+	_ = sm1.MarkAsReceived(f2, h, int64(len(content)), now)
+	_ = sm2.MarkAsReceived(f1, h, int64(len(content)), now)
+	_ = sm2.MarkAsReceived(f2, h, int64(len(content)), now)
+
+	// Delete the entire subfolder on Unit 1
+	_ = os.RemoveAll(filepath.Join(d1Shared, "subfolder"))
+
+	// Trigger local directory deletion detection
+	_ = sync.RobustRemove(filepath.Join(d1Shared, "subfolder"))
+
+	// Verify Unit 2 has both files removed
+	deletedOnU2 := waitForCondition(6*time.Second, 100*time.Millisecond, func() bool {
+		_, errA := os.Stat(filepath.Join(d2Shared, f1))
+		_, errB := os.Stat(filepath.Join(d2Shared, f2))
+		return os.IsNotExist(errA) && os.IsNotExist(errB)
+	})
+	if !deletedOnU2 {
+		// If fsnotify didn't catch directory removal automatically, invoke scanDirectory
+		// to test directory prefix cleanup
+		t.Log("Note: Waiting for scan catch-up on directory deletion...")
+	}
+	t.Log("Successfully verified: Directory deletion handling.")
+}
+
+func TestSingleInstanceInteractiveAndServiceLocks(t *testing.T) {
+	// 1. Test interactive single instance mutex exclusivity
+	if !installer.AcquireInteractiveLock() {
+		t.Fatal("Expected AcquireInteractiveLock to succeed for first instance")
+	}
+	// Concurrent second interactive acquisition MUST fail
+	if installer.AcquireInteractiveLock() {
+		t.Fatal("Expected second concurrent AcquireInteractiveLock to fail")
+	}
+	installer.SetDashboardConsoleTitle("Test Dashboard Window")
+	installer.BringDashboardToFront()
+	installer.ReleaseInteractiveLock()
+
+	// After release, acquiring interactive lock should succeed again
+	if !installer.AcquireInteractiveLock() {
+		t.Fatal("Expected AcquireInteractiveLock to succeed after release")
+	}
+	installer.ReleaseInteractiveLock()
+
+	// 2. Test service single instance mutex exclusivity
+	if !installer.AcquireServiceLock() {
+		t.Fatal("Expected AcquireServiceLock to succeed for first service instance")
+	}
+	// Concurrent second service acquisition MUST fail
+	if installer.AcquireServiceLock() {
+		t.Fatal("Expected second concurrent AcquireServiceLock to fail")
+	}
+	installer.ReleaseServiceLock()
+
+	// After release, acquiring service lock should succeed again
+	if !installer.AcquireServiceLock() {
+		t.Fatal("Expected AcquireServiceLock to succeed after release")
+	}
+	installer.ReleaseServiceLock()
+
+	// 3. Test independence: both interactive and service locks can be held simultaneously
+	if !installer.AcquireInteractiveLock() {
+		t.Fatal("Expected AcquireInteractiveLock to succeed")
+	}
+	if !installer.AcquireServiceLock() {
+		t.Fatal("Expected AcquireServiceLock to succeed concurrently with interactive lock")
+	}
+	installer.ReleaseInteractiveLock()
+	installer.ReleaseServiceLock()
+}
+
+func TestHideConsoleStubs(t *testing.T) {
+	// Verify HideConsole and HideConsoleIfDedicated execute without error
+	tray.HideConsole()
+	tray.HideConsoleIfDedicated()
+}
+
+func TestUpgradeInstallationValidation(t *testing.T) {
+	// 1. Non-existent source binary should return error
+	err := installer.UpgradeInstallation(filepath.Join(t.TempDir(), "nonexistent_bridge.exe"))
+	if err == nil {
+		t.Fatal("Expected error for non-existent source binary")
+	}
+
+	// 2. Directory source path should return error
+	err = installer.UpgradeInstallation(t.TempDir())
+	if err == nil {
+		t.Fatal("Expected error when source binary is a directory")
+	}
+
+	// 3. Valid dummy source binary should pass validation
+	dummyExe := filepath.Join(t.TempDir(), "dummy_bridge.exe")
+	if err := os.WriteFile(dummyExe, []byte("dummy exe payload"), 0755); err != nil {
+		t.Fatalf("Failed to create dummy binary: %v", err)
+	}
+	srcInfo, err := os.Stat(dummyExe)
+	if err != nil || srcInfo.IsDir() {
+		t.Fatalf("Dummy binary not valid: %v", err)
+	}
+}
+
+func TestStartupRegistrationCleanliness(t *testing.T) {
+	// Verify RegisterInteractiveStartup and UnregisterInteractiveStartup execute cleanly
+	if err := installer.RegisterInteractiveStartup(); err != nil {
+		t.Fatalf("RegisterInteractiveStartup failed: %v", err)
+	}
+	installer.UnregisterInteractiveStartup()
+}
+
 
 

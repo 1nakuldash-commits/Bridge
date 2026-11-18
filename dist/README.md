@@ -1,97 +1,206 @@
-# Bridge: Symmetrical Two-Way File Sync, Native Virtual Printing & Status Dot
+# Bridge: Autonomous Multi-Device Mesh Sync, Virtual Printing & Modern Taskbar Icon
 
-A lightweight, zero-dependency Windows application (`bridge.exe`) providing automatic **two-way folder synchronization**, **native virtual printer integration (Ctrl+P)**, **two-way silent remote printing**, and a **multifunctional taskbar status dot** between two Windows PCs over Tailscale.
+A lightweight, zero-dependency Windows application (`bridge.exe`) providing automatic **multi-device mesh folder synchronization**, **instant multi-hop file deletion propagation (with tombstones)**, **native virtual printer integration (Ctrl+P)**, **isolated parallel silent remote printing**, **autonomous Tailscale onboarding**, and a **modern multifunctional taskbar Bridge icon** across any number of Windows PCs (U1, U2, U3, Unit 4, Unit 5...) over Tailscale.
 
-Designed for low-end Windows 10/11 machines with **idle RAM < 20 MB** and **idle CPU near 0%**.
+Designed for low-end Windows 10/11 machines with **idle RAM < 25 MB** and **idle CPU near 0%**.
 
 ---
 
-## 🌟 What Makes Bridge Effortless?
+## 🌟 Architecture & Core Capabilities
 
 ```
-    [ PC 1: Sulobha Unit 1 ]                                  [ PC 2: Sulobha Unit 2 ]
-+------------------------------+                          +------------------------------+
-|  🟢 Multifunctional Dot      |                          |  🟢 Multifunctional Dot      |
-|     (Windows Taskbar)        |                          |     (Windows Taskbar)        |
-|                              |                          |                              |
-|  📁 Unit 2 - Shared Folder   | <== (Two-Way Sync) ===>  |  📁 Unit 1 - Shared Folder   |
-|  🖨️ Print on Unit 2          | == (Ctrl+P / Spooler) => |  🖨️ Physical HP Printer      |
-|     (Virtual Printer)        |                          |     (Prints Silently!)       |
-+------------------------------+                          +------------------------------+
+       [ Device 1: U1 ]                      [ Device 2: U2 ]                      [ Device 3: U3 ]
++----------------------------+        +----------------------------+        +----------------------------+
+| 🟢 Bridge Icon (2/2 online)|        | 🟢 Bridge Icon (2/2 online)|        | 🟢 Bridge Icon (2/2 online)|
+|                            |        |                            |        |                            |
+| 📁 Global Shared Folder    |<======>| 📁 Global Shared Folder    |<======>| 📁 Global Shared Folder    |
+|    (C:\Bridge\Shared)      |  Mesh  |    (C:\Bridge\Shared)      |  Mesh  |    (C:\Bridge\Shared)      |
+|    * Multi-Hop Deletion    | Relay  |    * Multi-Hop Deletion    | Relay  |    * Multi-Hop Deletion    |
+|                            |        |                            |        |                            |
+| 🖨️ Print on U2 (Port 9101)  |=======>| 🖨️ Physical HP Printer     |        |                            |
+| 🖨️ Print on U3 (Port 9102)  |=============================================>| 🖨️ Physical HP Printer     |
+| 🖨️ Physical HP Printer     |<=======| 🖨️ Print on U1 (Port 9101)  |        |                            |
+|                            |<=============================================| 🖨️ Print on U1 (Port 9101)  |
++----------------------------+        +----------------------------+        +----------------------------+
 ```
 
-1. **Automatic Tailscale Peer Discovery (Zero-Typing Setup):**
-   - The setup wizard automatically scans your Tailscale network, detects the online peer device, resolves its friendly name, and pre-fills its IP address.
-   - Setup requires simply pressing `Enter` to confirm!
+### 1. Robust File Sharing & Instant Multi-Hop Deletion Synchronization
+- **True Mesh Synchronization:** All devices share a single folder at `C:\Bridge\Shared` (accessible via Desktop shortcut).
+- **Multi-Hop Deletion Routing (Relay):** When a file is deleted from any device, every intermediate node immediately relays the deletion across all other peers in the mesh. Even across hub-and-spoke or transitive networks, deletions propagate to every device.
+- **Tombstone State & Zombie File Defense:** Deleted files are tracked with high-precision timestamped tombstones (`deleted: true`). If a file with an older timestamp is detected on disk, Bridge immediately purges it and strictly suppresses re-uploading, eliminating resurrection loops.
+- **Non-Blocking Windows File Handles (`FILE_SHARE_DELETE`):** All file operations open files with full `FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE`. Bridge never locks files against Windows Explorer deletion or creates "File In Use" errors.
+- **Robust Read-Only & Lock Recovery (`RobustRemove`):** When deleting files on Windows, Bridge strips `FILE_ATTRIBUTE_READONLY` flags and retries with backoff against temporary locks (antivirus, thumbnail generators).
+- **Offline Catch-Up Reconciliation:** When an offline device reconnects, it reconciles tombstones bidirectionally, applies missing deletions, and safely synchronizes new files.
+- **Re-creation Support:** Creating a new file with the same name after deletion is immediately detected via timestamp comparison and synced cleanly across the network.
 
-2. **Native Virtual Printer in Any Program (Ctrl+P):**
-   - Seamlessly appears in the **Printer** dropdown in **Adobe Acrobat / Reader**, **AutoCAD**, **Microsoft Word**, **Google Chrome**, etc., as:
-     `Print on <PeerName>` (e.g., `Print on Sulobha Unit 2`).
-   - When you press Print, Windows Spooler streams the job directly to the peer PC where it prints silently to the physical printer (e.g., HP Smart Tank)!
-   - **Echo Loop Prevention:** Directs jobs exclusively to real physical printers (filtering out virtual loopback ports) and blocks reflected loopback origins via `X-Bridge-Origin`. Windows default printer is permanently protected from hijack (`LegacyDefaultPrinterMode = 1`).
+### 2. Streamlined Multi-Device First-Time Setup UX
+- **Autonomous Setup:** When running `bridge.exe` for the first time, it automatically verifies Tailscale and SumatraPDF, installing them silently if missing.
+- **Step 1 — Name THIS Device:** Prompts for this computer's friendly name first (e.g. `U1`, `U2`, `Office-PC`), defaulting intelligently to `U1`.
+- **Step 2 — Parallel Tailscale Active Device Discovery:**
+  - **Device 1 Setup:** Scans Tailscale. If no other Bridge peers are online yet, marks Device 1 as ready and displays its IP.
+  - **Device 2 Setup:** Automatically detects active device `U1` with its IP (`100.x.y.1`). Prompts: `Connect to 'U1' (100.x.y.1)? [Y = Connect, or enter another IP]: `. Simply pressing `Y` or `Enter` links Device 2 to U1!
+  - **Device 3 Setup:** Automatically detects both `U1` and `U2` with their IPs. Prompts: `Connect to these devices? [Y = Connect all, or enter another IP]: `. Pressing `Y` or `Enter` establishes a complete 3-way mesh!
+- **Clean Background Autostart & Zero Startup Terminals:**
+  - After a one-time setup, Bridge starts automatically at Windows logon via a single canonical registry entry with the `-autostart` flag.
+  - Console windows are suppressed immediately upon boot (`CREATE_NO_WINDOW` and early window hiding).
+  - Legacy duplicate startup locations (HKLM, User Startup, Common Startup, old scheduled tasks) are actively purged, guaranteeing that exactly ONE background service instance runs with the taskbar icon, and ZERO terminal windows open on boot.
+- **Single-Instance Protection:**
+  - Double-clicking `bridge.exe` while another dashboard is already running brings the existing window to the front, guaranteeing that only 1 terminal window can ever be opened.
+- **No Unsolicited Auto-Updates:**
+  - Launching `bridge.exe` presents an intuitive Control Dashboard with clear action options. It never auto-updates, kills processes, or overwrites files behind the user's back.
+  - Upgrading Bridge is an explicit user choice available in the dashboard menu (`Option [8]`).
 
-3. **Clean Single Desktop Shortcut (No Unnecessary Print Folders):**
-   - Only ONE desktop shortcut is created:
-     - `"<PeerName> - Shared Folder"` (e.g., `Sulobha Unit 2 - Shared Folder` -> `C:\Bridge\Shared`).
-   - Printing is 100% direct through `Ctrl+P` and Explorer right-click; no messy extra print folders are created.
+### 3. Modern Multi-Function Taskbar Bridge Icon
+- **High-DPI Multi-Resolution Bridge Icon:** Handcrafted architectural bridge icon packed with 16x16, 32x32, and 48x48 RGBA layers for pixel-perfect rendering across standard, 125%, 150%, and 200% Windows High-DPI displays.
+- **Anti-Flicker Debouncing:** Status polling uses debounced hysteresis and suppresses Windows taskbar redraws unless state actually changes. The icon remains a steady 🟢 **Emerald Green** whenever the mesh is operational.
+- **State Colors:**
+  - 🟢 **Emerald Green:** Peer devices connected and ready.
+  - 🟡 **Amber Gold:** Active file sync in progress or print job transmitting.
+  - 🔵 **Electric Azure:** Print job dispatched or operation completed.
+  - ⚪ **Slate Silver:** Offline or in standby mode.
+- **Rich Multi-Function Taskbar Menu:**
+  - 📁 *Open Shared Folder* (also triggered by **Double-Clicking** the icon)
+  - 🖨️ *Print on <PeerName>...* (direct print dialog for any peer with live online status)
+  - 📋 *Copy My Tailscale IP* (copies local Tailscale IP to Windows clipboard with 1 click)
+  - 📊 *Device Network Status* (shows local IP, printer status, spool ports, and connected devices)
+  - 🔄 *Sync Now* (triggers instant mesh inventory reconciliation)
+  - 📂 *Open Service Logs* (opens `C:\Bridge\Logs` in File Explorer)
+  - ❌ *Exit Bridge*
 
-4. **Native Right-Click Printing (Explorer Send-To):**
-   - Right-click **ANY file** in Windows (Desktop, Downloads, etc.) ➔ **Send to** ➔ **Print on <PeerName>**!
-   - Transmits immediately to the peer PC and prints silently.
-
-5. **Multifunctional Taskbar Dot (Right Next to Your Clock):**
-   - 🟢 **Green Dot:** Connected to peer and ready.
-   - 🟡 **Yellow Dot:** Print job transmitting or file sync actively in progress.
-   - 🔵 **Blue Dot:** Print job successfully completed (with Windows notification).
-   - ⚪ **Gray Dot:** Peer is currently offline or unreachable.
-   - **Hover:** Displays tooltip with connection status and printer readiness.
-   - **Right-Click Menu:**
-     - 📁 *Open Shared Folder*
-     - 🖨️ *Print on Remote PC... (opens file picker)*
-     - ℹ️ *Connection Status & Details*
-     - 🔄 *Sync Now*
-     - ❌ *Exit*
+### 4. Multi-Device Virtual Printing (Parallel & Non-Blocking)
+- Each peer device gets its own independent Windows virtual printer:
+  - **U1** shows: `Print on U2`, `Print on U3`, etc.
+  - **U2** shows: `Print on U1`, `Print on U3`, etc.
+  - **U3** shows: `Print on U1`, `Print on U2`, etc.
+- Each virtual printer binds to an independent RAW TCP spooler port (`127.0.0.1:9101`, `9102`, `9103`...).
+- **Simultaneous Usage:** Multiple users can print simultaneously across the network without waiting for each other or colliding in queue.
+- **Echo Loop Prevention:** Directs remote print jobs strictly to real physical printers (filtering out virtual spooler ports) and blocks reflected loopback jobs via `X-Bridge-Origin`.
+- **Default Printer Protection:** Windows default printer is permanently safeguarded (`LegacyDefaultPrinterMode = 1`) so Bridge will never hijack your normal local office printer.
 
 ---
 
-## ⚡ First-Time Setup (Takes Under 30 Seconds)
+## ⚡ Step-by-Step Setup Walkthrough
 
-### Step 1: On Your First Computer
-1. Double-click **`bridge.exe`** (click "Yes" to Administrator prompt).
-2. The wizard automatically detects Tailscale and SumatraPDF (installing them silently if missing).
-3. If an online Tailscale peer is detected, it displays:
+### Setup on Device 1 (e.g. "U1")
+1. Copy **`bridge.exe`** to Device 1.
+2. Double-click **`bridge.exe`** (click **Yes** on the Windows UAC prompt).
+3. `bridge.exe` checks Tailscale and opens browser login if needed.
+4. **Name Device 1:**
+   ```text
+   ======================================================================
+                          DEVICE CONFIGURATION                           
+   >>> THIS DEVICE'S TAILSCALE IP: 100.92.92.81 <<<
+   ======================================================================
+   What name to give THIS device? (e.g. U1, U2, Unit 1) [Default: 'U1']: U1
+   [✓] Configured this device as: 'U1'
    ```
-   [✓] Auto-detected connected Tailscale device: <PeerName> (100.x.y.z)
+5. **Network Discovery:**
+   ```text
+   [*] No other active Bridge devices detected on your network.
+   [✓] 'U1' will act as your first network device.
+   Press Enter if this is Device 1: [Press Enter]
    ```
-4. Simply press **Enter** to accept the auto-detected settings!
-5. The terminal closes and the status dot appears in your taskbar near the clock!
-
-### Step 2: On Your Second Computer
-1. Run **`bridge.exe`** on the second computer.
-2. It auto-detects Computer 1 on Tailscale. Press **Enter** to confirm.
-3. **Done!** Both computers link up, the status dots turn 🟢 **Green**, and you'll see:
-   - `<PeerName> - Shared Folder` on your desktop.
-   - `Print on <PeerName>` in your Ctrl+P print dropdown!
+6. Setup completes instantly! The modern Bridge icon appears in your Windows taskbar near the clock.
 
 ---
 
-## 🔄 How to Upgrade an Already Installed System
-
-1. Copy the newly compiled **`dist\bridge.exe`** (or run `install.ps1`) on your computer.
-2. Double-click **`bridge.exe`**.
-3. Bridge automatically:
-   - Decommissions any old `C:\Bridge\Print` folder and cleans up drop-to-print shortcuts.
-   - Preserves `<PeerName> - Shared Folder` on your desktop.
-   - Registers native Windows virtual printer `Print on <PeerName>`.
-   - Protects Windows default printer mode so your physical printer remains default.
-   - Restarts the service with the active taskbar dot.
-4. Repeat on your other PC. Both systems will immediately link and display 🟢 **Green**.
+### Setup on Device 2 (e.g. "U2")
+1. Copy **`bridge.exe`** to Device 2 and double-click it.
+2. **Name Device 2:**
+   ```text
+   What name to give THIS device? (e.g. U1, U2, Unit 1) [Default: 'U1']: U2
+   [✓] Configured this device as: 'U2'
+   ```
+3. **Auto-Discovery of Device 1:**
+   ```text
+   [*] Current active device found: 'U1' (IP: 100.92.92.81)
+   Connect to 'U1' (100.92.92.81)? [Y = Connect, or enter another IP]: Y
+   [✓] Linked with 'U1'! Virtual Printer prepared: 'Print on U1' (Port 9101)
+   ```
+4. **Done!**
+   - Device 2 shows `Print on U1` and `Bridge Shared Folder`.
+   - Device 1 immediately auto-detects Device 2 and creates `Print on U2`.
+   - Both taskbar icons turn 🟢 **Emerald Green**.
 
 ---
 
-## 📂 Everyday Usage
+### Setup on Device 3 (e.g. "U3")
+1. Copy **`bridge.exe`** to Device 3 and double-click it.
+2. **Name Device 3:** Enter `U3`.
+3. **Auto-Discovery of All Existing Devices:**
+   ```text
+   [*] Current active devices found on your network:
+       [1] U1              (IP: 100.92.92.81)
+       [2] U2              (IP: 100.92.92.82)
 
-- **Ctrl+P Print from Any App:** Open any PDF in Adobe Acrobat, drawing in AutoCAD, or document in Word. Press **Ctrl+P**, pick **`Print on <PeerName>`**, and click **Print**. The document transmits and prints silently on the remote printer.
-- **Sync Files:** Open the **`<PeerName> - Shared Folder`** shortcut on your Desktop (or `C:\Bridge\Shared`). Files sync bi-directionally in 2-3 seconds.
-- **Native Right-Click Print:** Right-click any file anywhere ➔ **Send to** ➔ **Print on <PeerName>**.
-- **Taskbar Menu:** Right-click the tiny dot near your clock to view connection status or open settings.
+   Connect to these devices? [Y = Connect all, or enter another IP]: Y
+   [✓] Linked with 'U1'! Virtual Printer prepared: 'Print on U1' (Port 9101)
+   [✓] Linked with 'U2'! Virtual Printer prepared: 'Print on U2' (Port 9102)
+   ```
+4. **Full 3-Way Mesh Established:**
+   - **Device 3** has: `Print on U1`, `Print on U2`.
+   - **Device 1** has: `Print on U2`, `Print on U3`.
+   - **Device 2** has: `Print on U1`, `Print on U3`.
+   - All 3 devices share the global folder `C:\Bridge\Shared`.
+   - Any file added or deleted on any device updates across all 3 devices instantly.
+
+---
+
+## 📂 Everyday Usage Guide
+
+### 1. File Sharing & Deletion
+- Open **`Bridge Shared Folder`** on your Desktop.
+- Any document, image, or PDF placed inside is synced to all connected devices in 1-2 seconds.
+- When you delete a file from *any* device, it is permanently deleted from all other devices. It will never re-upload or resurrect.
+
+### 2. Print from Any Application (Ctrl+P)
+- Open any document or drawing in **Word**, **Excel**, **Chrome**, **Acrobat Reader**, or **AutoCAD**.
+- Press **Ctrl+P**.
+- In the printer dropdown, select target computer:
+  - `Print on U1`
+  - `Print on U2`
+  - `Print on U3`
+- Click **Print**. The document transmits and prints silently on the remote computer's physical printer.
+
+### 3. Right-Click SendTo Printing
+- Right-click any file in Windows Explorer (Downloads, Desktop, etc.) ➔ **Send to** ➔ **Print on <PeerName>**.
+
+### 4. Taskbar Multi-Function Icon
+- **Left-Click** or **Right-Click** the modern Bridge icon near your clock:
+  - Click **📋 Copy My Tailscale IP** to immediately copy your IP to the clipboard.
+  - Click **📁 Open Shared Folder** to view files.
+  - Click **🖨️ Print on <PeerName>...** to print directly to a specific PC.
+  - Click **📊 Device Network Status** to see all connected nodes and physical printer status.
+- **Double-Click** the icon to jump directly to `C:\Bridge\Shared`.
+
+### 5. Interactive Control Dashboard & Safe Updates
+- When `bridge.exe` is run after setup, it displays the **Control Dashboard** (guaranteed exactly 1 terminal window):
+  - View real-time service status, IP, connected peers, and local physical printer.
+  - Quick action menu:
+    - `[1]` Open Shared Folder
+    - `[2]` Print Document to Peer
+    - `[3]` Add Peer Device by IP
+    - `[4]` View Live Service Logs
+    - `[5]` Start or Restart Background Service
+    - `[6]` Re-run Setup Wizard / Change Settings
+    - `[7]` Cleanly Uninstall Bridge Service
+    - `[8]` **Upgrade Bridge Installation** (Safely upgrades Bridge to a new version only when confirmed by the user; no surprise auto-updates!)
+    - `[0]` Exit Dashboard (Background service continues running in the taskbar)
+- **Computer Reboot / Startup:**
+  - Bridge starts silently in the background with the taskbar icon.
+  - ZERO terminal windows open on boot.
+  - It runs according to your configured setup without any prompts or popups.
+
+---
+
+## ⚙️ Technical Specifications
+
+| Component | Specification |
+| :--- | :--- |
+| **Binary** | Single standalone Windows executable (`bridge.exe`, ~8.1 MB) |
+| **Runtime Dependencies** | None (pure Go, native Win32 APIs, GDI, Winsock, Winspool) |
+| **Idle Resource Usage** | < 25 MB RAM, 0% CPU |
+| **Spooler Engine** | RAW TCP Port Monitor (`127.0.0.1:9101-9120`) |
+| **Silent PDF Engine** | Embedded SumatraPDF integration with 45s watchdog timer |
+| **Network Security** | Tailscale WireGuard mesh + `X-Bridge-Token` header verification |
+| **Default Printer Safety** | Protected via `LegacyDefaultPrinterMode = 1` registry lock |

@@ -16,7 +16,8 @@ type FileRecord struct {
 	RelPath string `json:"rel_path"`
 	Hash    string `json:"hash"`
 	Size    int64  `json:"size"`
-	ModTime int64  `json:"mod_time"` // Unix timestamp in nanoseconds
+	ModTime int64  `json:"mod_time"`          // Unix timestamp in nanoseconds
+	Deleted bool   `json:"deleted,omitempty"` // Tombstone marker for deleted files
 }
 
 // StateManager persists and provides thread-safe access to sync file states.
@@ -129,10 +130,29 @@ func (sm *StateManager) IsSynced(relPath string, hash string) bool {
 	sm.mu.RLock()
 	defer sm.mu.RUnlock()
 	rec, ok := sm.records[filepath.Clean(relPath)]
-	if !ok {
+	if !ok || rec.Deleted {
 		return false
 	}
 	return rec.Hash == hash
+}
+
+// IsDeleted checks if the file is recorded as deleted (tombstone).
+func (sm *StateManager) IsDeleted(relPath string) bool {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	rec, ok := sm.records[filepath.Clean(relPath)]
+	return ok && rec.Deleted
+}
+
+// MarkAsDeleted records a deletion tombstone so that local events do not echo it back.
+func (sm *StateManager) MarkAsDeleted(relPath string, modTime int64) error {
+	return sm.Set(relPath, FileRecord{
+		RelPath: filepath.Clean(relPath),
+		Hash:    "",
+		Size:    0,
+		ModTime: modTime,
+		Deleted: true,
+	})
 }
 
 // MarkAsReceived records a file received from a peer so that local events do not echo it back.
@@ -147,7 +167,7 @@ func (sm *StateManager) MarkAsReceived(relPath string, hash string, size int64, 
 
 // ComputeHash computes the SHA-256 hash and size of a file on disk.
 func ComputeHash(fullPath string) (string, int64, error) {
-	f, err := os.Open(fullPath)
+	f, err := OpenSharedFileForRead(fullPath)
 	if err != nil {
 		return "", 0, err
 	}

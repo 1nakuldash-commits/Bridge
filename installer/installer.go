@@ -24,6 +24,7 @@ var (
 	tsIPMu      sync.RWMutex
 	cachedTSIP  string
 	lastTSCheck time.Time
+	shortcutsMu sync.Mutex
 )
 
 // FindLocalTailscaleIP inspects system network interfaces for an active 100.x.y.z IP.
@@ -97,6 +98,7 @@ func DiscoverTailscalePeers() ([]DiscoveredPeer, error) {
 	}
 
 	cmd := exec.Command(bin, "status", "--json")
+	hideCmd(cmd)
 	out, err := cmd.Output()
 	if err != nil {
 		return nil, fmt.Errorf("tailscale status failed: %w", err)
@@ -116,6 +118,9 @@ func DiscoverTailscalePeers() ([]DiscoveredPeer, error) {
 	}
 
 	var peers []DiscoveredPeer
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+
 	for _, p := range status.Peer {
 		ip := ""
 		for _, tip := range p.TailscaleIPs {
@@ -135,29 +140,36 @@ func DiscoverTailscalePeers() ([]DiscoveredPeer, error) {
 			OS:       p.OS,
 		}
 
-		// Probe peer's /api/health with a short timeout to retrieve friendly Bridge names
 		if p.Online {
-			client := http.Client{Timeout: 1500 * time.Millisecond}
-			resp, err := client.Get(fmt.Sprintf("http://%s:8765/api/health", ip))
-			if err == nil {
-				var hr struct {
-					NodeName string `json:"node_name"`
-					PeerName string `json:"peer_name"`
-				}
-				if json.NewDecoder(resp.Body).Decode(&hr) == nil {
-					if hr.NodeName != "" {
-						dp.BridgeName = hr.NodeName
+			wg.Add(1)
+			go func(d DiscoveredPeer) {
+				defer wg.Done()
+				client := http.Client{Timeout: 1500 * time.Millisecond}
+				resp, err := client.Get(fmt.Sprintf("http://%s:8765/api/health", d.IP))
+				if err == nil {
+					var hr struct {
+						NodeName string `json:"node_name"`
+						PeerName string `json:"peer_name"`
 					}
-					if hr.PeerName != "" {
-						dp.MyName = hr.PeerName
+					if json.NewDecoder(resp.Body).Decode(&hr) == nil {
+						if hr.NodeName != "" {
+							d.BridgeName = hr.NodeName
+						}
+						if hr.PeerName != "" {
+							d.MyName = hr.PeerName
+						}
 					}
+					resp.Body.Close()
 				}
-				resp.Body.Close()
-			}
+				mu.Lock()
+				peers = append(peers, d)
+				mu.Unlock()
+			}(dp)
+		} else {
+			peers = append(peers, dp)
 		}
-
-		peers = append(peers, dp)
 	}
+	wg.Wait()
 
 	return peers, nil
 }
@@ -203,8 +215,13 @@ func EnsureTailscaleConnected() (string, error) {
 	}
 
 	// Ensure Windows service is active if applicable
-	_ = exec.Command("net", "start", "Tailscale").Run()
-	_ = exec.Command("net", "start", "Tailscale IPN").Run()
+	cmdNet1 := exec.Command("net", "start", "Tailscale")
+	hideCmd(cmdNet1)
+	_ = cmdNet1.Run()
+
+	cmdNet2 := exec.Command("net", "start", "Tailscale IPN")
+	hideCmd(cmdNet2)
+	_ = cmdNet2.Run()
 
 	// 1. Check if already connected with a valid 100.x.y.z IP
 	localIP := GetTailscaleIP()
@@ -223,6 +240,7 @@ func EnsureTailscaleConnected() (string, error) {
 	fmt.Println("======================================================================")
 
 	loginCmd := exec.Command(bin, "login")
+	hideCmd(loginCmd)
 	stdout, err1 := loginCmd.StdoutPipe()
 	stderr, err2 := loginCmd.StderrPipe()
 
@@ -260,10 +278,14 @@ func EnsureTailscaleConnected() (string, error) {
 			_ = OpenBrowser(url)
 		case <-time.After(6 * time.Second):
 			// Fallback: trigger general tailscale up
-			_ = exec.Command(bin, "up").Start()
+			cmdUp := exec.Command(bin, "up")
+			hideCmd(cmdUp)
+			_ = cmdUp.Start()
 		}
 	} else {
-		_ = exec.Command(bin, "up").Start()
+		cmdUp := exec.Command(bin, "up")
+		hideCmd(cmdUp)
+		_ = cmdUp.Start()
 	}
 
 	// 3. Poll for successful login in the browser
@@ -295,6 +317,9 @@ func CreateBridgeShortcuts(peerName string) error {
 // CreateBridgeShortcutsForPeers configures Windows Virtual Printers and SendTo shortcuts
 // for all connected peer devices in the multi-device network, plus the single global shared folder.
 func CreateBridgeShortcutsForPeers(peers []config.PeerDevice) error {
+	shortcutsMu.Lock()
+	defer shortcutsMu.Unlock()
+
 	// 1. Desktop Shortcuts: ONLY ONE global shared folder shortcut
 	sharedLnkName := "Bridge Shared Folder.lnk"
 	for _, d := range GetAllDesktopDirs() {
@@ -368,69 +393,97 @@ func CreateBridgeShortcutsForPeers(peers []config.PeerDevice) error {
 	return nil
 }
 
-// AutoUpgradeExisting detects if an older version of Bridge is installed, migrates it, and updates binary/shortcuts.
+// UpgradeInstallation cleanly upgrades the installed Bridge service to the specified source executable.
+// It is explicitly triggered by user confirmation, preventing unwanted auto-upgrades when opening bridge.exe.
+func UpgradeInstallation(sourceExe string) error {
+	fmt.Println()
+	fmt.Println("======================================================================")
+	fmt.Println("                      UPGRADING BRIDGE SERVICE                        ")
+	fmt.Println("======================================================================")
+
+	// Verify source executable exists
+	srcInfo, err := os.Stat(sourceExe)
+	if err != nil {
+		return fmt.Errorf("source binary not accessible: %w", err)
+	}
+	if srcInfo.IsDir() {
+		return fmt.Errorf("source path is a directory, not an executable file")
+	}
+
+	fmt.Println("[1/5] Stopping active Bridge background services...")
+	KillOtherBridgeProcesses()
+	time.Sleep(500 * time.Millisecond)
+
+	// Replace TargetExe if source is different
+	if !strings.EqualFold(filepath.Clean(sourceExe), filepath.Clean(TargetExe)) {
+		fmt.Printf("[2/5] Deploying updated binary to %s...\n", TargetExe)
+		src, err := os.Open(sourceExe)
+		if err != nil {
+			return fmt.Errorf("failed to open source executable: %w", err)
+		}
+		defer src.Close()
+
+		copied := false
+		for attempt := 0; attempt < 5; attempt++ {
+			_, _ = src.Seek(0, io.SeekStart)
+			dst, err := os.OpenFile(TargetExe, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0755)
+			if err == nil {
+				_, _ = io.Copy(dst, src)
+				dst.Close()
+				copied = true
+				break
+			}
+			time.Sleep(300 * time.Millisecond)
+		}
+		if !copied {
+			return fmt.Errorf("failed to overwrite %s: file may still be in use", TargetExe)
+		}
+	} else {
+		fmt.Printf("[2/5] Verified installation at %s.\n", TargetExe)
+	}
+
+	fmt.Println("[3/5] Refreshing system tray icons and configuration...")
+	_, _ = tray.EnsureIcons(TargetIcons)
+
+	cfg, _ := config.LoadConfig(TargetConfig)
+	if cfg != nil {
+		if sumatra := FindSumatraPDF(); sumatra != "" {
+			cfg.SumatraPath = sumatra
+		}
+		_ = config.SaveConfig(TargetConfig, cfg)
+	}
+
+	fmt.Println("[4/5] Updating startup registration (Session 1 taskbar tray)...")
+	_ = RegisterInteractiveStartup()
+
+	if cfg != nil {
+		_ = CreateBridgeShortcutsForPeers(cfg.GetPeers())
+	}
+
+	fmt.Println("[5/5] Restarting Bridge background service...")
+	cmd := exec.Command(TargetExe, "-autostart")
+	hideCmd(cmd)
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("failed to start Bridge background service: %w", err)
+	}
+
+	fmt.Println()
+	fmt.Println("[✓] Bridge has been successfully upgraded and restarted in the background!")
+	fmt.Println("======================================================================")
+	return nil
+}
+
+// AutoUpgradeExisting detects if an older version of Bridge is installed and runs upgrade.
+// Deprecated: Opening bridge.exe now presents explicit options instead of auto-upgrading without consent.
 func AutoUpgradeExisting() bool {
 	if _, err := os.Stat(TargetConfig); os.IsNotExist(err) {
 		return false
 	}
-
-	log.Printf("[AutoUpgrade] Existing Bridge installation detected. Performing automatic upgrade...")
-
-	cfg, err := config.LoadConfig(TargetConfig)
-	if err != nil {
-		return false
-	}
-
-	// Ensure SumatraPDF exists
-	if sumatra := FindSumatraPDF(); sumatra != "" {
-		cfg.SumatraPath = sumatra
-	} else {
-		if installed, err := InstallSumatraPDF(); err == nil {
-			cfg.SumatraPath = installed
-		}
-	}
-
-	// Ensure icons exist
-	_, _ = tray.EnsureIcons(TargetIcons)
-
-	// Save migrated configuration
-	_ = config.SaveConfig(TargetConfig, cfg)
-
-	// Kill legacy Session 0 scheduled task so it won't block Session 1 tray dot
-	_ = exec.Command("schtasks", "/Delete", "/TN", TaskName, "/F").Run()
-
-	// Register interactive Session 1 startup
-	_ = RegisterInteractiveStartup()
-
-	// Replace binary if running from another location
 	currentExe, err := os.Executable()
-	if err == nil && !strings.EqualFold(filepath.Clean(currentExe), filepath.Clean(TargetExe)) {
-		KillOtherBridgeProcesses()
-		time.Sleep(500 * time.Millisecond)
-
-		src, err := os.Open(currentExe)
-		if err == nil {
-			defer src.Close()
-			for attempt := 0; attempt < 5; attempt++ {
-				dst, err := os.OpenFile(TargetExe, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0755)
-				if err == nil {
-					_, _ = io.Copy(dst, src)
-					dst.Close()
-					break
-				}
-				time.Sleep(300 * time.Millisecond)
-			}
-		}
+	if err != nil {
+		currentExe = TargetExe
 	}
-
-	// Decommission legacy print folders if present
-	_ = os.RemoveAll(`C:\Bridge\Print`)
-
-	// Refresh shortcuts and virtual printers for all peers
-	_ = CreateBridgeShortcutsForPeers(cfg.GetPeers())
-
-	log.Printf("[AutoUpgrade] Upgrade complete! Service configured for interactive Session 1.")
-	return true
+	return UpgradeInstallation(currentExe) == nil
 }
 
 // InstallService deploys the executable, directories, firewall rule, and interactive startup.
@@ -438,7 +491,9 @@ func InstallService(cfg *config.Config) error {
 	fmt.Println("[1/5] Setting up directories and icons...")
 
 	// Kill legacy Session 0 scheduled task and any other old bridge processes
-	_ = exec.Command("schtasks", "/Delete", "/TN", TaskName, "/F").Run()
+	cmdTask := exec.Command("schtasks", "/Delete", "/TN", TaskName, "/F")
+	hideCmd(cmdTask)
+	_ = cmdTask.Run()
 	KillOtherBridgeProcesses()
 
 	dirs := []string{
@@ -465,6 +520,7 @@ func InstallService(cfg *config.Config) error {
 		if err == nil {
 			defer src.Close()
 			for attempt := 0; attempt < 5; attempt++ {
+				_, _ = src.Seek(0, io.SeekStart)
 				dst, err := os.OpenFile(TargetExe, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0755)
 				if err == nil {
 					_, _ = io.Copy(dst, src)
@@ -482,15 +538,20 @@ func InstallService(cfg *config.Config) error {
 	}
 
 	fmt.Println("[3/5] Configuring Windows Firewall for TCP ports 8765 and 9100-9120...")
-	_ = exec.Command("netsh", "advfirewall", "firewall", "delete", "rule", fmt.Sprintf("name=%s", FirewallRule)).Run()
-	_ = exec.Command("netsh", "advfirewall", "firewall", "add", "rule",
+	cmdFwDel := exec.Command("netsh", "advfirewall", "firewall", "delete", "rule", fmt.Sprintf("name=%s", FirewallRule))
+	hideCmd(cmdFwDel)
+	_ = cmdFwDel.Run()
+
+	cmdFwAdd := exec.Command("netsh", "advfirewall", "firewall", "add", "rule",
 		fmt.Sprintf("name=%s", FirewallRule),
 		"dir=in",
 		"action=allow",
 		"protocol=TCP",
 		fmt.Sprintf("localport=%d,9100-9120", cfg.ListenPort),
 		"profile=any",
-		"description=Bridge multi-device file sync and virtual print communication").Run()
+		"description=Bridge multi-device file sync and virtual print communication")
+	hideCmd(cmdFwAdd)
+	_ = cmdFwAdd.Run()
 
 	fmt.Println("[4/5] Registering Interactive Startup (Session 1 Taskbar Tray Dot)...")
 	_ = RegisterInteractiveStartup()
@@ -519,8 +580,13 @@ func VerifyHealth(port int) error {
 // UninstallService cleanly removes startup entries, virtual printers, firewall rule, and shortcuts.
 func UninstallService() error {
 	fmt.Println("[*] Stopping Bridge processes and removing Scheduled Task...")
-	_ = exec.Command("schtasks", "/Delete", "/TN", TaskName, "/F").Run()
-	_ = exec.Command("taskkill", "/F", "/IM", "bridge.exe").Run()
+	cmdSch := exec.Command("schtasks", "/Delete", "/TN", TaskName, "/F")
+	hideCmd(cmdSch)
+	_ = cmdSch.Run()
+
+	cmdKill := exec.Command("taskkill", "/F", "/IM", "bridge.exe")
+	hideCmd(cmdKill)
+	_ = cmdKill.Run()
 
 	fmt.Println("[*] Removing interactive startup registry keys...")
 	UnregisterInteractiveStartup()
@@ -529,7 +595,9 @@ func UninstallService() error {
 	_ = UninstallAllVirtualPrinters()
 
 	fmt.Println("[*] Removing Windows Firewall rule...")
-	_ = exec.Command("netsh", "advfirewall", "firewall", "delete", "rule", fmt.Sprintf("name=%s", FirewallRule)).Run()
+	cmdFwDel2 := exec.Command("netsh", "advfirewall", "firewall", "delete", "rule", fmt.Sprintf("name=%s", FirewallRule))
+	hideCmd(cmdFwDel2)
+	_ = cmdFwDel2.Run()
 
 	fmt.Println("[*] Cleaning up Desktop shortcuts...")
 	for _, d := range GetAllDesktopDirs() {
@@ -560,11 +628,15 @@ func UninstallService() error {
 	return nil
 }
 
-// RestartService restarts Bridge in the current interactive session.
+// RestartService restarts Bridge in the current interactive session with taskbar tray icon.
 func RestartService() error {
-	_ = exec.Command("schtasks", "/Delete", "/TN", TaskName, "/F").Run()
+	cmdSch := exec.Command("schtasks", "/Delete", "/TN", TaskName, "/F")
+	hideCmd(cmdSch)
+	_ = cmdSch.Run()
+
 	KillOtherBridgeProcesses()
 	time.Sleep(500 * time.Millisecond)
-	cmd := exec.Command(TargetExe)
+	cmd := exec.Command(TargetExe, "-autostart")
+	hideCmd(cmd)
 	return cmd.Start()
 }

@@ -2,6 +2,8 @@
 
 package printer
 
+import "os/exec"
+
 // GetDefaultWindowsPrinter stub for non-Windows platforms.
 func GetDefaultWindowsPrinter() (string, error) {
 	return "MockPrinter", nil
@@ -11,3 +13,6 @@ func GetDefaultWindowsPrinter() (string, error) {
 func GetTargetPhysicalPrinter() (string, error) {
 	return "MockPrinter", nil
 }
+
+func hideCmd(cmd *exec.Cmd) {}
+

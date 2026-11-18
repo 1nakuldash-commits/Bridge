@@ -26,13 +26,24 @@ import (
 )
 
 func main() {
+	// Early console suppression for background / autostart launches
+	for _, arg := range os.Args[1:] {
+		if arg == "-autostart" || arg == "-tray" || arg == "-service" || arg == "-silent" {
+			tray.HideConsole()
+			break
+		}
+	}
+
 	serviceFlag := flag.Bool("service", false, "Run silently as background service without tray icon")
+	autostartFlag := flag.Bool("autostart", false, "Run in background with taskbar tray icon (used at system boot / startup)")
+	trayFlag := flag.Bool("tray", false, "Run in background with taskbar tray icon")
 	installFlag := flag.Bool("install", false, "Install Bridge background service")
 	setupFlag := flag.Bool("setup", false, "Run interactive setup wizard")
 	uninstallFlag := flag.Bool("uninstall", false, "Uninstall Bridge background service")
 	statusFlag := flag.Bool("status", false, "Check status of Bridge background service")
 	sendPrintFlag := flag.Bool("send-print", false, "Send file to remote printer (used by Windows Explorer Send-To)")
 
+	upgradeFlag := flag.String("upgrade", "", "Upgrade Bridge installation using specified binary")
 	nameFlag := flag.String("name", "", "Name of this PC for automated install")
 	peerFlag := flag.String("peer", "", "Peer Tailscale IP/URL for automated install")
 	tokenFlag := flag.String("token", "", "Auth token for automated install")
@@ -42,7 +53,7 @@ func main() {
 	flag.Parse()
 
 	// 1. Right-Click SendTo Handler ("Print on <PeerName>")
-	if *sendPrintFlag || (len(flag.Args()) > 0 && !*serviceFlag && !*installFlag && !*setupFlag && !*uninstallFlag && !*statusFlag) {
+	if *sendPrintFlag || (len(flag.Args()) > 0 && !*serviceFlag && !*autostartFlag && !*trayFlag && !*installFlag && !*setupFlag && !*uninstallFlag && !*statusFlag && *upgradeFlag == "") {
 		targetFile := ""
 		if len(flag.Args()) > 0 {
 			targetFile = flag.Args()[0]
@@ -72,7 +83,20 @@ func main() {
 		return
 	}
 
-	// 4. Automated / Headless Install Mode
+	// 4. Upgrade Mode
+	if *upgradeFlag != "" {
+		if !installer.IsElevated() {
+			_ = installer.SelfElevate(os.Args[1:])
+			return
+		}
+		if err := installer.UpgradeInstallation(*upgradeFlag); err != nil {
+			fmt.Fprintf(os.Stderr, "Upgrade failed: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+
+	// 5. Automated / Headless Install Mode
 	if *installFlag && *peerFlag != "" {
 		if !installer.IsElevated() {
 			_ = installer.SelfElevate(os.Args[1:])
@@ -82,8 +106,14 @@ func main() {
 		return
 	}
 
-	// 5. Explicit Setup Mode
+	// 6. Explicit Setup Mode (-setup or -install without peer)
 	if *setupFlag || (*installFlag && *peerFlag == "") {
+		if !installer.AcquireInteractiveLock() {
+			return
+		}
+		defer installer.ReleaseInteractiveLock()
+		installer.SetDashboardConsoleTitle("Bridge Multi-Device Setup")
+
 		if !installer.IsElevated() {
 			_ = installer.SelfElevate(os.Args[1:])
 			return
@@ -92,15 +122,52 @@ func main() {
 			fmt.Fprintf(os.Stderr, "Setup error: %v\n", err)
 			os.Exit(1)
 		}
-		runUnifiedService(installer.TargetConfig, *serviceFlag)
 		return
 	}
 
-	// 6. Check for First-Time Setup vs Existing Upgrade vs Running Service
 	resolvedConfig := *configPath
 	if resolvedConfig == "" {
 		resolvedConfig = installer.TargetConfig
 	}
+
+	// 7. Background / Autostart Mode (System boot or background daemon)
+	if *autostartFlag || *trayFlag || *serviceFlag {
+		tray.HideConsole()
+
+		// Ensure only one background service instance runs
+		if !installer.AcquireServiceLock() {
+			return
+		}
+		defer installer.ReleaseServiceLock()
+
+		// If config does not exist or is not yet configured, exit silently at boot (do not spawn setup terminal)
+		existingCfg, err := config.LoadConfig(resolvedConfig)
+		if err != nil || !existingCfg.Configured {
+			log.Printf("[Autostart] Config not ready at %s. Exiting background start.", resolvedConfig)
+			return
+		}
+
+		// Ensure duplicate startup registrations are cleaned up
+		_ = installer.RegisterInteractiveStartup()
+
+		// If an un-mutexed legacy process is currently bound to port, kill it to take over
+		if installer.VerifyHealth(existingCfg.ListenPort) == nil {
+			installer.KillOtherBridgeProcesses()
+			time.Sleep(300 * time.Millisecond)
+		}
+
+		// Run unified background service (headless=true if -service, false if -autostart/-tray with taskbar tray)
+		runUnifiedService(resolvedConfig, *serviceFlag)
+		return
+	}
+
+	// 8. Interactive Launch Mode (User double-clicked bridge.exe or ran from terminal)
+	// Enforce single interactive terminal: if already open, bring existing window to front
+	if !installer.AcquireInteractiveLock() {
+		return
+	}
+	defer installer.ReleaseInteractiveLock()
+	installer.SetDashboardConsoleTitle("Bridge Multi-Device Dashboard")
 
 	needsSetup := false
 	if _, err := os.Stat(resolvedConfig); os.IsNotExist(err) {
@@ -109,16 +176,11 @@ func main() {
 		existingCfg, err := config.LoadConfig(resolvedConfig)
 		if err != nil || !existingCfg.Configured {
 			needsSetup = true
-		} else if installer.VerifyHealth(existingCfg.ListenPort) == nil && !*serviceFlag {
-			// Service is already running! Launch interactive Control Dashboard
-			if err := installer.RunDashboard(); err != nil {
-				fmt.Fprintf(os.Stderr, "Dashboard error: %v\n", err)
-			}
-			return
 		}
 	}
 
-	if needsSetup && !*serviceFlag {
+	// First-Time Setup Wizard (only if never configured before)
+	if needsSetup {
 		if !installer.IsElevated() {
 			_ = installer.SelfElevate(os.Args[1:])
 			return
@@ -127,16 +189,16 @@ func main() {
 			fmt.Fprintf(os.Stderr, "Setup error: %v\n", err)
 			os.Exit(1)
 		}
-		// Directly run unified service in the current session!
-		runUnifiedService(installer.TargetConfig, *serviceFlag)
 		return
 	}
 
-	// Service not running: Auto-upgrade if needed and run unified service
-	installer.AutoUpgradeExisting()
+	// Ensure clean autostart registration
+	_ = installer.RegisterInteractiveStartup()
 
-	// 7. Run Unified Service (with Multifunctional System Tray Icon!)
-	runUnifiedService(resolvedConfig, *serviceFlag)
+	// Already configured: Launch Control Dashboard with options (NO blind auto-updating)
+	if err := installer.RunDashboard(); err != nil {
+		fmt.Fprintf(os.Stderr, "Dashboard error: %v\n", err)
+	}
 }
 
 func handleSendPrint(filePath, targetPeer string) {
@@ -237,6 +299,9 @@ func runUnifiedService(configPath string, headless bool) {
 	// 2. Multi-Peer Mesh Sync Engine
 	syncEngine := bridgesync.NewSyncEngine(cfg.SharedDir, "", cfg.AuthToken, stateMgr)
 	syncEngine.UpdatePeerURLs(cfg.GetPeerURLs())
+	if localTS := installer.GetTailscaleIP(); localTS != "" {
+		syncEngine.SetLocalURL(fmt.Sprintf("http://%s:%d", localTS, cfg.ListenPort))
+	}
 	if err := syncEngine.Start(); err != nil {
 		log.Fatalf("Failed to start sync engine: %v", err)
 	}
@@ -244,6 +309,7 @@ func runUnifiedService(configPath string, headless bool) {
 
 	// 3. HTTP API Server
 	httpServer := server.NewServer(cfg, stateMgr, printService)
+	httpServer.SetSyncEngine(syncEngine)
 	go func() {
 		if err := httpServer.Start(); err != nil && err != http.ErrServerClosed {
 			log.Printf("HTTP server terminated: %v", err)
@@ -306,10 +372,10 @@ func runUnifiedService(configPath string, headless bool) {
 		if trayMgr != nil {
 			trayMgr.UpdateNetworkStatus(cfg.GetNodeName(), cfg.GetPeers())
 		}
-		// Catch-up synchronize files immediately with the connecting peer
-		syncEngine.ReconcileWithPeer(peer.URL)
-
+		// Catch-up synchronize files immediately ONLY when a brand new peer connects (not on repeated pings)
 		if isNew {
+			syncEngine.ReconcileWithPeer(peer.URL)
+
 			go func() {
 				_ = installer.CreateBridgeShortcutsForPeers(cfg.GetPeers())
 			}()
@@ -425,6 +491,12 @@ func runUnifiedService(configPath string, headless bool) {
 					trayMgr.UpdateNetworkStatus(cfg.GetNodeName(), cfg.GetPeers())
 				}
 			},
+			OnCopyIP: func() string {
+				return installer.GetTailscaleIP()
+			},
+			OnOpenLogs: func() {
+				_ = exec.Command("explorer.exe", cfg.LogDir).Start()
+			},
 			OnExit: func() {
 				if trayMgr != nil {
 					trayMgr.Stop()
@@ -466,6 +538,8 @@ func runUnifiedService(configPath string, headless bool) {
 
 		// Periodic connection watcher to keep tray icon dot updated and maintain transitive mesh discovery
 		go func() {
+			peerFailCounts := make(map[string]int)
+
 			for {
 				time.Sleep(3 * time.Second)
 				if trayMgr == nil {
@@ -498,15 +572,26 @@ func runUnifiedService(configPath string, headless bool) {
 						defer mu.Unlock()
 
 						wasOnline := peers[idx].Online
-						if healthy != wasOnline {
-							peers[idx].Online = healthy
-							cfg.SetPeerOnlineStatus(p.URL, healthy)
-							statusChanged = true
-							// If peer transitioned from offline to online, trigger catch-up sync!
-							if healthy && !wasOnline {
+						if healthy {
+							peerFailCounts[p.URL] = 0
+							if !wasOnline {
+								peers[idx].Online = true
+								cfg.SetPeerOnlineStatus(p.URL, true)
+								statusChanged = true
+								// If peer transitioned from offline to online, trigger catch-up sync!
 								syncEngine.ReconcileWithPeer(p.URL)
 							}
+						} else {
+							peerFailCounts[p.URL]++
+							// Debounce ping jitter: Require 3 consecutive failed health checks (~9-12s of sustained downtime)
+							// before marking a connected peer as offline. This eliminates flickering between yellow and green!
+							if peerFailCounts[p.URL] >= 3 && wasOnline {
+								peers[idx].Online = false
+								cfg.SetPeerOnlineStatus(p.URL, false)
+								statusChanged = true
+							}
 						}
+
 						if healthy && hr != nil {
 							peers[idx].LastSeen = time.Now()
 							if learnedName != "" && learnedName != p.Name {
@@ -573,7 +658,7 @@ func checkPeerHealthy(peerURL, token, nodeName string) (bool, string, *server.He
 	if peerURL == "" {
 		return false, "", nil
 	}
-	client := http.Client{Timeout: 2 * time.Second}
+	client := http.Client{Timeout: 3500 * time.Millisecond}
 	req, err := http.NewRequest("GET", fmt.Sprintf("%s/api/health", peerURL), nil)
 	if err != nil {
 		return false, "", nil
@@ -633,6 +718,8 @@ func runHeadlessInstall(name, peer, token string) {
 		fmt.Fprintf(os.Stderr, "Installation failed: %v\n", err)
 		os.Exit(1)
 	}
+
+	_ = installer.RestartService()
 
 	fmt.Println("[✓] Headless installation completed successfully.")
 }
