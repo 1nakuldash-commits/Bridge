@@ -29,6 +29,7 @@ type Server struct {
 	startTime         time.Time
 	peerUpdater       func(peer config.PeerDevice, isNew bool)
 	onPrintDispatched func(fileName, peerName string)
+	onSyncReceived    func(relPath string)
 }
 
 // HealthResponse represents the payload returned by GET /api/health.
@@ -93,6 +94,11 @@ func (s *Server) SetOnPrintDispatched(fn func(fileName, peerName string)) {
 	s.onPrintDispatched = fn
 }
 
+// SetOnSyncReceived sets a callback invoked when a file is received via sync upload.
+func (s *Server) SetOnSyncReceived(fn func(relPath string)) {
+	s.onSyncReceived = fn
+}
+
 // Start runs the HTTP listener.
 func (s *Server) Start() error {
 	log.Printf("[Server] Listening on :%d (Node: %s)", s.cfg.ListenPort, s.cfg.GetNodeName())
@@ -128,13 +134,13 @@ func (s *Server) checkAutoPair(r *http.Request) {
 	cleanPeerURL := strings.TrimRight(strings.TrimSpace(peerHeader), "/")
 	cleanNodeName := strings.TrimSpace(nodeHeader)
 
-	if cleanNodeName != "" && strings.EqualFold(cleanNodeName, s.cfg.GetNodeName()) {
-		return // Ignore self
+	if config.IsSelfTarget(cleanNodeName, "", cleanPeerURL, s.cfg.GetNodeName(), s.cfg.ListenPort) {
+		return // Strictly ignore self
 	}
 
 	if cleanPeerURL != "" || cleanNodeName != "" {
 		dev, isNew := s.cfg.AddOrUpdatePeer(cleanNodeName, "", cleanPeerURL)
-		if isNew {
+		if isNew && dev.Name != "" {
 			log.Printf("[Server] Discovered new peer: '%s' (%s) -> Assigned SpoolPort %d", dev.Name, dev.URL, dev.SpoolPort)
 			if s.peerUpdater != nil {
 				s.peerUpdater(dev, isNew)
@@ -151,7 +157,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	}
 
 	token := r.Header.Get("X-Bridge-Token")
-	if token == s.cfg.AuthToken {
+	if token == s.cfg.AuthToken && r.Header.Get("X-Bridge-Probe") == "" {
 		s.checkAutoPair(r)
 	}
 
@@ -159,8 +165,9 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	onlineCount := 0
 	anyReachable := false
 
-	// Fast parallel reachability probe if not a probe ping itself
-	if r.Header.Get("X-Bridge-Probe") == "" && len(peers) > 0 {
+	// Fast parallel reachability probe ONLY if explicitly requested via ?probe=sync
+	// Routine health checks return instantly using dynamic cached status, eliminating latency
+	if r.URL.Query().Get("probe") == "sync" && r.Header.Get("X-Bridge-Probe") == "" && len(peers) > 0 {
 		var wg sync.WaitGroup
 		var mu sync.Mutex
 		onlineCount = 0
@@ -173,7 +180,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 			wg.Add(1)
 			go func(dev *config.PeerDevice) {
 				defer wg.Done()
-				client := http.Client{Timeout: 1200 * time.Millisecond}
+				client := http.Client{Timeout: 500 * time.Millisecond}
 				req, err := http.NewRequest("GET", fmt.Sprintf("%s/api/health", dev.URL), nil)
 				if err != nil {
 					return
@@ -197,6 +204,13 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 			}(p)
 		}
 		wg.Wait()
+	} else {
+		for _, p := range peers {
+			if p.Online {
+				onlineCount++
+				anyReachable = true
+			}
+		}
 	}
 
 	queueDepth := 0
@@ -247,12 +261,15 @@ func (s *Server) handlePeers(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "Invalid peer JSON", http.StatusBadRequest)
 			return
 		}
-		if dev.Name != "" && strings.EqualFold(dev.Name, s.cfg.GetNodeName()) {
+		if config.IsSelfTarget(dev.Name, dev.IP, dev.URL, s.cfg.GetNodeName(), s.cfg.ListenPort) {
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(dev)
 			return
 		}
 		addedDev, isNew := s.cfg.AddOrUpdatePeer(dev.Name, dev.IP, dev.URL)
+		if s.cfg.ConfigPath != "" {
+			_ = config.SaveConfig(s.cfg.ConfigPath, s.cfg)
+		}
 		if isNew && s.peerUpdater != nil {
 			s.peerUpdater(addedDev, isNew)
 		}
@@ -309,6 +326,10 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 			log.Printf("[Server] Error receiving sync file %s: %v", relPath, err)
 			http.Error(w, fmt.Sprintf("Sync failed: %v", err), http.StatusInternalServerError)
 			return
+		}
+
+		if s.onSyncReceived != nil {
+			s.onSyncReceived(relPath)
 		}
 
 		w.Header().Set("Content-Type", "application/json")

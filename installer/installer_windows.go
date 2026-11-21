@@ -12,6 +12,9 @@ import (
 	"time"
 	"unsafe"
 
+	"bridge/config"
+	"bridge/printer"
+
 	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/registry"
 )
@@ -60,7 +63,15 @@ func SelfElevate(args []string) error {
 	}
 	verbPtr, _ := windows.UTF16PtrFromString("runas")
 	exePtr, _ := windows.UTF16PtrFromString(exe)
-	cwdPtr, _ := windows.UTF16PtrFromString(filepath.Dir(exe))
+
+	cwd := filepath.Dir(exe)
+	for _, a := range args {
+		if strings.Contains(a, "-uninstall") {
+			cwd = `C:\`
+			break
+		}
+	}
+	cwdPtr, _ := windows.UTF16PtrFromString(cwd)
 
 	var argPtr *uint16
 	if len(args) > 0 {
@@ -189,42 +200,33 @@ func GetTailscaleIP() string {
 	return ""
 }
 
-// FindSumatraPDF searches for SumatraPDF.exe in standard locations.
+// FindSumatraPDF searches for SumatraPDF.exe across standard system locations.
 func FindSumatraPDF() string {
-	if p, err := exec.LookPath("SumatraPDF.exe"); err == nil {
-		return p
-	}
-	candidates := []string{
-		`C:\Program Files\SumatraPDF\SumatraPDF.exe`,
-		`C:\Program Files (x86)\SumatraPDF\SumatraPDF.exe`,
-		`C:\BridgeApp\SumatraPDF.exe`,
-		filepath.Join(os.Getenv("LOCALAPPDATA"), `SumatraPDF\SumatraPDF.exe`),
-	}
-	for _, c := range candidates {
-		if _, err := os.Stat(c); err == nil {
-			return c
-		}
-	}
-	return ""
+	return printer.FindSumatraPDF()
 }
 
-// InstallSumatraPDF installs SumatraPDF silently via winget.
+// InstallSumatraPDF installs standalone SumatraPDF silently and verifies the executable.
 func InstallSumatraPDF() (string, error) {
-	fmt.Println("[*] Installing SumatraPDF silently via winget...")
-	cmd := exec.Command("winget", "install", "-e", "--id", "SumatraPDF.SumatraPDF", "--accept-package-agreements", "--accept-source-agreements", "--silent")
-	hideCmd(cmd)
-	out, err := cmd.CombinedOutput()
+	fmt.Println("[*] Auto-provisioning standalone Silent Print Engine (SumatraPDF)...")
+	path, err := printer.EnsureSumatraPDF()
 	if err != nil {
-		return "", fmt.Errorf("winget install SumatraPDF failed: %w (%s)", err, string(out))
+		// Secondary fallback: winget if available
+		fmt.Printf("[*] Direct standalone download returned (%v); trying winget fallback...\n", err)
+		cmd := exec.Command("winget", "install", "-e", "--id", "SumatraPDF.SumatraPDF", "--accept-package-agreements", "--accept-source-agreements", "--silent")
+		hideCmd(cmd)
+		_, _ = cmd.CombinedOutput()
+		for i := 0; i < 5; i++ {
+			if found := printer.FindSumatraPDF(); found != "" {
+				_ = printer.CreateSumatraShortcut(found)
+				return found, nil
+			}
+			time.Sleep(1 * time.Second)
+		}
+		return "", fmt.Errorf("failed to install SumatraPDF: %w", err)
 	}
 
-	for i := 0; i < 10; i++ {
-		if path := FindSumatraPDF(); path != "" {
-			return path, nil
-		}
-		time.Sleep(1 * time.Second)
-	}
-	return `C:\Program Files\SumatraPDF\SumatraPDF.exe`, nil
+	_ = printer.CreateSumatraShortcut(path)
+	return path, nil
 }
 
 // GetAllDesktopDirs collects all valid desktop directories on the system.
@@ -325,10 +327,22 @@ oLink.Save
 // InstallVirtualPrinter registers a Windows RAW TCP port on 127.0.0.1:port and creates
 // a virtual printer named "Print on <PeerName>".
 func InstallVirtualPrinter(peerName string, port int) error {
+	cleanPeer := SanitizeFileName(peerName)
+	if cleanPeer == "" {
+		return nil
+	}
+
+	localNode := ""
+	if cfg, err := config.LoadConfig(TargetConfig); err == nil && cfg.NodeName != "" {
+		localNode = cfg.NodeName
+	}
+	if config.IsSelfTarget(cleanPeer, "", "", localNode, 0) {
+		return nil // Strictly never install virtual printer for self device
+	}
+
 	if port <= 0 {
 		port = 9101
 	}
-	cleanPeer := SanitizeFileName(peerName)
 	printerName := fmt.Sprintf("Print on %s", cleanPeer)
 	portName := fmt.Sprintf("Bridge_Port_%d", port)
 
@@ -367,7 +381,7 @@ if (-not (Get-PrinterPort -Name $portName -ErrorAction SilentlyContinue)) {
     Add-PrinterPort -Name $portName -PrinterHostAddress '127.0.0.1' -PortNumber $portNumber -ErrorAction Stop
 }
 
-$preferredDrivers = @('Microsoft XPS Document Writer v4', 'Microsoft XPS Document Writer', 'Microsoft Software Printer Driver', 'Generic / Text Only')
+$preferredDrivers = @('Microsoft XPS Document Writer v4', 'Microsoft XPS Document Writer', 'OpenXPS Document Writer')
 $driver = $null
 foreach ($d in $preferredDrivers) {
     if (Get-PrinterDriver -Name $d -ErrorAction SilentlyContinue) {
@@ -376,13 +390,46 @@ foreach ($d in $preferredDrivers) {
     }
 }
 if (-not $driver) {
-    $driver = (Get-PrinterDriver -ErrorAction SilentlyContinue | Where-Object { $_.Name -notlike '*PDF*' } | Select-Object -First 1).Name
+    try { Add-PrinterDriver -Name 'Microsoft XPS Document Writer v4' -ErrorAction SilentlyContinue } catch {}
+    if (Get-PrinterDriver -Name 'Microsoft XPS Document Writer v4' -ErrorAction SilentlyContinue) {
+        $driver = 'Microsoft XPS Document Writer v4'
+    }
 }
 if (-not $driver) {
-    $driver = (Get-PrinterDriver -ErrorAction SilentlyContinue | Select-Object -First 1).Name
+    try { Add-PrinterDriver -Name 'Microsoft XPS Document Writer' -ErrorAction SilentlyContinue } catch {}
+    if (Get-PrinterDriver -Name 'Microsoft XPS Document Writer' -ErrorAction SilentlyContinue) {
+        $driver = 'Microsoft XPS Document Writer'
+    }
 }
 if (-not $driver) {
-    throw "No printer drivers available"
+    # If XPS driver was removed in Windows optional features, enable Printing-XPSServices-Features
+    Start-Process -FilePath "dism.exe" -ArgumentList "/Online /Enable-Feature /FeatureName:Printing-XPSServices-Features /NoRestart /Quiet" -Wait -WindowStyle Hidden -ErrorAction SilentlyContinue
+    foreach ($d in $preferredDrivers) {
+        if (Get-PrinterDriver -Name $d -ErrorAction SilentlyContinue) {
+            $driver = $d
+            break
+        }
+    }
+}
+if (-not $driver) {
+    # Attempt installing XPS driver INF directly from driver store / INF repository
+    $infCandidates = @(
+        "$env:SystemRoot\System32\spool\tools\Microsoft XPS Document Writer\prnms001.inf",
+        "$env:SystemRoot\INF\ntprint.inf"
+    )
+    foreach ($inf in $infCandidates) {
+        if (Test-Path $inf) {
+            try { pnputil.exe /add-driver $inf /install | Out-Null } catch {}
+            try { Add-PrinterDriver -Name 'Microsoft XPS Document Writer v4' -ErrorAction SilentlyContinue } catch {}
+            if (Get-PrinterDriver -Name 'Microsoft XPS Document Writer v4' -ErrorAction SilentlyContinue) {
+                $driver = 'Microsoft XPS Document Writer v4'
+                break
+            }
+        }
+    }
+}
+if (-not $driver) {
+    throw "Microsoft XPS Document Writer driver is required for native remote printing but is not installed. Enable 'Printing-XPSServices-Features' in Windows Features."
 }
 
 if (-not (Get-Printer -Name $printerName -ErrorAction SilentlyContinue)) {
@@ -443,13 +490,60 @@ if ($isPhysicalDefault) {
 	return nil
 }
 
+// RemoveVirtualPrinter uninstalls a specific Bridge virtual printer if present.
+func RemoveVirtualPrinter(peerName string) error {
+	cleanPeer := SanitizeFileName(peerName)
+	printerName := fmt.Sprintf("Print on %s", cleanPeer)
+
+	psScript := fmt.Sprintf(`
+$pName = '%s'
+Get-Printer -Name $pName -ErrorAction SilentlyContinue | Remove-Printer -ErrorAction SilentlyContinue
+Get-CimInstance Win32_Printer -Filter "Name = '$($pName.Replace("'", "''"))'" -ErrorAction SilentlyContinue | Remove-CimInstance -ErrorAction SilentlyContinue
+`, strings.ReplaceAll(printerName, `'`, `''`))
+	cmd := exec.Command("powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", psScript)
+	hideCmd(cmd)
+	return cmd.Run()
+}
+
 // UninstallAllVirtualPrinters removes all Bridge virtual printers and TCP ports.
 func UninstallAllVirtualPrinters() error {
 	psScript := `
+# 1. Clear any stuck print jobs on Bridge virtual printers
 Get-Printer -ErrorAction SilentlyContinue | Where-Object { 
-    $_.PortName -like 'Bridge_Port_*' -or $_.PortName -eq 'Bridge_TCP_Port' -or $_.Name -like 'Print on *' 
+    $_.PortName -like 'Bridge_Port_*' -or $_.PortName -eq 'Bridge_TCP_Port' -or $_.Name -like 'Print on *' -or $_.Name -like '*Bridge*'
+} | ForEach-Object {
+    $pName = $_.Name
+    Get-PrintJob -PrinterName $pName -ErrorAction SilentlyContinue | Remove-PrintJob -ErrorAction SilentlyContinue
+}
+
+# 2. Reset default printer if set to a Bridge virtual printer
+$currDef = $null
+try { $currDef = (Get-CimInstance Win32_Printer -Filter "Default = True" -ErrorAction SilentlyContinue).Name } catch {}
+if ($currDef -and ($currDef -like 'Print on *' -or $currDef -like '*Bridge*')) {
+    $fallback = (Get-CimInstance Win32_Printer -ErrorAction SilentlyContinue | Where-Object {
+        $_.Name -notlike 'Print on *' -and
+        $_.Name -notlike '*Bridge*' -and
+        $_.PortName -notlike 'Bridge_*' -and
+        $_.PortName -ne 'Bridge_TCP_Port'
+    } | Select-Object -First 1).Name
+    if ($fallback) {
+        (New-Object -ComObject WScript.Network).SetDefaultPrinter($fallback)
+    }
+}
+
+# 3. Remove all Bridge virtual printers via standard cmdlet and WMI CIM
+Get-Printer -ErrorAction SilentlyContinue | Where-Object { 
+    $_.PortName -like 'Bridge_Port_*' -or $_.PortName -eq 'Bridge_TCP_Port' -or $_.Name -like 'Print on *' -or $_.Name -like '*Bridge*'
 } | Remove-Printer -ErrorAction SilentlyContinue
 
+Get-CimInstance Win32_Printer -ErrorAction SilentlyContinue | Where-Object {
+    $_.PortName -like 'Bridge_Port_*' -or $_.PortName -eq 'Bridge_TCP_Port' -or $_.Name -like 'Print on *' -or $_.Name -like '*Bridge*'
+} | ForEach-Object {
+    Remove-CimInstance -InputObject $_ -ErrorAction SilentlyContinue
+}
+
+# 4. Restart Spooler to flush port bindings, then remove all Bridge TCP ports
+Restart-Service spooler -Force -ErrorAction SilentlyContinue
 Get-PrinterPort -ErrorAction SilentlyContinue | Where-Object { 
     $_.Name -like 'Bridge_Port_*' -or $_.Name -eq 'Bridge_TCP_Port' 
 } | Remove-PrinterPort -ErrorAction SilentlyContinue
@@ -472,15 +566,21 @@ func KillOtherBridgeProcesses() {
 // AcquireInteractiveLock attempts to acquire a named mutex ensuring only one interactive dashboard/setup terminal runs.
 // If another instance is already running, it brings that instance's console window to the foreground and returns false.
 func AcquireInteractiveLock() bool {
+	if interactiveMutex != 0 {
+		BringDashboardToFront()
+		return false
+	}
 	mutexName, _ := windows.UTF16PtrFromString("Local\\BridgeApp_Interactive_Mutex")
 	h, err := windows.CreateMutex(nil, false, mutexName)
-	if err != nil {
-		return true // Fallback: allow launch if mutex creation fails
-	}
-	if windows.GetLastError() == windows.ERROR_ALREADY_EXISTS {
+	if err == windows.ERROR_ALREADY_EXISTS {
 		BringDashboardToFront()
-		_ = windows.CloseHandle(h)
+		if h != 0 {
+			_ = windows.CloseHandle(h)
+		}
 		return false
+	}
+	if err != nil && h == 0 {
+		return true // Fallback: allow launch if mutex creation fails
 	}
 	interactiveMutex = h
 	return true
@@ -540,19 +640,30 @@ func SetDashboardConsoleTitle(title string) {
 // AcquireServiceLock ensures only one background service runs.
 // It checks the Global namespace first, with fallback to Local namespace for unprivileged standard user accounts.
 func AcquireServiceLock() bool {
+	if serviceMutex != 0 {
+		return false
+	}
 	mutexName, _ := windows.UTF16PtrFromString("Global\\BridgeApp_Service_Mutex")
 	h, err := windows.CreateMutex(nil, false, mutexName)
-	if err != nil {
+	if err == windows.ERROR_ALREADY_EXISTS {
+		if h != 0 {
+			_ = windows.CloseHandle(h)
+		}
+		return false
+	}
+	if err != nil && h == 0 {
 		// Fallback for non-admin tokens without SeCreateGlobalPrivilege
 		localName, _ := windows.UTF16PtrFromString("Local\\BridgeApp_Service_Mutex")
 		h, err = windows.CreateMutex(nil, false, localName)
-		if err != nil {
+		if err == windows.ERROR_ALREADY_EXISTS {
+			if h != 0 {
+				_ = windows.CloseHandle(h)
+			}
+			return false
+		}
+		if err != nil && h == 0 {
 			return true
 		}
-	}
-	if windows.GetLastError() == windows.ERROR_ALREADY_EXISTS {
-		_ = windows.CloseHandle(h)
-		return false
 	}
 	serviceMutex = h
 	return true
@@ -586,26 +697,66 @@ func RegisterInteractiveStartup() error {
 
 // UnregisterInteractiveStartup cleanly removes startup entries across all possible locations.
 func UnregisterInteractiveStartup() {
-	// 1. HKCU Run Key (purge BridgeApp and legacy Bridge keys)
-	k, err := registry.OpenKey(registry.CURRENT_USER, `Software\Microsoft\Windows\CurrentVersion\Run`, registry.SET_VALUE)
+	// 1. In-process HKCU Run Key clean
+	k, err := registry.OpenKey(registry.CURRENT_USER, `Software\Microsoft\Windows\CurrentVersion\Run`, registry.QUERY_VALUE|registry.SET_VALUE)
 	if err == nil {
-		_ = k.DeleteValue("BridgeApp")
-		_ = k.DeleteValue("Bridge")
+		if valNames, err := k.ReadValueNames(-1); err == nil {
+			for _, vn := range valNames {
+				if strings.Contains(strings.ToLower(vn), "bridge") {
+					_ = k.DeleteValue(vn)
+					continue
+				}
+				if val, _, err := k.GetStringValue(vn); err == nil && strings.Contains(strings.ToLower(val), "bridge.exe") {
+					_ = k.DeleteValue(vn)
+				}
+			}
+		}
 		k.Close()
 	}
 
-	// 2. HKLM Run Key (purge duplicate)
-	kAdmin, err := registry.OpenKey(registry.LOCAL_MACHINE, `Software\Microsoft\Windows\CurrentVersion\Run`, registry.SET_VALUE)
+	// 2. In-process HKLM Run Key clean (if process is elevated)
+	kAdmin, err := registry.OpenKey(registry.LOCAL_MACHINE, `Software\Microsoft\Windows\CurrentVersion\Run`, registry.QUERY_VALUE|registry.SET_VALUE)
 	if err == nil {
-		_ = kAdmin.DeleteValue("BridgeApp")
-		_ = kAdmin.DeleteValue("Bridge")
+		if valNames, err := kAdmin.ReadValueNames(-1); err == nil {
+			for _, vn := range valNames {
+				if strings.Contains(strings.ToLower(vn), "bridge") {
+					_ = kAdmin.DeleteValue(vn)
+					continue
+				}
+				if val, _, err := kAdmin.GetStringValue(vn); err == nil && strings.Contains(strings.ToLower(val), "bridge.exe") {
+					_ = kAdmin.DeleteValue(vn)
+				}
+			}
+		}
 		kAdmin.Close()
 	}
+	kAdmin32, err := registry.OpenKey(registry.LOCAL_MACHINE, `Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Run`, registry.QUERY_VALUE|registry.SET_VALUE)
+	if err == nil {
+		if valNames, err := kAdmin32.ReadValueNames(-1); err == nil {
+			for _, vn := range valNames {
+				if strings.Contains(strings.ToLower(vn), "bridge") {
+					_ = kAdmin32.DeleteValue(vn)
+					continue
+				}
+				if val, _, err := kAdmin32.GetStringValue(vn); err == nil && strings.Contains(strings.ToLower(val), "bridge.exe") {
+					_ = kAdmin32.DeleteValue(vn)
+				}
+			}
+		}
+		kAdmin32.Close()
+	}
 
-	// 3. User & Common Startup Folder Shortcuts (purge any shortcuts containing bridge)
+	// 3. User & Common Startup Folder Shortcuts (purge any shortcuts pointing to bridge.exe across all users)
 	startupDirs := []string{
 		filepath.Join(os.Getenv("APPDATA"), "Microsoft", "Windows", "Start Menu", "Programs", "Startup"),
 		`C:\ProgramData\Microsoft\Windows\Start Menu\Programs\Startup`,
+	}
+	if uDirs, err := os.ReadDir(`C:\Users`); err == nil {
+		for _, u := range uDirs {
+			if u.IsDir() {
+				startupDirs = append(startupDirs, filepath.Join(`C:\Users`, u.Name(), "AppData", "Roaming", "Microsoft", "Windows", "Start Menu", "Programs", "Startup"))
+			}
+		}
 	}
 	for _, sd := range startupDirs {
 		if sd != "" {
@@ -620,7 +771,37 @@ func UnregisterInteractiveStartup() {
 		}
 	}
 
-	// 4. Legacy Session 0 Scheduled Task (purge)
+	// 4. Exhaustive PowerShell cleanup across all Run keys, HKEY_USERS hives, and Task Scheduler
+	purgeScript := `
+$runKeys = @(
+    "HKLM:\Software\Microsoft\Windows\CurrentVersion\Run",
+    "HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Run",
+    "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run"
+)
+Get-ChildItem "Registry::HKEY_USERS" -ErrorAction SilentlyContinue | ForEach-Object {
+    $runKeys += "$($_.PSPath)\Software\Microsoft\Windows\CurrentVersion\Run"
+}
+foreach ($rk in $runKeys) {
+    if (Test-Path $rk) {
+        $item = Get-ItemProperty -Path $rk -ErrorAction SilentlyContinue
+        if ($item) {
+            foreach ($prop in $item.PSObject.Properties) {
+                if ($prop.Name -like "*bridge*" -or ($prop.Value -is [string] -and $prop.Value -like "*bridge.exe*")) {
+                    Remove-ItemProperty -Path $rk -Name $prop.Name -Force -ErrorAction SilentlyContinue
+                }
+            }
+        }
+    }
+}
+Get-ScheduledTask -ErrorAction SilentlyContinue | Where-Object { 
+    $_.TaskName -like "*bridge*" -or ($_.Actions -and ($_.Actions.Execute -like "*bridge.exe*"))
+} | Unregister-ScheduledTask -Confirm:$false -ErrorAction SilentlyContinue
+`
+	psCmd := exec.Command("powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", purgeScript)
+	hideCmd(psCmd)
+	_ = psCmd.Run()
+
+	// 5. Legacy Session 0 Scheduled Task (purge)
 	cmdSch := exec.Command("schtasks", "/Delete", "/TN", TaskName, "/F")
 	hideCmd(cmdSch)
 	_ = cmdSch.Run()

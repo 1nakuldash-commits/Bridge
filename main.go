@@ -25,8 +25,18 @@ import (
 	"bridge/tray"
 )
 
+func init() {
+	// Earliest possible console suppression for background / autostart launches
+	for _, arg := range os.Args[1:] {
+		if arg == "-autostart" || arg == "-tray" || arg == "-service" || arg == "-silent" {
+			tray.HideConsole()
+			break
+		}
+	}
+}
+
 func main() {
-	// Early console suppression for background / autostart launches
+	// Double check early console suppression
 	for _, arg := range os.Args[1:] {
 		if arg == "-autostart" || arg == "-tray" || arg == "-service" || arg == "-silent" {
 			tray.HideConsole()
@@ -308,8 +318,14 @@ func runUnifiedService(configPath string, headless bool) {
 	defer syncEngine.Stop()
 
 	// 3. HTTP API Server
+	var trayMgr *tray.TrayManager
 	httpServer := server.NewServer(cfg, stateMgr, printService)
 	httpServer.SetSyncEngine(syncEngine)
+	httpServer.SetOnSyncReceived(func(relPath string) {
+		if trayMgr != nil {
+			trayMgr.FlashSyncComplete("File Received", fmt.Sprintf("Received %s from network!", filepath.Base(relPath)))
+		}
+	})
 	go func() {
 		if err := httpServer.Start(); err != nil && err != http.ErrServerClosed {
 			log.Printf("HTTP server terminated: %v", err)
@@ -317,19 +333,17 @@ func runUnifiedService(configPath string, headless bool) {
 	}()
 	defer httpServer.Stop()
 
-	var trayMgr *tray.TrayManager
-
 	// Dispatch feedback hook for SendTo right-click printing
 	httpServer.SetOnPrintDispatched(func(fileName, peerName string) {
 		if trayMgr != nil {
-			trayMgr.FlashComplete("Print Dispatched", fmt.Sprintf("Sent %s to print on %s!", fileName, peerName))
+			trayMgr.FlashPrintComplete("Print Dispatched", fmt.Sprintf("Sent %s to print on %s!", fileName, peerName))
 		}
 	})
 
 	// 4. Windows Spooler Multi-Listener (One listener per peer virtual printer port)
 	multiSpooler := printer.NewMultiSpoolerListener(func(peer config.PeerDevice, filePath string) error {
 		if trayMgr != nil {
-			trayMgr.SetState(tray.StatePrinting, fmt.Sprintf("Bridge: Sending print to %s...", peer.Name))
+			trayMgr.SetPrintingState(fmt.Sprintf("Bridge: Sending print to %s...", peer.Name))
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 		defer cancel()
@@ -341,12 +355,12 @@ func runUnifiedService(configPath string, headless bool) {
 
 	multiSpooler.OnJobStarted = func(peer config.PeerDevice, fileName string) {
 		if trayMgr != nil {
-			trayMgr.SetState(tray.StatePrinting, fmt.Sprintf("Bridge: Transmitting %s to %s...", fileName, peer.Name))
+			trayMgr.SetPrintingState(fmt.Sprintf("Bridge: Transmitting %s to %s...", fileName, peer.Name))
 		}
 	}
 	multiSpooler.OnJobCompleted = func(peer config.PeerDevice, fileName string) {
 		if trayMgr != nil {
-			trayMgr.FlashComplete("Print Complete", fmt.Sprintf("Sent print job to %s!", peer.Name))
+			trayMgr.FlashPrintComplete("Print Complete", fmt.Sprintf("Sent print job to %s!", peer.Name))
 		}
 	}
 	multiSpooler.OnJobFailed = func(peer config.PeerDevice, fileName string, err error) {
@@ -366,6 +380,9 @@ func runUnifiedService(configPath string, headless bool) {
 
 	// Dynamic peer update wiring: when a peer connects or registers
 	httpServer.SetPeerUpdater(func(peer config.PeerDevice, isNew bool) {
+		if strings.EqualFold(strings.TrimSpace(peer.Name), strings.TrimSpace(cfg.GetNodeName())) {
+			return // Strictly ignore self
+		}
 		syncEngine.UpdatePeerURL(peer.URL)
 		_ = multiSpooler.EnsurePeerListener(peer)
 		cfg.SetPeerOnlineStatus(peer.URL, true)
@@ -374,6 +391,7 @@ func runUnifiedService(configPath string, headless bool) {
 		}
 		// Catch-up synchronize files immediately ONLY when a brand new peer connects (not on repeated pings)
 		if isNew {
+			_ = config.SaveConfig(configPath, cfg)
 			syncEngine.ReconcileWithPeer(peer.URL)
 
 			go func() {
@@ -416,7 +434,7 @@ func runUnifiedService(configPath string, headless bool) {
 				)
 				if err == nil {
 					if trayMgr != nil {
-						trayMgr.FlashComplete("Print Complete", fmt.Sprintf("Printed %s on %s!", filepath.Base(filePath), primaryName))
+						trayMgr.FlashPrintComplete("Print Complete", fmt.Sprintf("Printed %s on %s!", filepath.Base(filePath), primaryName))
 					}
 				} else {
 					if trayMgr != nil {
@@ -438,7 +456,7 @@ func runUnifiedService(configPath string, headless bool) {
 				)
 				if err == nil {
 					if trayMgr != nil {
-						trayMgr.FlashComplete("Print Complete", fmt.Sprintf("Printed %s on %s!", filepath.Base(filePath), p.Name))
+						trayMgr.FlashPrintComplete("Print Complete", fmt.Sprintf("Printed %s on %s!", filepath.Base(filePath), p.Name))
 					}
 				} else {
 					if trayMgr != nil {
@@ -516,23 +534,23 @@ func runUnifiedService(configPath string, headless bool) {
 		// Connect callbacks to update tray dot state:
 		printService.OnJobStarted = func(job printer.PrintJob) {
 			if trayMgr != nil {
-				trayMgr.SetState(tray.StatePrinting, fmt.Sprintf("Bridge: Printing %s...", job.FileName))
+				trayMgr.SetPrintingState(fmt.Sprintf("Bridge: Printing %s...", job.FileName))
 			}
 		}
 		printService.OnJobCompleted = func(job printer.PrintJob) {
 			if trayMgr != nil {
-				trayMgr.FlashComplete("Print Succeeded", fmt.Sprintf("%s was printed successfully!", job.FileName))
+				trayMgr.FlashPrintComplete("Print Succeeded", fmt.Sprintf("%s was printed successfully!", job.FileName))
 			}
 		}
 
 		syncEngine.OnSyncStarted = func(relPath string) {
 			if trayMgr != nil {
-				trayMgr.SetState(tray.StateSyncing, fmt.Sprintf("Bridge: Syncing %s...", relPath))
+				trayMgr.SetSyncingState(fmt.Sprintf("Bridge: Uploading/Syncing %s...", relPath))
 			}
 		}
 		syncEngine.OnSyncCompleted = func(relPath string) {
 			if trayMgr != nil {
-				trayMgr.UpdateNetworkStatus(cfg.GetNodeName(), cfg.GetPeers())
+				trayMgr.FlashSyncComplete("Sync Complete", fmt.Sprintf("Uploaded %s to network!", relPath))
 			}
 		}
 
@@ -548,7 +566,7 @@ func runUnifiedService(configPath string, headless bool) {
 
 				peers := cfg.GetPeers()
 				if len(peers) == 0 {
-					trayMgr.SetState(tray.StateOffline, fmt.Sprintf("Bridge: %s (Waiting for devices to connect)", cfg.GetNodeName()))
+					trayMgr.SetState(tray.StateDisconnected, fmt.Sprintf("Bridge: %s (No other device connected)", cfg.GetNodeName()))
 					continue
 				}
 
@@ -602,7 +620,7 @@ func runUnifiedService(configPath string, headless bool) {
 							}
 							// Transitive Mesh Peer Discovery: check peers returned by healthy peer
 							for _, mp := range hr.Peers {
-								if mp.Name == cfg.GetNodeName() || (localTailscale != "" && mp.IP == localTailscale) {
+								if config.IsSelfTarget(mp.Name, mp.IP, mp.URL, cfg.GetNodeName(), cfg.ListenPort) || (localTailscale != "" && mp.IP == localTailscale) {
 									continue
 								}
 								if cfg.FindPeer(mp.Name) == nil && cfg.FindPeer(mp.IP) == nil && cfg.FindPeer(mp.URL) == nil {
@@ -617,6 +635,9 @@ func runUnifiedService(configPath string, headless bool) {
 				// Add any newly discovered mesh peers
 				hasNewPeers := false
 				for _, np := range newDiscoveredPeers {
+					if config.IsSelfTarget(np.Name, np.IP, np.URL, cfg.GetNodeName(), cfg.ListenPort) {
+						continue
+					}
 					if cfg.FindPeer(np.Name) == nil && cfg.FindPeer(np.IP) == nil && cfg.FindPeer(np.URL) == nil {
 						added, isNew := cfg.AddOrUpdatePeer(np.Name, np.IP, np.URL)
 						if isNew {
@@ -712,7 +733,9 @@ func runHeadlessInstall(name, peer, token string) {
 			fmt.Printf("[!] SumatraPDF install warning: %v\n", err)
 		}
 	}
-	cfg.SumatraPath = sumatra
+	if sumatra != "" {
+		cfg.SumatraPath = sumatra
+	}
 
 	if err := installer.InstallService(cfg); err != nil {
 		fmt.Fprintf(os.Stderr, "Installation failed: %v\n", err)

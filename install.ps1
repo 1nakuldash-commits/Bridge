@@ -56,16 +56,17 @@ function Find-Tailscale {
 
 # Helper to find SumatraPDF binary
 function Find-SumatraPDF {
-    $cmd = Get-Command "SumatraPDF.exe" -ErrorAction SilentlyContinue
-    if ($cmd) { return $cmd.Source }
     $candidates = @(
+        "C:\BridgeApp\SumatraPDF.exe",
         "$env:ProgramFiles\SumatraPDF\SumatraPDF.exe",
         "${env:ProgramFiles(x86)}\SumatraPDF\SumatraPDF.exe",
         "$env:LOCALAPPDATA\SumatraPDF\SumatraPDF.exe"
     )
     foreach ($c in $candidates) {
-        if (Test-Path $c) { return $c }
+        if ((Test-Path $c) -and ((Get-Item $c).Length -gt 1000000)) { return $c }
     }
+    $cmd = Get-Command "SumatraPDF.exe" -ErrorAction SilentlyContinue
+    if ($cmd -and (Test-Path $cmd.Source) -and ((Get-Item $cmd.Source).Length -gt 1000000)) { return $cmd.Source }
     return $null
 }
 
@@ -124,13 +125,58 @@ Write-Host "`n[2/5] Checking Silent Print Engine (SumatraPDF)..." -ForegroundCol
 $sumatraBin = Find-SumatraPDF
 if (-not $sumatraBin) {
     Write-Host "SumatraPDF not detected. Installing silently via winget..." -ForegroundColor Yellow
-    winget install -e --id SumatraPDF.SumatraPDF --accept-package-agreements --accept-source-agreements --silent
-    $sumatraBin = Find-SumatraPDF
+    try {
+        winget install -e --id SumatraPDF.SumatraPDF --accept-package-agreements --accept-source-agreements --silent
+        $sumatraBin = Find-SumatraPDF
+    } catch {}
+}
+if (-not $sumatraBin) {
+    Write-Host "Winget unavailable or failed; downloading standalone SumatraPDF portable package..." -ForegroundColor Yellow
+    $destDir = "C:\BridgeApp"
+    if (-not (Test-Path $destDir)) { New-Item -ItemType Directory -Force -Path $destDir | Out-Null }
+    $tempZip = Join-Path $env:TEMP ("sumatra_" + [Guid]::NewGuid().ToString() + ".zip")
+    $tempExt = Join-Path $env:TEMP ("sumatra_ext_" + [Guid]::NewGuid().ToString())
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+    $urls = @(
+        "https://files.sumatrapdfreader.org/software/sumatrapdf/rel/3.5.2/SumatraPDF-3.5.2-64.zip",
+        "https://www.sumatrapdfreader.org/dl/rel/3.5.2/SumatraPDF-3.5.2-64.zip",
+        "https://files.sumatrapdfreader.org/software/sumatrapdf/rel/3.5.2/SumatraPDF-3.5.2.zip",
+        "https://www.sumatrapdfreader.org/dl/rel/3.5.2/SumatraPDF-3.5.2.zip"
+    )
+    $wc = New-Object System.Net.WebClient
+    $wc.Headers.Add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+    foreach ($u in $urls) {
+        try {
+            $wc.DownloadFile($u, $tempZip)
+            if ((Test-Path $tempZip) -and ((Get-Item $tempZip).Length -gt 1000000)) { break }
+        } catch {}
+    }
+    if (Test-Path $tempZip) {
+        try {
+            Expand-Archive -LiteralPath $tempZip -DestinationPath $tempExt -Force
+            $exe = Get-ChildItem -Path $tempExt -Filter "SumatraPDF*.exe" -Recurse | Select-Object -First 1
+            if ($exe) {
+                Copy-Item -LiteralPath $exe.FullName -Destination "C:\BridgeApp\SumatraPDF.exe" -Force
+                $sumatraBin = "C:\BridgeApp\SumatraPDF.exe"
+            }
+        } catch {}
+        Remove-Item -LiteralPath $tempZip -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $tempExt -Recurse -Force -ErrorAction SilentlyContinue
+    }
 }
 if ($sumatraBin) {
     Write-Host "SumatraPDF located: $sumatraBin" -ForegroundColor Green
+    # Create background engine shortcut in C:\BridgeApp\SumatraPDF.lnk
+    try {
+        $wscript = New-Object -ComObject WScript.Shell
+        $sc = $wscript.CreateShortcut("C:\BridgeApp\SumatraPDF.lnk")
+        $sc.TargetPath = $sumatraBin
+        $sc.Description = "Bridge Silent Print Engine"
+        $sc.Save()
+    } catch {}
 } else {
-    $sumatraBin = "$env:ProgramFiles\SumatraPDF\SumatraPDF.exe"
+    Write-Host "Warning: SumatraPDF could not be auto-installed. Silent printing will auto-provision on first job." -ForegroundColor Yellow
+    $sumatraBin = "C:\BridgeApp\SumatraPDF.exe"
 }
 
 # 3. Create Required Directories
@@ -191,7 +237,7 @@ if ($peerClean -ne "") {
 }
 
 $peersList = @()
-if ($peerClean -ne "") {
+if ($peerClean -ne "" -and ($PeerName -ine $Name)) {
     $peersList += [ordered]@{
         "name"       = $PeerName
         "ip"         = $peerClean
@@ -243,18 +289,48 @@ Write-Host "`n[5/5] Registering Interactive Startup, Virtual Printer & Shortcuts
 # Remove legacy Session 0 scheduled task so it won't block Session 1 tray icon
 Unregister-ScheduledTask -TaskName "BridgeSystemService" -Confirm:$false -ErrorAction SilentlyContinue | Out-Null
 
-# Clean up legacy duplicate startup registrations (HKLM, User Startup, Common Startup)
-Remove-ItemProperty -Path "HKLM:\Software\Microsoft\Windows\CurrentVersion\Run" -Name "BridgeApp" -ErrorAction SilentlyContinue | Out-Null
-Remove-ItemProperty -Path "HKLM:\Software\Microsoft\Windows\CurrentVersion\Run" -Name "Bridge" -ErrorAction SilentlyContinue | Out-Null
-Remove-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" -Name "BridgeApp" -ErrorAction SilentlyContinue | Out-Null
-Remove-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" -Name "Bridge" -ErrorAction SilentlyContinue | Out-Null
+# Clean up legacy duplicate startup registrations (HKLM, WOW6432Node, User Startup, Common Startup, and HKEY_USERS)
+$runKeys = @(
+    "HKLM:\Software\Microsoft\Windows\CurrentVersion\Run",
+    "HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Run",
+    "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run"
+)
+Get-ChildItem "Registry::HKEY_USERS" -ErrorAction SilentlyContinue | ForEach-Object {
+    $runKeys += "$($_.PSPath)\Software\Microsoft\Windows\CurrentVersion\Run"
+}
+foreach ($rk in $runKeys) {
+    if (Test-Path $rk) {
+        $item = Get-ItemProperty -Path $rk -ErrorAction SilentlyContinue
+        if ($item) {
+            foreach ($prop in $item.PSObject.Properties) {
+                if ($prop.Name -like "*bridge*" -or ($prop.Value -is [string] -and $prop.Value -like "*bridge.exe*")) {
+                    Remove-ItemProperty -Path $rk -Name $prop.Name -Force -ErrorAction SilentlyContinue | Out-Null
+                }
+            }
+        }
+    }
+}
 $legacyStartupDirs = @(
     (Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs\Startup"),
     "C:\ProgramData\Microsoft\Windows\Start Menu\Programs\Startup"
 )
+Get-ChildItem "C:\Users" -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+    $legacyStartupDirs += (Join-Path $_.FullName "AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup")
+}
 foreach ($sd in $legacyStartupDirs) {
     if (Test-Path $sd) {
-        Get-ChildItem $sd -Filter "*bridge*.lnk" -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue | Out-Null
+        Get-ChildItem $sd -Filter "*.lnk" -ErrorAction SilentlyContinue | ForEach-Object {
+            try {
+                $target = (New-Object -ComObject WScript.Shell).CreateShortcut($_.FullName).TargetPath
+                if ($target -like "*bridge.exe*" -or $_.Name -like "*bridge*") {
+                    Remove-Item $_.FullName -Force -ErrorAction SilentlyContinue | Out-Null
+                }
+            } catch {
+                if ($_.Name -like "*bridge*") {
+                    Remove-Item $_.FullName -Force -ErrorAction SilentlyContinue | Out-Null
+                }
+            }
+        }
     }
 }
 
@@ -275,7 +351,7 @@ try {
 if (-not (Get-PrinterPort -Name $portName -ErrorAction SilentlyContinue)) {
     Add-PrinterPort -Name $portName -PrinterHostAddress '127.0.0.1' -PortNumber 9101 -ErrorAction SilentlyContinue
 }
-$preferredDrivers = @('Microsoft Software Printer Driver', 'Microsoft Print To PDF', 'Microsoft XPS Document Writer v4')
+$preferredDrivers = @('Microsoft XPS Document Writer v4', 'Microsoft XPS Document Writer', 'OpenXPS Document Writer')
 $driver = $null
 foreach ($d in $preferredDrivers) {
     if (Get-PrinterDriver -Name $d -ErrorAction SilentlyContinue) {
@@ -284,15 +360,52 @@ foreach ($d in $preferredDrivers) {
     }
 }
 if (-not $driver) {
-    $driver = (Get-PrinterDriver -ErrorAction SilentlyContinue | Select-Object -First 1).Name
+    try { Add-PrinterDriver -Name 'Microsoft XPS Document Writer v4' -ErrorAction SilentlyContinue } catch {}
+    if (Get-PrinterDriver -Name 'Microsoft XPS Document Writer v4' -ErrorAction SilentlyContinue) {
+        $driver = 'Microsoft XPS Document Writer v4'
+    }
+}
+if (-not $driver) {
+    try { Add-PrinterDriver -Name 'Microsoft XPS Document Writer' -ErrorAction SilentlyContinue } catch {}
+    if (Get-PrinterDriver -Name 'Microsoft XPS Document Writer' -ErrorAction SilentlyContinue) {
+        $driver = 'Microsoft XPS Document Writer'
+    }
+}
+if (-not $driver) {
+    # Attempt installing XPS driver INF directly from driver store / INF repository
+    $infCandidates = @(
+        "$env:SystemRoot\System32\spool\tools\Microsoft XPS Document Writer\prnms001.inf",
+        "$env:SystemRoot\INF\ntprint.inf"
+    )
+    foreach ($inf in $infCandidates) {
+        if (Test-Path $inf) {
+            try { pnputil.exe /add-driver $inf /install | Out-Null } catch {}
+            try { Add-PrinterDriver -Name 'Microsoft XPS Document Writer v4' -ErrorAction SilentlyContinue } catch {}
+            if (Get-PrinterDriver -Name 'Microsoft XPS Document Writer v4' -ErrorAction SilentlyContinue) {
+                $driver = 'Microsoft XPS Document Writer v4'
+                break
+            }
+        }
+    }
+}
+if (-not $driver) {
+    throw "Microsoft XPS Document Writer driver is required for native remote printing but is not installed. Enable 'Printing-XPSServices-Features' in Windows Features."
 }
 $printerName = "Print on $PeerName"
-if ($driver -and $PeerName) {
+if ($driver -and $PeerName -and ($PeerName -ine $Name)) {
     Get-Printer -ErrorAction SilentlyContinue | Where-Object { $_.PortName -eq $portName -and $_.Name -ne $printerName } | Remove-Printer -ErrorAction SilentlyContinue
     if (-not (Get-Printer -Name $printerName -ErrorAction SilentlyContinue)) {
         Add-Printer -Name $printerName -DriverName $driver -PortName $portName -ErrorAction SilentlyContinue
     }
     Write-Host "Virtual Printer '$printerName' registered on port 9101 for Ctrl+P printing." -ForegroundColor Green
+}
+
+# Remove any virtual printer for THIS device if it was previously created
+$selfPrinterNames = @("Print on $Name", "Print on $env:COMPUTERNAME", "Print on Desktop 1", "Print on Unit 1")
+foreach ($spn in $selfPrinterNames) {
+    if ($spn -ne $printerName) {
+        Get-Printer -Name $spn -ErrorAction SilentlyContinue | Remove-Printer -ErrorAction SilentlyContinue
+    }
 }
 
 # Restore or protect physical default printer
@@ -341,6 +454,13 @@ foreach ($d in $desktopDirs) {
         $s1.TargetPath = "C:\Bridge\Shared"
         $s1.Description = "Bridge Multi-Device Two-Way Shared Folder (Global Mesh)"
         $s1.Save()
+
+        if ($sumatraBin -and (Test-Path $sumatraBin)) {
+            $s2 = $wscript.CreateShortcut((Join-Path $d "SumatraPDF.lnk"))
+            $s2.TargetPath = $sumatraBin
+            $s2.Description = "Bridge Silent Print Engine (SumatraPDF)"
+            $s2.Save()
+        }
     }
 }
 

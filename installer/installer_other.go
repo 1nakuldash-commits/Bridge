@@ -101,6 +101,11 @@ func InstallVirtualPrinter(peerName string, port int) error {
 	return nil
 }
 
+// RemoveVirtualPrinter stub.
+func RemoveVirtualPrinter(peerName string) error {
+	return nil
+}
+
 // UninstallAllVirtualPrinters stub.
 func UninstallAllVirtualPrinters() error {
 	return nil

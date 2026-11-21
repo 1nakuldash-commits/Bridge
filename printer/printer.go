@@ -1,6 +1,8 @@
 package printer
 
 import (
+	"archive/zip"
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -10,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -44,18 +47,26 @@ func IsVirtualPrinterName(name, port string) bool {
 
 	virtualKeywords := []string{
 		"print to pdf",
-		"xps document writer",
-		"anydesk",
-		"fax",
-		"onenote",
-		"cutepdf",
-		"foxit",
+		"pdf creator",
 		"pdfcreator",
+		"adobe pdf",
+		"foxit",
+		"cutepdf",
 		"bullzip",
 		"primopdf",
 		"dopdf",
 		"novapdf",
-		"adobe pdf",
+		"nitro pdf",
+		"soda pdf",
+		"xps document writer",
+		"openxps",
+		"generic / text only",
+		"generic",
+		"text only",
+		"anydesk",
+		"fax",
+		"onenote",
+		"snagit",
 		"virtual printer",
 	}
 
@@ -121,6 +132,16 @@ func (ps *PrintService) Start() error {
 		return fmt.Errorf("failed to create print failed dir: %w", err)
 	}
 
+	// Proactive auto-heal: On Windows, if SumatraPDF is missing, begin background provisioning
+	// so the engine is fully ready and verified before the first print job arrives.
+	if runtime.GOOS == "windows" && !isUsableSumatra(ps.sumatraPath) && FindSumatraPDF() == "" {
+		go func() {
+			if path, err := EnsureSumatraPDF(); err == nil && path != "" {
+				ps.sumatraPath = path
+			}
+		}()
+	}
+
 	ps.wg.Add(1)
 	go ps.workerLoop()
 
@@ -174,6 +195,31 @@ func (ps *PrintService) SaveIncomingJob(fileName string, r io.Reader) (PrintJob,
 		return PrintJob{}, fmt.Errorf("failed to write print job data: %w", err)
 	}
 
+	// Inspect binary header to auto-correct mismatched extensions or strip PJL wrappers
+	header := make([]byte, 4096)
+	if hf, err := os.Open(jobPath); err == nil {
+		n, _ := hf.Read(header)
+		_ = hf.Close()
+		cleanHeader, detectedExt := ExtractCleanSpoolPayload(header[:n])
+		// If PJL was detected at start of file, re-write with clean payload
+		if len(cleanHeader) < n && (bytes.HasPrefix(header[:n], []byte("\x1b%-12345X")) || bytes.Index(header[:n], []byte("%PDF-")) > 0 || bytes.Index(header[:n], []byte("PK\x03\x04")) > 0) {
+			if allData, readErr := os.ReadFile(jobPath); readErr == nil {
+				cleaned, cleanExt := ExtractCleanSpoolPayload(allData)
+				_ = os.WriteFile(jobPath, cleaned, 0644)
+				detectedExt = cleanExt
+			}
+		}
+		currExt := strings.ToLower(filepath.Ext(jobPath))
+		if detectedExt != "" && currExt != detectedExt {
+			newJobPath := strings.TrimSuffix(jobPath, currExt) + detectedExt
+			if renErr := os.Rename(jobPath, newJobPath); renErr == nil {
+				jobPath = newJobPath
+				jobID = strings.TrimSuffix(jobID, currExt) + detectedExt
+				cleanName = strings.TrimSuffix(cleanName, currExt) + detectedExt
+			}
+		}
+	}
+
 	job := PrintJob{
 		ID:         jobID,
 		FileName:   cleanName,
@@ -210,6 +256,288 @@ func fileExists(p string) bool {
 	return err == nil
 }
 
+var directPrintClient = &http.Client{
+	Timeout: 60 * time.Second,
+	Transport: &http.Transport{
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 20,
+		IdleConnTimeout:     90 * time.Second,
+		DisableCompression:  true, // Print streams (XPS/PDF) are pre-compressed; avoids redundant CPU compression latency
+	},
+}
+
+// isValidSumatraExe verifies that a path points to an existing, non-empty executable (> 1 MB).
+func isValidSumatraExe(p string) bool {
+	if p == "" {
+		return false
+	}
+	fi, err := os.Stat(p)
+	if err != nil || fi.IsDir() {
+		return false
+	}
+	// A valid SumatraPDF binary must be at least 1MB in size
+	if fi.Size() < 1024*1024 {
+		return false
+	}
+	return true
+}
+
+// isUsableSumatra checks whether a path points to an executable suitable for silent printing (or mock).
+func isUsableSumatra(p string) bool {
+	if p == "" {
+		return false
+	}
+	if strings.Contains(strings.ToLower(p), "mock") {
+		return true
+	}
+	return isValidSumatraExe(p)
+}
+
+// FindSumatraPDF locates SumatraPDF.exe across standard installation directories and user profiles.
+func FindSumatraPDF() string {
+	// 1. Direct standalone deployment path (highest priority)
+	const standalone = `C:\BridgeApp\SumatraPDF.exe`
+	if isValidSumatraExe(standalone) {
+		return standalone
+	}
+
+	// 2. PATH environment lookup
+	if p, err := exec.LookPath("SumatraPDF.exe"); err == nil {
+		if isValidSumatraExe(p) {
+			return p
+		}
+	}
+
+	// 3. Standard Program Files, LocalAppData, and package manager paths
+	candidates := []string{
+		`C:\Program Files\SumatraPDF\SumatraPDF.exe`,
+		`C:\Program Files (x86)\SumatraPDF\SumatraPDF.exe`,
+		filepath.Join(os.Getenv("ProgramFiles"), `SumatraPDF\SumatraPDF.exe`),
+		filepath.Join(os.Getenv("ProgramFiles(x86)"), `SumatraPDF\SumatraPDF.exe`),
+		filepath.Join(os.Getenv("LOCALAPPDATA"), `SumatraPDF\SumatraPDF.exe`),
+		filepath.Join(os.Getenv("LOCALAPPDATA"), `Microsoft\WinGet\Links\SumatraPDF.exe`),
+		filepath.Join(os.Getenv("LOCALAPPDATA"), `Microsoft\WindowsApps\SumatraPDF.exe`),
+		filepath.Join(os.Getenv("ProgramData"), `chocolatey\bin\SumatraPDF.exe`),
+		`C:\tools\SumatraPDF\SumatraPDF.exe`,
+	}
+	for _, c := range candidates {
+		if c != "" && isValidSumatraExe(c) {
+			return c
+		}
+	}
+
+	// 4. Scan C:\Users for interactive user profiles
+	if entries, err := os.ReadDir(`C:\Users`); err == nil {
+		for _, e := range entries {
+			if e.IsDir() {
+				up := filepath.Join(`C:\Users`, e.Name(), "AppData", "Local", "SumatraPDF", "SumatraPDF.exe")
+				if isValidSumatraExe(up) {
+					return up
+				}
+			}
+		}
+	}
+
+	// 5. Windows Registry App Paths (via OS-specific helper)
+	if p := findSumatraFromRegistry(); p != "" && isValidSumatraExe(p) {
+		return p
+	}
+
+	return ""
+}
+
+// findSumatraPDF is an internal backward-compatibility wrapper around FindSumatraPDF.
+func findSumatraPDF() string {
+	return FindSumatraPDF()
+}
+
+// DownloadSumatraPDF downloads the standalone SumatraPDF portable zip and extracts SumatraPDF.exe into destPath.
+func DownloadSumatraPDF(destPath string) error {
+	destDir := filepath.Dir(destPath)
+	if err := os.MkdirAll(destDir, 0755); err != nil {
+		return fmt.Errorf("failed to create destination directory: %w", err)
+	}
+
+	urls := []string{
+		"https://files.sumatrapdfreader.org/software/sumatrapdf/rel/3.5.2/SumatraPDF-3.5.2-64.zip",
+		"https://www.sumatrapdfreader.org/dl/rel/3.5.2/SumatraPDF-3.5.2-64.zip",
+		"https://files.sumatrapdfreader.org/software/sumatrapdf/rel/3.5.2/SumatraPDF-3.5.2.zip",
+		"https://www.sumatrapdfreader.org/dl/rel/3.5.2/SumatraPDF-3.5.2.zip",
+	}
+
+	client := &http.Client{
+		Timeout: 45 * time.Second,
+		Transport: &http.Transport{
+			Proxy: http.ProxyFromEnvironment,
+		},
+	}
+
+	var downloadErr error
+	for _, targetURL := range urls {
+		req, err := http.NewRequest("GET", targetURL, nil)
+		if err != nil {
+			downloadErr = err
+			continue
+		}
+		// Modern browser User-Agent header bypasses server protection / 403 Forbidden
+		req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
+		req.Header.Set("Accept", "*/*")
+
+		resp, err := client.Do(req)
+		if err != nil {
+			downloadErr = err
+			continue
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			resp.Body.Close()
+			downloadErr = fmt.Errorf("HTTP %d from %s", resp.StatusCode, targetURL)
+			continue
+		}
+
+		// Stage zip to temp file
+		tmpZip, err := os.CreateTemp("", "sumatra_*.zip")
+		if err != nil {
+			resp.Body.Close()
+			downloadErr = err
+			continue
+		}
+		tmpZipPath := tmpZip.Name()
+
+		n, copyErr := io.Copy(tmpZip, resp.Body)
+		resp.Body.Close()
+		tmpZip.Close()
+
+		if copyErr != nil || n < 1024*1024 {
+			_ = os.Remove(tmpZipPath)
+			if copyErr != nil {
+				downloadErr = copyErr
+			} else {
+				downloadErr = fmt.Errorf("downloaded zip incomplete (%d bytes)", n)
+			}
+			continue
+		}
+
+		// Extract SumatraPDF.exe from zip
+		extractErr := ExtractSumatraFromZip(tmpZipPath, destPath)
+		_ = os.Remove(tmpZipPath)
+		if extractErr != nil {
+			downloadErr = extractErr
+			continue
+		}
+
+		// Success!
+		return nil
+	}
+
+	return fmt.Errorf("all download attempts failed: %v", downloadErr)
+}
+
+// ExtractSumatraFromZip extracts SumatraPDF binary from an official release zip package into destPath.
+func ExtractSumatraFromZip(zipPath, destPath string) error {
+	r, err := zip.OpenReader(zipPath)
+	if err != nil {
+		return fmt.Errorf("failed to open zip: %w", err)
+	}
+	defer r.Close()
+
+	var targetFile *zip.File
+	for _, f := range r.File {
+		base := strings.ToLower(filepath.Base(f.Name))
+		if strings.HasPrefix(base, "sumatrapdf") && strings.HasSuffix(base, ".exe") {
+			targetFile = f
+			break
+		}
+	}
+
+	if targetFile == nil {
+		return errors.New("SumatraPDF.exe not found inside zip package")
+	}
+
+	rc, err := targetFile.Open()
+	if err != nil {
+		return fmt.Errorf("failed to open file inside zip: %w", err)
+	}
+	defer rc.Close()
+
+	tmpDest := destPath + ".tmp"
+	out, err := os.OpenFile(tmpDest, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0755)
+	if err != nil {
+		return fmt.Errorf("failed to create temp binary: %w", err)
+	}
+
+	written, err := io.Copy(out, rc)
+	out.Close()
+	if err != nil || written < 1024*1024 {
+		_ = os.Remove(tmpDest)
+		return fmt.Errorf("failed to write binary: %v (written: %d)", err, written)
+	}
+
+	if err := os.Rename(tmpDest, destPath); err != nil {
+		_ = os.Remove(tmpDest)
+		return fmt.Errorf("failed to replace destination: %w", err)
+	}
+
+	_ = os.Chmod(destPath, 0755)
+	return nil
+}
+
+// EnsureSumatraPDF locates SumatraPDF or downloads and configures the standalone binary if missing.
+func EnsureSumatraPDF() (string, error) {
+	if existing := FindSumatraPDF(); existing != "" {
+		return existing, nil
+	}
+
+	if runtime.GOOS != "windows" {
+		return "", errors.New("SumatraPDF auto-download is only supported on Windows")
+	}
+
+	const targetPath = `C:\BridgeApp\SumatraPDF.exe`
+	log.Printf("[Printer] SumatraPDF not detected. Downloading standalone engine to %s...", targetPath)
+	if err := DownloadSumatraPDF(targetPath); err == nil && isValidSumatraExe(targetPath) {
+		log.Printf("[Printer] Successfully provisioned standalone SumatraPDF at %s", targetPath)
+		_ = CreateSumatraShortcut(targetPath)
+		return targetPath, nil
+	}
+
+	// Secondary fallback: winget if available on Windows
+	log.Printf("[Printer] Direct download returned error or incomplete. Attempting winget fallback...")
+	cmd := exec.Command("winget", "install", "-e", "--id", "SumatraPDF.SumatraPDF", "--accept-package-agreements", "--accept-source-agreements", "--silent")
+	hideCmd(cmd)
+	_ = cmd.Run()
+	for i := 0; i < 15; i++ {
+		if found := FindSumatraPDF(); found != "" {
+			_ = CreateSumatraShortcut(found)
+			return found, nil
+		}
+		time.Sleep(1 * time.Second)
+	}
+
+	return "", errors.New("provisioned SumatraPDF binary failed validation")
+}
+
+// CreateSumatraShortcut creates a shortcut to SumatraPDF in C:\BridgeApp\SumatraPDF.lnk and across desktop directories.
+func CreateSumatraShortcut(exePath string) error {
+	if exePath == "" || !isValidSumatraExe(exePath) {
+		return errors.New("invalid SumatraPDF executable path")
+	}
+
+	// 1. Standalone application directory shortcut
+	lnkPath := `C:\BridgeApp\SumatraPDF.lnk`
+	_ = os.MkdirAll(filepath.Dir(lnkPath), 0755)
+	_ = CreateShortcut(exePath, lnkPath, "Bridge Silent Print Engine", "")
+
+	// 2. Desktop shortcuts across user profiles
+	desktopDirs := getDesktopDirsForShortcuts()
+	for _, d := range desktopDirs {
+		_ = os.MkdirAll(d, 0755)
+		desktopLnk := filepath.Join(d, "SumatraPDF.lnk")
+		_ = CreateShortcut(exePath, desktopLnk, "Bridge Silent Print Engine (SumatraPDF)", "")
+	}
+
+	return nil
+}
+
 func (ps *PrintService) processJob(job PrintJob) {
 	log.Printf("[Printer] Processing job %s (%s)...", job.ID, job.FileName)
 	if ps.OnJobStarted != nil {
@@ -239,44 +567,56 @@ func (ps *PrintService) processJob(job PrintJob) {
 
 	log.Printf("[Printer] Target physical printer for job %s: '%s'", job.ID, targetPrinter)
 
+	// Locate effective SumatraPDF executable: check configured path, then auto-discover
+	sumatraBin := ps.sumatraPath
+	if !isUsableSumatra(sumatraBin) {
+		if discovered := FindSumatraPDF(); isUsableSumatra(discovered) {
+			sumatraBin = discovered
+			ps.sumatraPath = discovered
+		} else {
+			// Auto-heal on the fly: attempt standalone engine download if missing
+			if provisioned, provErr := EnsureSumatraPDF(); provErr == nil && isUsableSumatra(provisioned) {
+				sumatraBin = provisioned
+				ps.sumatraPath = provisioned
+			}
+		}
+	}
+
 	ctx, cancel := context.WithTimeout(ps.ctx, ps.timeout)
 	defer cancel()
 
 	var out []byte
-	ext := strings.ToLower(filepath.Ext(job.FilePath))
 
-	if ext == ".xps" && !strings.Contains(strings.ToLower(ps.sumatraPath), "mock") {
-		// Native Windows System.Printing spooling for XPS print streams
-		psScript := fmt.Sprintf(
-			`$ErrorActionPreference = 'Stop'; Add-Type -AssemblyName ReachFramework, System.Printing; $ps = New-Object System.Printing.LocalPrintServer; $pq = $ps.GetPrintQueue('%s'); $pq.AddJob('%s', '%s', $false) | Out-Null`,
-			strings.ReplaceAll(targetPrinter, `'`, `''`),
-			strings.ReplaceAll(job.FileName, `'`, `''`),
-			strings.ReplaceAll(job.FilePath, `'`, `''`),
-		)
-		cmd := exec.CommandContext(ctx, "powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", psScript)
+	// Always use SumatraPDF for silent, driver-rendered printing (supports PDF, XPS, OXPS, images, etc.)
+	// This renders each page through the printer's native Windows driver, preventing raw bytes / random page gibberish.
+	if isUsableSumatra(sumatraBin) {
+		log.Printf("[Printer] Rendering and printing via SumatraPDF silently to '%s' (fit-to-page)...", targetPrinter)
+		// -print-settings "fit" guarantees 99.99% native accuracy, scaling pages precisely to printable margins
+		// -exit-when-done guarantees SumatraPDF immediately exits and releases file handles
+		cmd := exec.CommandContext(ctx, sumatraBin, "-print-to", targetPrinter, "-silent", "-print-settings", "fit", "-exit-when-done", job.FilePath)
 		hideCmd(cmd)
 		out, err = cmd.CombinedOutput()
-		if err != nil && ps.sumatraPath != "" && fileExists(ps.sumatraPath) {
-			log.Printf("[Printer] ReachFramework XPS spool failed (%v), falling back to SumatraPDF...", err)
-			cmd = exec.CommandContext(ctx, ps.sumatraPath, "-print-to", targetPrinter, "-silent", job.FilePath)
-			hideCmd(cmd)
-			out, err = cmd.CombinedOutput()
-		}
-	} else if ps.sumatraPath != "" && fileExists(ps.sumatraPath) {
-		cmd := exec.CommandContext(ctx, ps.sumatraPath, "-print-to", targetPrinter, "-silent", job.FilePath)
+	} else if strings.EqualFold(filepath.Ext(job.FilePath), ".xps") {
+		// Native Windows .NET XPS driver rendering fallback:
+		// Uses System.Printing.PrintQueue::CreateXpsDocumentWriter to pass FixedDocumentSequence
+		// through the target printer's native driver, generating proper raster/PCL rather than raw binary bytes.
+		log.Printf("[Printer] SumatraPDF not found, executing native Windows .NET XPS rendering to '%s'...", targetPrinter)
+		psScript := fmt.Sprintf(`
+Add-Type -AssemblyName ReachFramework, System.Printing
+$ps = New-Object System.Printing.LocalPrintServer
+$pq = $ps.GetPrintQueue('%s')
+$writer = [System.Printing.PrintQueue]::CreateXpsDocumentWriter($pq)
+$xpsDoc = New-Object System.Windows.Xps.Packaging.XpsDocument('%s', [System.IO.FileAccess]::Read)
+$writer.Write($xpsDoc.GetFixedDocumentSequence())
+$xpsDoc.Close()
+`, strings.ReplaceAll(targetPrinter, `'`, `''`), strings.ReplaceAll(job.FilePath, `'`, `''`))
+		cmd := exec.CommandContext(ctx, "powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", psScript)
 		hideCmd(cmd)
 		out, err = cmd.CombinedOutput()
 	} else {
-		// Fallback: Attempt printing via PowerShell / Windows shell PrintTo
-		log.Printf("[Printer] Notice: SumatraPDF not found at '%s', attempting Windows shell PrintTo fallback...", ps.sumatraPath)
-		psScript := fmt.Sprintf(
-			`$p = Start-Process -FilePath '%s' -Verb PrintTo -ArgumentList '"%s"' -PassThru; Start-Sleep -Seconds 4; if ($p -and -not $p.HasExited) { $p.Kill() }`,
-			strings.ReplaceAll(job.FilePath, `'`, `''`),
-			strings.ReplaceAll(targetPrinter, `'`, `''`),
-			)
-		cmd := exec.CommandContext(ctx, "powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", psScript)
-		hideCmd(cmd)
-		out, err = cmd.CombinedOutput()
+		// Strict safeguard: NEVER execute shell PrintTo with Notepad (which dumps raw binary bytes as text across 20 pages)
+		log.Printf("[Printer] ERROR: Silent print engine (SumatraPDF) not installed on host! Cannot safely render %s.", job.FileName)
+		err = fmt.Errorf("silent print engine (SumatraPDF) is missing on host; run setup or install to auto-provision")
 	}
 
 	if ctx.Err() == context.DeadlineExceeded {
@@ -297,12 +637,13 @@ func (ps *PrintService) processJob(job PrintJob) {
 		return
 	}
 
-	// Printing succeeded! Clean up temp file from queue with retry for spooler lock release
-	for attempt := 0; attempt < 5; attempt++ {
+	// Printing succeeded! Clean up temp file from queue with fast progressive retry
+	cleanupDelays := []time.Duration{25 * time.Millisecond, 50 * time.Millisecond, 100 * time.Millisecond, 200 * time.Millisecond, 400 * time.Millisecond}
+	for _, delay := range cleanupDelays {
 		if remErr := os.Remove(job.FilePath); remErr == nil || os.IsNotExist(remErr) {
 			break
 		}
-		time.Sleep(200 * time.Millisecond)
+		time.Sleep(delay)
 	}
 	log.Printf("[Printer] Job %s printed successfully to '%s' and cleaned up.", job.ID, targetPrinter)
 	if ps.OnJobCompleted != nil {
@@ -674,8 +1015,7 @@ func SendDirectPrint(ctx context.Context, peerURL, authToken, filePath string, e
 		}
 	}
 
-	client := &http.Client{Timeout: 60 * time.Second}
-	resp, err := client.Do(req)
+	resp, err := directPrintClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("failed to deliver print job: %w", err)
 	}

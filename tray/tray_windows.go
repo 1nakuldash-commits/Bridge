@@ -215,11 +215,13 @@ func (tm *TrayManager) loadIconHandles() {
 		return h
 	}
 
-	tm.hIcons[StateConnected] = loadIco(tm.icons.Green)
-	tm.hIcons[StatePrinting] = loadIco(tm.icons.Yellow)
-	tm.hIcons[StateSyncing] = loadIco(tm.icons.Yellow)
-	tm.hIcons[StateCompleted] = loadIco(tm.icons.Blue)
-	tm.hIcons[StateOffline] = loadIco(tm.icons.Gray)
+	tm.hIcons[StateDisconnected] = loadIco(tm.icons.PrinterDisconnected)
+	tm.hIcons[StatePartial] = loadIco(tm.icons.PrinterGray)
+	tm.hIcons[StateConnected] = loadIco(tm.icons.PrinterGreen)
+	tm.hIcons[StatePrinting] = loadIco(tm.icons.PrinterLoading)
+	tm.hIcons[StatePrintCompleted] = loadIco(tm.icons.PrinterBlue)
+	tm.hIcons[StateSyncing] = loadIco(tm.icons.CloudLoading)
+	tm.hIcons[StateSyncCompleted] = loadIco(tm.icons.CloudBlue)
 }
 
 // Start begins the Win32 window and tray icon event loop in a dedicated thread.
@@ -388,22 +390,26 @@ func (tm *TrayManager) UpdateNetworkStatus(nodeName string, peers []config.PeerD
 	}
 
 	tip := ""
-	state := StateOffline
+	state := StateDisconnected
 	total := len(peers)
 
-	if total == 0 {
-		tip = fmt.Sprintf("Bridge: %s (Waiting for peers to connect)", nodeName)
-		state = StateOffline
-	} else if onlineCount > 0 {
-		state = StateConnected
-		if onlineCount == total {
-			tip = fmt.Sprintf("Bridge: %s (All %d devices online & ready)", nodeName, total)
+	// User-specified icon state machine:
+	// 1. If 0 devices connected/online -> Printer icon with red cross line (Disconnected)
+	// 2. If 1 or more devices connected, but not all -> Gray printer icon (cross removed)
+	// 3. If all devices connected -> Green printer icon
+	if total == 0 || onlineCount == 0 {
+		state = StateDisconnected
+		if total == 0 {
+			tip = fmt.Sprintf("Bridge: %s (No other device connected)", nodeName)
 		} else {
-			tip = fmt.Sprintf("Bridge: %s (%d/%d devices online)", nodeName, onlineCount, total)
+			tip = fmt.Sprintf("Bridge: %s (0/%d devices connected - Disconnected)", nodeName, total)
 		}
+	} else if onlineCount < total {
+		state = StatePartial
+		tip = fmt.Sprintf("Bridge: %s (%d/%d devices connected)", nodeName, onlineCount, total)
 	} else {
-		state = StateOffline
-		tip = fmt.Sprintf("Bridge: %s (All %d peer devices offline)", nodeName, total)
+		state = StateConnected
+		tip = fmt.Sprintf("Bridge: %s (All %d devices connected & ready)", nodeName, total)
 	}
 
 	// Avoid Windows taskbar re-render flickering: Only update if state or tip changed!
@@ -662,19 +668,51 @@ func HideConsoleIfDedicated() {
 	HideConsole()
 }
 
-// FlashComplete changes dot to blue, shows a balloon notification, and reverts to green.
-func (tm *TrayManager) FlashComplete(title, message string) {
-	tm.SetState(StateCompleted, message)
+// SetPrintingState displays the loading printer icon during print spooling/transmission.
+func (tm *TrayManager) SetPrintingState(tooltip string) {
+	tm.SetState(StatePrinting, tooltip)
+}
+
+// SetSyncingState displays the loading cloud icon during file upload/synchronization.
+func (tm *TrayManager) SetSyncingState(tooltip string) {
+	tm.SetState(StateSyncing, tooltip)
+}
+
+// FlashPrintComplete displays the blue printer icon for 4 seconds, then reverts to baseline network status.
+func (tm *TrayManager) FlashPrintComplete(title, message string) {
+	tm.SetState(StatePrintCompleted, message)
 	tm.ShowBalloon(title, message)
 
 	go func() {
-		time.Sleep(5 * time.Second)
-		tm.mu.Lock()
-		nodeName := tm.nodeName
-		peers := tm.peers
-		tm.mu.Unlock()
-		tm.UpdateNetworkStatus(nodeName, peers)
+		time.Sleep(4 * time.Second)
+		tm.RestoreNetworkStatus()
 	}()
+}
+
+// FlashSyncComplete displays the blue cloud icon for 4 seconds, then reverts to baseline network status.
+func (tm *TrayManager) FlashSyncComplete(title, message string) {
+	tm.SetState(StateSyncCompleted, message)
+	tm.ShowBalloon(title, message)
+
+	go func() {
+		time.Sleep(4 * time.Second)
+		tm.RestoreNetworkStatus()
+	}()
+}
+
+// RestoreNetworkStatus re-evaluates current peer counts and restores the baseline printer icon.
+func (tm *TrayManager) RestoreNetworkStatus() {
+	tm.mu.Lock()
+	nodeName := tm.nodeName
+	peers := make([]config.PeerDevice, len(tm.peers))
+	copy(peers, tm.peers)
+	tm.mu.Unlock()
+	tm.UpdateNetworkStatus(nodeName, peers)
+}
+
+// FlashComplete backward-compatible alias for print completion.
+func (tm *TrayManager) FlashComplete(title, message string) {
+	tm.FlashPrintComplete(title, message)
 }
 
 // SetClipboardText places plain unicode text onto the Windows system clipboard.

@@ -6,21 +6,130 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
 	"unsafe"
 
+	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/registry"
 )
 
 var (
 	winspool              = syscall.NewLazyDLL("winspool.drv")
 	procGetDefaultPrinter = winspool.NewProc("GetDefaultPrinterW")
+	procEnumPrintersW     = winspool.NewProc("EnumPrintersW")
 )
+
+const (
+	PRINTER_ENUM_LOCAL       = 0x00000002
+	PRINTER_ENUM_CONNECTIONS = 0x00000004
+)
+
+type PRINTER_INFO_2W struct {
+	ServerName         *uint16
+	PrinterName        *uint16
+	ShareName          *uint16
+	PortName           *uint16
+	DriverName         *uint16
+	Comment            *uint16
+	Location           *uint16
+	DevMode            uintptr
+	SepFile            *uint16
+	PrintProcessor     *uint16
+	Datatype           *uint16
+	Parameters         *uint16
+	SecurityDescriptor uintptr
+	Attributes         uint32
+	Priority           uint32
+	DefaultPriority    uint32
+	StartTime          uint32
+	UntilTime          uint32
+	Status             uint32
+	CJobs              uint32
+	AveragePPM         uint32
+}
+
+// enumPrintersWin32 queries all Windows printers directly via winspool.drv (< 1ms, 0 subprocesses).
+func enumPrintersWin32() ([]WindowsPrinter, error) {
+	flags := uintptr(PRINTER_ENUM_LOCAL | PRINTER_ENUM_CONNECTIONS)
+	level := uintptr(2)
+
+	var needed, returned uint32
+	procEnumPrintersW.Call(
+		flags,
+		0,
+		level,
+		0,
+		0,
+		uintptr(unsafe.Pointer(&needed)),
+		uintptr(unsafe.Pointer(&returned)),
+	)
+	if needed == 0 {
+		return nil, errors.New("no printers found or EnumPrinters buffer check failed")
+	}
+
+	buf := make([]byte, needed)
+	r1, _, err := procEnumPrintersW.Call(
+		flags,
+		0,
+		level,
+		uintptr(unsafe.Pointer(&buf[0])),
+		uintptr(needed),
+		uintptr(unsafe.Pointer(&needed)),
+		uintptr(unsafe.Pointer(&returned)),
+	)
+	if r1 == 0 {
+		return nil, err
+	}
+
+	defPrinter, _ := GetDefaultWindowsPrinter()
+	count := int(returned)
+	if count == 0 {
+		return nil, errors.New("no printers returned from winspool")
+	}
+
+	p2Slice := unsafe.Slice((*PRINTER_INFO_2W)(unsafe.Pointer(&buf[0])), count)
+	var list []WindowsPrinter
+	seen := make(map[string]bool)
+
+	for i := 0; i < count; i++ {
+		pName := ""
+		if p2Slice[i].PrinterName != nil {
+			pName = windows.UTF16PtrToString(p2Slice[i].PrinterName)
+		}
+		if pName == "" {
+			continue
+		}
+		low := strings.ToLower(strings.TrimSpace(pName))
+		if seen[low] {
+			continue
+		}
+		seen[low] = true
+
+		portName := ""
+		if p2Slice[i].PortName != nil {
+			portName = windows.UTF16PtrToString(p2Slice[i].PortName)
+		}
+
+		list = append(list, WindowsPrinter{
+			Name:     pName,
+			PortName: portName,
+			Default:  strings.EqualFold(pName, defPrinter),
+		})
+	}
+
+	if len(list) > 0 {
+		return list, nil
+	}
+	return nil, errors.New("empty printer list from winspool EnumPrinters")
+}
 
 // GetDefaultWindowsPrinter queries Windows for the default paper printer name.
 func GetDefaultWindowsPrinter() (string, error) {
@@ -106,11 +215,20 @@ func queryWindowsPrinters() ([]WindowsPrinter, error) {
 	printerQueryMu.Lock()
 	defer printerQueryMu.Unlock()
 
-	// 15-second debounce cache prevents repeated registry/CIM queries on rapid health checks
-	if len(cachedPrinters) > 0 && time.Since(lastPrinterQuery) < 15*time.Second {
+	// 30-second debounce cache prevents repeated registry/CIM queries on rapid health checks
+	if len(cachedPrinters) > 0 && time.Since(lastPrinterQuery) < 30*time.Second {
 		return cachedPrinters, nil
 	}
 
+	// 1. Direct Win32 API EnumPrinters query (< 1ms, 0 subprocesses)
+	win32Printers, win32Err := enumPrintersWin32()
+	if win32Err == nil && len(win32Printers) > 0 {
+		cachedPrinters = win32Printers
+		lastPrinterQuery = time.Now()
+		return win32Printers, nil
+	}
+
+	// 2. Direct Registry query fallback
 	printers, err := queryPrintersFromRegistry()
 	if err == nil && len(printers) > 0 {
 		cachedPrinters = printers
@@ -118,6 +236,7 @@ func queryWindowsPrinters() ([]WindowsPrinter, error) {
 		return printers, nil
 	}
 
+	// 3. CIM PowerShell query fallback (last resort)
 	cimPrinters, cimErr := queryPrintersFromCim()
 	if cimErr == nil && len(cimPrinters) > 0 {
 		cachedPrinters = cimPrinters
@@ -128,35 +247,162 @@ func queryWindowsPrinters() ([]WindowsPrinter, error) {
 	return printers, err
 }
 
-func queryPrintersFromRegistry() ([]WindowsPrinter, error) {
-	k, err := registry.OpenKey(registry.LOCAL_MACHINE, `SOFTWARE\Microsoft\Windows NT\CurrentVersion\Print\Printers`, registry.READ)
-	if err != nil {
-		return nil, err
+func findSumatraFromRegistry() string {
+	keys := []struct {
+		root registry.Key
+		path string
+		val  string
+	}{
+		{registry.LOCAL_MACHINE, `SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\SumatraPDF.exe`, ""},
+		{registry.CURRENT_USER, `Software\Microsoft\Windows\CurrentVersion\App Paths\SumatraPDF.exe`, ""},
+		{registry.LOCAL_MACHINE, `SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\App Paths\SumatraPDF.exe`, ""},
+		{registry.LOCAL_MACHINE, `SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\SumatraPDF`, "InstallLocation"},
+		{registry.CURRENT_USER, `Software\Microsoft\Windows\CurrentVersion\Uninstall\SumatraPDF`, "InstallLocation"},
 	}
-	defer k.Close()
-
-	names, err := k.ReadSubKeyNames(-1)
-	if err != nil {
-		return nil, err
-	}
-
-	defPrinter, _ := GetDefaultWindowsPrinter()
-	var list []WindowsPrinter
-	for _, name := range names {
-		subK, err := registry.OpenKey(k, name, registry.READ)
-		if err != nil {
-			continue
+	for _, k := range keys {
+		if rk, err := registry.OpenKey(k.root, k.path, registry.QUERY_VALUE); err == nil {
+			val, _, err := rk.GetStringValue(k.val)
+			rk.Close()
+			if err == nil && val != "" {
+				clean := strings.Trim(strings.TrimSpace(val), `"`)
+				if strings.HasSuffix(strings.ToLower(clean), ".exe") {
+					if isValidSumatraExe(clean) {
+						return clean
+					}
+				} else {
+					candidate := filepath.Join(clean, "SumatraPDF.exe")
+					if isValidSumatraExe(candidate) {
+						return candidate
+					}
+				}
+			}
 		}
-		port, _, _ := subK.GetStringValue("Port")
-		subK.Close()
-
-		list = append(list, WindowsPrinter{
-			Name:     name,
-			PortName: port,
-			Default:  strings.EqualFold(name, defPrinter),
-		})
 	}
-	return list, nil
+	return ""
+}
+
+// getDesktopDirsForShortcuts returns all active user and public desktop paths on Windows.
+func getDesktopDirsForShortcuts() []string {
+	seen := make(map[string]bool)
+	var dirs []string
+	add := func(p string) {
+		clean := filepath.Clean(strings.TrimSpace(p))
+		if clean == "" {
+			return
+		}
+		low := strings.ToLower(clean)
+		if !seen[low] {
+			seen[low] = true
+			dirs = append(dirs, clean)
+		}
+	}
+
+	if u := os.Getenv("USERPROFILE"); u != "" {
+		add(filepath.Join(u, "Desktop"))
+		add(filepath.Join(u, "OneDrive", "Desktop"))
+	}
+	add(`C:\Users\Public\Desktop`)
+
+	if entries, err := os.ReadDir(`C:\Users`); err == nil {
+		for _, e := range entries {
+			if e.IsDir() {
+				name := strings.ToLower(e.Name())
+				if name != "public" && name != "default" && name != "default user" && name != "all users" {
+					add(filepath.Join(`C:\Users`, e.Name(), "Desktop"))
+				}
+			}
+		}
+	}
+	return dirs
+}
+
+// CreateShortcut creates a Windows .lnk shortcut using VBScript WScript.Shell.
+func CreateShortcut(targetPath, lnkPath, description, arguments string) error {
+	_ = os.MkdirAll(filepath.Dir(lnkPath), 0755)
+	if fi, err := os.Stat(lnkPath); err == nil && fi.Size() > 0 {
+		return nil
+	}
+
+	vbsContent := fmt.Sprintf(`Set oWS = WScript.CreateObject("WScript.Shell")
+Set oLink = oWS.CreateShortcut("%s")
+oLink.TargetPath = "%s"
+oLink.Description = "%s"
+oLink.Arguments = "%s"
+oLink.Save
+`, strings.ReplaceAll(lnkPath, `"`, `""`), strings.ReplaceAll(targetPath, `"`, `""`), strings.ReplaceAll(description, `"`, `""`), strings.ReplaceAll(arguments, `"`, `""`))
+
+	tmpVbs := filepath.Join(os.TempDir(), fmt.Sprintf("mksumatra_%d.vbs", time.Now().UnixNano()))
+	if err := os.WriteFile(tmpVbs, []byte(vbsContent), 0644); err != nil {
+		return err
+	}
+	defer os.Remove(tmpVbs)
+
+	cmd := exec.Command("wscript", "//B", "//nologo", tmpVbs)
+	hideCmd(cmd)
+	return cmd.Run()
+}
+
+func queryPrintersFromRegistry() ([]WindowsPrinter, error) {
+	defPrinter, _ := GetDefaultWindowsPrinter()
+	seen := make(map[string]bool)
+	var list []WindowsPrinter
+
+	// 1. Check machine-wide printers in HKLM
+	if k, err := registry.OpenKey(registry.LOCAL_MACHINE, `SOFTWARE\Microsoft\Windows NT\CurrentVersion\Print\Printers`, registry.READ); err == nil {
+		if names, err := k.ReadSubKeyNames(-1); err == nil {
+			for _, name := range names {
+				low := strings.ToLower(strings.TrimSpace(name))
+				if seen[low] {
+					continue
+				}
+				seen[low] = true
+				subK, err := registry.OpenKey(k, name, registry.READ)
+				port := ""
+				if err == nil {
+					port, _, _ = subK.GetStringValue("Port")
+					subK.Close()
+				}
+				list = append(list, WindowsPrinter{
+					Name:     name,
+					PortName: port,
+					Default:  strings.EqualFold(name, defPrinter),
+				})
+			}
+		}
+		k.Close()
+	}
+
+	// 2. Check user-level network and redirected printers in HKCU Devices
+	if kUser, err := registry.OpenKey(registry.CURRENT_USER, `Software\Microsoft\Windows NT\CurrentVersion\Devices`, registry.READ); err == nil {
+		if valNames, err := kUser.ReadValueNames(-1); err == nil {
+			for _, name := range valNames {
+				low := strings.ToLower(strings.TrimSpace(name))
+				if seen[low] {
+					continue
+				}
+				seen[low] = true
+				val, _, err := kUser.GetStringValue(name)
+				port := ""
+				if err == nil {
+					parts := strings.Split(val, ",")
+					if len(parts) >= 2 {
+						port = strings.TrimSpace(parts[1])
+					}
+				}
+				list = append(list, WindowsPrinter{
+					Name:     name,
+					PortName: port,
+					Default:  strings.EqualFold(name, defPrinter),
+				})
+			}
+		}
+		kUser.Close()
+	}
+
+	if len(list) > 0 {
+		return list, nil
+	}
+	return nil, errors.New("no printers found in registry")
 }
 
 func queryPrintersFromCim() ([]WindowsPrinter, error) {

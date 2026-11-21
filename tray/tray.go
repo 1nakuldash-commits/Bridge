@@ -10,11 +10,17 @@ import (
 type TrayState int
 
 const (
-	StateConnected TrayState = iota // 🟢 Green Dot: Network online and ready
-	StatePrinting                   // 🟡 Yellow Dot: Print transmission active
-	StateSyncing                    // 🟡 Yellow Dot: File sync in progress
-	StateCompleted                  // 🔵 Blue Dot: Operation completed
-	StateOffline                    // ⚪ Gray Dot: All peers offline
+	StateDisconnected   TrayState = iota // 🖨️❌ Printer with cross line (0 devices connected)
+	StatePartial                         // 🖨️⚪ Gray printer (1 or more devices connected, cross removed)
+	StateConnected                       // 🖨️🟢 Green printer (all devices connected)
+	StatePrinting                        // 🖨️🟡 Printer with loading progress
+	StatePrintCompleted                  // 🖨️🔵 Printer blue (print completed)
+	StateSyncing                         // ☁️🟡 Cloud with loading progress (uploading / syncing)
+	StateSyncCompleted                   // ☁️🔵 Cloud blue (upload completed)
+
+	// Backward-compatible aliases
+	StateOffline   = StateDisconnected
+	StateCompleted = StatePrintCompleted
 )
 
 // TrayCallbacks allows caller to attach actions to menu items.

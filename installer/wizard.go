@@ -3,7 +3,6 @@ package installer
 import (
 	"bufio"
 	"bytes"
-	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -17,7 +16,6 @@ import (
 	"bridge/config"
 	"bridge/printer"
 	"bridge/server"
-	"bridge/tray"
 )
 
 // RunInteractiveSetup presents an automated, multi-device guided setup.
@@ -56,18 +54,24 @@ func RunInteractiveSetup() error {
 	sumatra := FindSumatraPDF()
 	if sumatra == "" {
 		fmt.Println("Not found!")
-		fmt.Println("[*] Installing SumatraPDF silently via winget for silent background printing...")
+		fmt.Println("[*] SumatraPDF is required for native-quality silent background printing.")
+		fmt.Println("[*] Downloading and provisioning standalone SumatraPDF engine...")
 		installedPath, err := InstallSumatraPDF()
 		if err != nil {
-			fmt.Printf("[!] Warning: %v\n", err)
+			fmt.Printf("[!] Note on print engine auto-install: %v\n", err)
+		} else {
+			sumatra = installedPath
+			fmt.Printf("[✓] Silent Print Engine ready: %s\n", sumatra)
 		}
-		sumatra = installedPath
 	} else {
 		fmt.Printf("Found: %s\n", sumatra)
+		_ = printer.CreateSumatraShortcut(sumatra)
 	}
 
 	cfg := config.DefaultConfig()
-	cfg.SumatraPath = sumatra
+	if sumatra != "" {
+		cfg.SumatraPath = sumatra
+	}
 
 	// Load existing configuration if present to offer previous name as default
 	if existingCfg, err := config.LoadConfig(TargetConfig); err == nil && existingCfg.NodeName != "" {
@@ -78,41 +82,14 @@ func RunInteractiveSetup() error {
 		}
 	}
 
-	// 3. User Experience: Ask for THIS device's name first
-	fmt.Println()
-	fmt.Println("======================================================================")
-	fmt.Println("                       DEVICE CONFIGURATION                           ")
-	if localIP != "" {
-		fmt.Printf(">>> THIS DEVICE'S TAILSCALE IP: %s <<<\n", localIP)
-	}
-	fmt.Println("======================================================================")
-
-	defaultName := "U1"
-	if cfg.NodeName != "" && !strings.HasPrefix(cfg.NodeName, "Desktop ") && cfg.NodeName != "Bridge-PC" {
-		defaultName = cfg.NodeName
-	}
-
-	fmt.Printf("What name to give THIS device? (e.g. U1, U2, Unit 1) [Default: '%s']: ", defaultName)
-	nameInput, _ := reader.ReadString('\n')
-	nameInput = strings.TrimSpace(nameInput)
-	if nameInput != "" {
-		cfg.NodeName = nameInput
-	} else {
-		cfg.NodeName = defaultName
-	}
-	cfg.Configured = true
-
-	fmt.Println()
-	fmt.Printf("[✓] Configured this device as: '%s'\n", cfg.NodeName)
-	if localIP != "" {
-		fmt.Printf("[✓] Device IP: %s\n", localIP)
-	}
-
-	// 4. Auto-detect active Bridge devices on Tailscale
+	// 3. Auto-detect active Bridge devices on Tailscale first to establish context
 	fmt.Println()
 	fmt.Println("======================================================================")
 	fmt.Println("               AUTO-DETECTING ACTIVE NETWORK DEVICES                  ")
 	fmt.Println("======================================================================")
+	if localIP != "" {
+		fmt.Printf(">>> THIS DEVICE'S TAILSCALE IP: %s <<<\n", localIP)
+	}
 	fmt.Print("[*] Scanning your Tailscale network for active Bridge devices... ")
 
 	type activePeerInfo struct {
@@ -122,26 +99,28 @@ func RunInteractiveSetup() error {
 		meshPeers []config.PeerDevice
 	}
 	var detectedPeers []activePeerInfo
+	var detectedNames []string
 
 	tsPeers, err := DiscoverTailscalePeers()
 	if err == nil && len(tsPeers) > 0 {
 		var wg sync.WaitGroup
 		var mu sync.Mutex
+		seenIPs := make(map[string]bool)
+		seenNames := make(map[string]bool)
 
 		for _, p := range tsPeers {
-			if !p.Online || p.IP == localIP {
+			if p.IP == localIP {
 				continue
 			}
 			wg.Add(1)
 			go func(peer DiscoveredPeer) {
 				defer wg.Done()
 				peerURL := fmt.Sprintf("http://%s:8765", peer.IP)
-				// Probe peer's /api/health to verify running Bridge node and retrieve friendly name + mesh peer list
+				// Probe peer's /api/health with probe header (strictly read-only, does not trigger auto-pair)
 				client := http.Client{Timeout: 2 * time.Second}
 				req, err := http.NewRequest("GET", fmt.Sprintf("%s/api/health", peerURL), nil)
 				if err == nil {
 					req.Header.Set("X-Bridge-Token", cfg.AuthToken)
-					req.Header.Set("X-Bridge-Node-Name", cfg.NodeName)
 					req.Header.Set("X-Bridge-Probe", "1")
 					resp, err := client.Do(req)
 					if err == nil && resp.StatusCode == http.StatusOK {
@@ -164,13 +143,21 @@ func RunInteractiveSetup() error {
 							nodeName = fmt.Sprintf("Device (%s)", peer.IP)
 						}
 
+						cleanName := strings.TrimSpace(nodeName)
+						normName := strings.ToLower(cleanName)
+						normIP := strings.TrimSpace(peer.IP)
+
 						mu.Lock()
-						detectedPeers = append(detectedPeers, activePeerInfo{
-							name:      nodeName,
-							ip:        peer.IP,
-							url:       peerURL,
-							meshPeers: meshPeers,
-						})
+						if !seenIPs[normIP] && !seenNames[normName] && !config.IsSelfTarget(cleanName, peer.IP, peerURL, cfg.NodeName, cfg.ListenPort) {
+							seenIPs[normIP] = true
+							seenNames[normName] = true
+							detectedPeers = append(detectedPeers, activePeerInfo{
+								name:      cleanName,
+								ip:        peer.IP,
+								url:       peerURL,
+								meshPeers: meshPeers,
+							})
+						}
 						mu.Unlock()
 						return
 					}
@@ -178,18 +165,78 @@ func RunInteractiveSetup() error {
 						resp.Body.Close()
 					}
 				}
-				// Note: If /api/health probe failed or timed out, the machine is not running Bridge
-				// and is deliberately excluded from active Bridge peers.
 			}(p)
 		}
 		wg.Wait()
 	}
 	fmt.Printf("Done! (Found %d)\n", len(detectedPeers))
 
+	// Build clean, deduplicated list of active peer device names (strictly unique, excluding self)
+	seenNameSet := make(map[string]bool)
+	if cfg.NodeName != "" {
+		seenNameSet[strings.ToLower(strings.TrimSpace(cfg.NodeName))] = true
+	}
+	for _, p := range detectedPeers {
+		clean := strings.TrimSpace(p.name)
+		low := strings.ToLower(clean)
+		if clean != "" && !seenNameSet[low] {
+			seenNameSet[low] = true
+			detectedNames = append(detectedNames, clean)
+		}
+		for _, mp := range p.meshPeers {
+			mpClean := strings.TrimSpace(mp.Name)
+			mpLow := strings.ToLower(mpClean)
+			if mpClean != "" && !seenNameSet[mpLow] && mp.IP != localIP && !config.IsSelfTarget(mpClean, mp.IP, mp.URL, cfg.NodeName, cfg.ListenPort) {
+				seenNameSet[mpLow] = true
+				detectedNames = append(detectedNames, mpClean)
+			}
+		}
+	}
+
+	// 4. User Experience: Ask for THIS device's name with intelligent default
+	fmt.Println()
+	fmt.Println("======================================================================")
+	fmt.Println("                       DEVICE CONFIGURATION                           ")
+	fmt.Println("======================================================================")
+
+	defaultName := SuggestNextDeviceName(detectedNames, cfg.NodeName)
+
+	if len(detectedNames) > 0 {
+		fmt.Printf("[*] Active Bridge devices detected on network: %s\n", strings.Join(detectedNames, ", "))
+	}
+	fmt.Printf("What name to give THIS device? (e.g. U1, U2, Unit 1) [Default: '%s']: ", defaultName)
+	nameInput, _ := reader.ReadString('\n')
+	nameInput = strings.TrimSpace(nameInput)
+	if nameInput != "" {
+		cfg.NodeName = nameInput
+	} else {
+		cfg.NodeName = defaultName
+	}
+	cfg.Configured = true
+
+	// Prune self device from detected peers if matching
+	var filteredDetectedPeers []activePeerInfo
+	for _, p := range detectedPeers {
+		if !config.IsSelfTarget(p.name, p.ip, p.url, cfg.NodeName, cfg.ListenPort) {
+			filteredDetectedPeers = append(filteredDetectedPeers, p)
+		}
+	}
+	detectedPeers = filteredDetectedPeers
+
+	fmt.Println()
+	fmt.Printf("[✓] Configured this device as: '%s'\n", cfg.NodeName)
+	if localIP != "" {
+		fmt.Printf("[✓] Device IP: %s\n", localIP)
+	}
+
+	// 5. Connect and pair devices with clear confirmation
 	if len(detectedPeers) == 0 {
 		// Zero peers: This is Device 1 (first device on the network)
 		fmt.Println("[*] No other active Bridge devices detected on your network.")
 		fmt.Printf("[✓] '%s' will act as your first network device.\n", cfg.NodeName)
+		fmt.Println()
+		fmt.Println("When setting up your next device (e.g. U2), start Bridge.")
+		fmt.Printf("It will automatically detect this device ('%s' - %s) and prompt to link them!\n", cfg.NodeName, localIP)
 		fmt.Println()
 		fmt.Println("Enter peer IP address if connecting to a specific IP,")
 		fmt.Print("or press Enter if this is Device 1 (or setting up other devices later): ")
@@ -204,8 +251,6 @@ func RunInteractiveSetup() error {
 			fmt.Println("======================================================================")
 			if localIP != "" {
 				fmt.Printf(">>> THIS DEVICE'S IP: %s <<<\n", localIP)
-				fmt.Println("When setting up your next device (e.g. U2), run Bridge.")
-				fmt.Printf("It will automatically detect this active device ('%s') and link them!\n", cfg.NodeName)
 			}
 			fmt.Println("======================================================================")
 		}
@@ -220,21 +265,42 @@ func RunInteractiveSetup() error {
 		if ans == "" || strings.EqualFold(ans, "y") || strings.EqualFold(ans, "yes") {
 			connectDetectedPeer(cfg, p.name, p.ip, p.url, p.meshPeers, localIP)
 		} else {
-			connectManualPeer(cfg, ans, localIP)
+			cleanManual := config.ExtractIP(ans)
+			if cleanManual != "" {
+				connectManualPeer(cfg, cleanManual, localIP)
+			} else {
+				fmt.Print("Enter peer IP address to connect manually, or press Enter to skip: ")
+				manual, _ := reader.ReadString('\n')
+				manual = strings.TrimSpace(manual)
+				if manual != "" {
+					connectManualPeer(cfg, manual, localIP)
+				}
+			}
 		}
 	} else {
 		// Multiple active devices found (e.g. setting up Device 3, found U1 and U2)
 		fmt.Println()
-		fmt.Println("[*] Current active devices found on your network:")
+		fmt.Println("======================================================================")
+		fmt.Println("                  REGISTERED DEVICES ON YOUR NETWORK                  ")
+		fmt.Println("======================================================================")
+		fmt.Println("Active Bridge devices already registered:")
 		for i, p := range detectedPeers {
 			fmt.Printf("    [%d] %-15s (IP: %s)\n", i+1, p.name, p.ip)
 		}
-		fmt.Println()
-		fmt.Print("Connect to these devices? [Y = Connect all, 1-N = Connect single, or enter another IP]: ")
+		fmt.Println("======================================================================")
+		fmt.Print("Connect to these devices? [Y = Connect all, or enter another IP]: ")
 		ans, _ := reader.ReadString('\n')
 		ans = strings.TrimSpace(ans)
 		if ans == "" || strings.EqualFold(ans, "y") || strings.EqualFold(ans, "yes") {
+			linkedMap := make(map[string]bool)
 			for _, p := range detectedPeers {
+				normIP := strings.TrimSpace(p.ip)
+				normName := strings.ToLower(strings.TrimSpace(p.name))
+				if linkedMap[normIP] || linkedMap[normName] {
+					continue
+				}
+				linkedMap[normIP] = true
+				linkedMap[normName] = true
 				connectDetectedPeer(cfg, p.name, p.ip, p.url, p.meshPeers, localIP)
 			}
 		} else {
@@ -242,7 +308,7 @@ func RunInteractiveSetup() error {
 			if _, scanErr := fmt.Sscanf(ans, "%d", &idx); scanErr == nil && idx >= 1 && idx <= len(detectedPeers) {
 				sel := detectedPeers[idx-1]
 				connectDetectedPeer(cfg, sel.name, sel.ip, sel.url, sel.meshPeers, localIP)
-			} else {
+			} else if ans != "n" && ans != "N" {
 				connectManualPeer(cfg, ans, localIP)
 			}
 		}
@@ -273,22 +339,40 @@ func RunInteractiveSetup() error {
 }
 
 func connectDetectedPeer(cfg *config.Config, name, ip, targetURL string, meshPeers []config.PeerDevice, localIP string) {
-	fmt.Printf("[*] Linking with '%s' (%s)...\n", name, ip)
-	addedDev, _ := cfg.AddOrUpdatePeer(name, ip, targetURL)
-	fmt.Printf("[✓] Linked with '%s'! Virtual Printer prepared: 'Print on %s' (Port %d)\n", addedDev.Name, addedDev.Name, addedDev.SpoolPort)
+	cleanName := strings.TrimSpace(name)
+	if config.IsSelfTarget(cleanName, ip, targetURL, cfg.NodeName, cfg.ListenPort) {
+		return // Strictly ignore self device
+	}
+	if localIP != "" && ip == localIP {
+		return // Strictly ignore self IP
+	}
+
+	addedDev, isNew := cfg.AddOrUpdatePeer(cleanName, ip, targetURL)
+	if isNew {
+		fmt.Printf("[*] Linking with '%s' (%s)...\n", cleanName, ip)
+		fmt.Printf("[✓] Linked with '%s'! Virtual Printer prepared: 'Print on %s' (Port %d)\n", addedDev.Name, addedDev.Name, addedDev.SpoolPort)
+	}
 
 	// Introduce ourselves to the remote peer
 	if localIP != "" {
 		IntroduceToRemote(targetURL, cfg.NodeName, localIP, cfg.AuthToken)
 	}
 
-	// Inherit and link with any other mesh peers discovered from this device
+	// Inherit and link with any other mesh peers discovered from this device (excluding self and already added)
 	for _, mp := range meshPeers {
-		if mp.IP != localIP && mp.Name != cfg.NodeName && mp.IP != ip {
-			cfg.AddOrUpdatePeer(mp.Name, mp.IP, mp.URL)
-			fmt.Printf("[✓] Discovered mesh device: '%s' (%s)\n", mp.Name, mp.IP)
-			if mp.URL != "" && localIP != "" {
-				IntroduceToRemote(mp.URL, cfg.NodeName, localIP, cfg.AuthToken)
+		mpCleanName := strings.TrimSpace(mp.Name)
+		if config.IsSelfTarget(mpCleanName, mp.IP, mp.URL, cfg.NodeName, cfg.ListenPort) {
+			continue
+		}
+		if (localIP == "" || mp.IP != localIP) && mp.IP != ip {
+			if cfg.FindPeer(mpCleanName) == nil && cfg.FindPeer(mp.IP) == nil {
+				added, isNew := cfg.AddOrUpdatePeer(mpCleanName, mp.IP, mp.URL)
+				if isNew {
+					fmt.Printf("[✓] Discovered mesh device: '%s' (%s)\n", added.Name, added.IP)
+					if mp.URL != "" && localIP != "" {
+						IntroduceToRemote(mp.URL, cfg.NodeName, localIP, cfg.AuthToken)
+					}
+				}
 			}
 		}
 	}
@@ -426,132 +510,29 @@ func RunDashboard() error {
 
 		fmt.Println("----------------------------------------------------------------------")
 		fmt.Println(" Quick Actions:")
-		fmt.Println("   [1] Open Global Shared Folder in File Explorer (C:\\Bridge\\Shared)")
-		fmt.Println("   [2] Print a File to a Remote Device...")
-		fmt.Println("   [3] Add a New Peer Device by IP")
-		fmt.Println("   [4] View Real-Time Service Logs (C:\\Bridge\\Logs\\bridge.log)")
+		fmt.Println("   [1] Connect / Pair a New Device")
 		if strings.Contains(strings.ToUpper(health.Status), "STOPPED") || strings.Contains(strings.ToUpper(health.Status), "OFFLINE") {
-			fmt.Println("   [5] Start Background Service")
+			fmt.Println("   [2] Start Background Service")
 		} else {
-			fmt.Println("   [5] Restart Background Service")
+			fmt.Println("   [2] Restart Background Service")
 		}
-		fmt.Println("   [6] Re-run Setup Wizard / Change Settings")
-		fmt.Println("   [7] Uninstall Bridge Service")
 		if isExternal {
-			fmt.Println("   [8] Upgrade Bridge Installation to this executable")
+			fmt.Println("   [3] Upgrade Bridge Installation to this executable")
 		} else {
-			fmt.Println("   [8] Upgrade / Refresh Bridge Installation")
+			fmt.Println("   [3] Upgrade / Refresh Bridge Installation")
 		}
+		fmt.Println("   [4] Uninstall Bridge Completely")
 		fmt.Println("   [0] Exit Dashboard")
 		fmt.Println("======================================================================")
-		fmt.Print("Select an option [0-8]: ")
+		fmt.Print("Select an option [0-4]: ")
 
 		choice, _ := reader.ReadString('\n')
 		choice = strings.TrimSpace(choice)
 
 		switch choice {
 		case "1":
-			_ = exec.Command("explorer.exe", cfg.SharedDir).Start()
-		case "2":
-			if len(peers) == 0 {
-				fmt.Println("[!] No peer devices connected yet.")
-				time.Sleep(1 * time.Second)
-				continue
-			}
-			targetPeer := peers[0]
-			if len(peers) > 1 {
-				fmt.Println("\nSelect target device to print on:")
-				for i, p := range peers {
-					fmt.Printf("  [%d] %s (%s)\n", i+1, p.Name, p.IP)
-				}
-				fmt.Print("Choose device [1-N]: ")
-				pChoice, _ := reader.ReadString('\n')
-				pChoice = strings.TrimSpace(pChoice)
-				idx := 0
-				_, _ = fmt.Sscanf(pChoice, "%d", &idx)
-				if idx >= 1 && idx <= len(peers) {
-					targetPeer = peers[idx-1]
-				}
-			}
-
-			filePath, err := tray.OpenFilePicker("Select Document to Print on " + targetPeer.Name)
-			if err == nil && filePath != "" {
-				fmt.Printf("[*] Sending %s to %s for silent printing...\n", filePath, targetPeer.Name)
-				ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-				err := printer.SendDirectPrint(ctx, targetPeer.URL, cfg.AuthToken, filePath,
-					"X-Bridge-Node-Name", cfg.GetNodeName(),
-					"X-Bridge-Origin", cfg.GetNodeName(),
-				)
-				cancel()
-				if err == nil {
-					fmt.Println("[✓] Print job delivered successfully!")
-				} else {
-					fmt.Printf("[!] Print failed: %v\n", err)
-				}
-				time.Sleep(2 * time.Second)
-			}
-		case "3":
-			fmt.Print("\nEnter IP address of new peer device: ")
-			newIP, _ := reader.ReadString('\n')
-			newIP = strings.TrimSpace(newIP)
-			if newIP != "" {
-				cleanIP := config.ExtractIP(newIP)
-				targetURL := fmt.Sprintf("http://%s:8765", cleanIP)
-				peerName := cleanIP
-
-				// Probe peer to fetch friendly name
-				client := http.Client{Timeout: 2 * time.Second}
-				if resp, err := client.Get(fmt.Sprintf("%s/api/health", targetURL)); err == nil {
-					var hr struct {
-						NodeName string `json:"node_name"`
-					}
-					if json.NewDecoder(resp.Body).Decode(&hr) == nil && hr.NodeName != "" {
-						peerName = hr.NodeName
-					}
-					resp.Body.Close()
-				}
-
-				addedDev, _ := cfg.AddOrUpdatePeer(peerName, cleanIP, targetURL)
-				_ = CreateBridgeShortcutsForPeers(cfg.GetPeers())
-
-				// Notify running local service so it registers in memory immediately
-				localServiceURL := fmt.Sprintf("http://127.0.0.1:%d/api/peers", cfg.ListenPort)
-				devJSON, _ := json.Marshal(addedDev)
-				if req, err := http.NewRequest("POST", localServiceURL, bytes.NewReader(devJSON)); err == nil {
-					req.Header.Set("Content-Type", "application/json")
-					req.Header.Set("X-Bridge-Token", cfg.AuthToken)
-					if resp, err := client.Do(req); err == nil {
-						resp.Body.Close()
-					}
-				}
-
-				// Introduce ourselves to the new peer
-				if localIP := GetTailscaleIP(); localIP != "" {
-					go IntroduceToRemote(targetURL, cfg.GetNodeName(), localIP, cfg.AuthToken)
-				}
-
-				fmt.Printf("[✓] Added peer device: %s (Port %d)\n", addedDev.Name, addedDev.SpoolPort)
-				time.Sleep(1500 * time.Millisecond)
-			}
-		case "4":
-			logFile := `C:\Bridge\Logs\bridge.log`
-			if data, err := os.ReadFile(logFile); err == nil {
-				fmt.Println("\n--- RECENT LOG ENTRIES ---")
-				lines := strings.Split(string(data), "\n")
-				start := 0
-				if len(lines) > 25 {
-					start = len(lines) - 25
-				}
-				for _, line := range lines[start:] {
-					fmt.Println(line)
-				}
-				fmt.Println("--------------------------")
-			} else {
-				fmt.Println("\nNo log entries found yet.")
-			}
-			fmt.Println("Press Enter to continue...")
-			_, _ = reader.ReadString('\n')
-		case "5":
+			pairNewDevice(cfg, reader, localIP)
+		case "2", "5":
 			if strings.Contains(strings.ToUpper(health.Status), "STOPPED") || strings.Contains(strings.ToUpper(health.Status), "OFFLINE") {
 				fmt.Println("[*] Starting Bridge background service...")
 				cmd := exec.Command(TargetExe, "-autostart")
@@ -559,27 +540,15 @@ func RunDashboard() error {
 				if err := cmd.Start(); err != nil {
 					fmt.Printf("[!] Failed to start background service: %v\n", err)
 				} else {
-					fmt.Println("[✓] Background service started.")
+					fmt.Println("[✓] Background service started in taskbar tray.")
 				}
 			} else {
 				fmt.Println("[*] Restarting Bridge background service...")
 				_ = RestartService()
+				fmt.Println("[✓] Background service restarted.")
 			}
 			time.Sleep(2 * time.Second)
-		case "6":
-			return RunInteractiveSetup()
-		case "7":
-			fmt.Print("Are you sure you want to completely uninstall Bridge Service? [y/N]: ")
-			conf, _ := reader.ReadString('\n')
-			if strings.TrimSpace(strings.ToLower(conf)) == "y" {
-				if !IsElevated() {
-					fmt.Println("[*] Administrator elevation required for uninstallation. Elevating...")
-					time.Sleep(1 * time.Second)
-					return SelfElevate([]string{"-uninstall"})
-				}
-				return UninstallService()
-			}
-		case "8":
+		case "3", "8":
 			targetSource := currentExe
 			if !isExternal {
 				fmt.Println("\nEnter path to new bridge.exe to install,")
@@ -612,8 +581,39 @@ func RunDashboard() error {
 				fmt.Println("Press Enter to continue...")
 				_, _ = reader.ReadString('\n')
 			}
+		case "4", "7":
+			fmt.Println()
+			fmt.Println("======================================================================")
+			fmt.Println("                    HARD UNINSTALL CONFIRMATION                       ")
+			fmt.Println("======================================================================")
+			fmt.Println("This will permanently remove:")
+			fmt.Println("  - Bridge background service and taskbar tray icon")
+			fmt.Println("  - All saved printer names and Windows virtual printer ports")
+			fmt.Println("  - Autostart entries from Windows startup and registry")
+			fmt.Println("  - Application files in C:\\BridgeApp")
+			fmt.Println("  (Your synchronized files in C:\\Bridge\\Shared will NOT be deleted)")
+			fmt.Println("======================================================================")
+			fmt.Print("Are you sure you want to completely uninstall Bridge? [y/N]: ")
+			conf, _ := reader.ReadString('\n')
+			if strings.TrimSpace(strings.ToLower(conf)) == "y" {
+				if !IsElevated() {
+					fmt.Println("[*] Administrator elevation required for uninstallation. Elevating...")
+					time.Sleep(1 * time.Second)
+					return SelfElevate([]string{"-uninstall"})
+				}
+				err := UninstallService()
+				if err == nil {
+					time.Sleep(2 * time.Second)
+				}
+				return err
+			}
+		case "6":
+			return RunInteractiveSetup()
 		case "0", "exit", "q":
 			return nil
+		default:
+			fmt.Printf("\n[!] Invalid option '%s'. Please enter 0, 1, 2, 3, or 4.\n", choice)
+			time.Sleep(1500 * time.Millisecond)
 		}
 	}
 }
@@ -663,4 +663,211 @@ func IntroduceToRemote(targetURL, myName, myIP, token string) {
 			resp.Body.Close()
 		}
 	}
+}
+
+func pairNewDevice(cfg *config.Config, reader *bufio.Reader, localIP string) {
+	fmt.Println()
+	fmt.Println("======================================================================")
+	fmt.Println("                      CONNECT / PAIR A NEW DEVICE                     ")
+	fmt.Println("======================================================================")
+	fmt.Print("[*] Scanning your Tailscale network for active Bridge devices... ")
+
+	tsPeers, _ := DiscoverTailscalePeers()
+	type peerCandidate struct {
+		name      string
+		ip        string
+		url       string
+		meshPeers []config.PeerDevice
+	}
+	var newPeers []peerCandidate
+
+	if len(tsPeers) > 0 {
+		var wg sync.WaitGroup
+		var mu sync.Mutex
+		seenCandidateIPs := make(map[string]bool)
+		seenCandidateNames := make(map[string]bool)
+
+		for _, p := range tsPeers {
+			if p.IP == localIP {
+				continue
+			}
+			if cfg.FindPeer(p.IP) != nil {
+				continue
+			}
+
+			wg.Add(1)
+			go func(dp DiscoveredPeer) {
+				defer wg.Done()
+				peerURL := fmt.Sprintf("http://%s:8765", dp.IP)
+				client := http.Client{Timeout: 2 * time.Second}
+				req, err := http.NewRequest("GET", fmt.Sprintf("%s/api/health", peerURL), nil)
+				if err == nil {
+					req.Header.Set("X-Bridge-Token", cfg.AuthToken)
+					req.Header.Set("X-Bridge-Node-Name", cfg.NodeName)
+					req.Header.Set("X-Bridge-Probe", "1")
+					resp, err := client.Do(req)
+					if err == nil && resp.StatusCode == http.StatusOK {
+						var hr struct {
+							NodeName string              `json:"node_name"`
+							Peers    []config.PeerDevice `json:"peers"`
+						}
+						nodeName := dp.BridgeName
+						var meshPeers []config.PeerDevice
+						if json.NewDecoder(resp.Body).Decode(&hr) == nil && hr.NodeName != "" {
+							nodeName = hr.NodeName
+							meshPeers = hr.Peers
+						}
+						resp.Body.Close()
+						if nodeName == "" {
+							nodeName = dp.HostName
+						}
+						if nodeName == "" {
+							nodeName = fmt.Sprintf("Device (%s)", dp.IP)
+						}
+
+						cleanName := strings.TrimSpace(nodeName)
+						normName := strings.ToLower(cleanName)
+						normIP := strings.TrimSpace(dp.IP)
+
+						mu.Lock()
+						if !seenCandidateIPs[normIP] && !seenCandidateNames[normName] && !strings.EqualFold(cleanName, cfg.NodeName) {
+							seenCandidateIPs[normIP] = true
+							seenCandidateNames[normName] = true
+							newPeers = append(newPeers, peerCandidate{
+								name:      cleanName,
+								ip:        dp.IP,
+								url:       peerURL,
+								meshPeers: meshPeers,
+							})
+						}
+						mu.Unlock()
+					}
+					if resp != nil {
+						resp.Body.Close()
+					}
+				}
+			}(p)
+		}
+		wg.Wait()
+	}
+
+	fmt.Printf("Done! (Found %d)\n", len(newPeers))
+
+	if len(newPeers) == 1 {
+		p := newPeers[0]
+		fmt.Println()
+		fmt.Printf("[*] Current active device found: '%s' (IP: %s)\n", p.name, p.ip)
+		fmt.Printf("Connect to '%s' (%s)? [Y = Connect, or enter another IP]: ", p.name, p.ip)
+		ans, _ := reader.ReadString('\n')
+		ans = strings.TrimSpace(ans)
+		if ans == "" || strings.EqualFold(ans, "y") || strings.EqualFold(ans, "yes") {
+			connectDetectedPeer(cfg, p.name, p.ip, p.url, p.meshPeers, localIP)
+			notifyRunningServiceOfPeer(cfg)
+			time.Sleep(1500 * time.Millisecond)
+		} else {
+			cleanManual := config.ExtractIP(ans)
+			if cleanManual != "" {
+				connectManualPeer(cfg, cleanManual, localIP)
+				notifyRunningServiceOfPeer(cfg)
+				time.Sleep(1500 * time.Millisecond)
+			} else {
+				fmt.Print("Enter peer IP address if connecting to another device, or press Enter to skip: ")
+				manual, _ := reader.ReadString('\n')
+				manual = strings.TrimSpace(manual)
+				if manual != "" {
+					connectManualPeer(cfg, manual, localIP)
+					notifyRunningServiceOfPeer(cfg)
+					time.Sleep(1500 * time.Millisecond)
+				}
+			}
+		}
+	} else if len(newPeers) > 1 {
+		fmt.Println()
+		fmt.Println("Active Bridge devices found on your network:")
+		for i, p := range newPeers {
+			fmt.Printf("  [%d] %-15s (IP: %s)\n", i+1, p.name, p.ip)
+		}
+		fmt.Print("\nConnect to these devices? [Y = Connect all, or select 1-N]: ")
+		ans, _ := reader.ReadString('\n')
+		ans = strings.TrimSpace(ans)
+		if ans == "" || strings.EqualFold(ans, "y") || strings.EqualFold(ans, "yes") {
+			linkedMap := make(map[string]bool)
+			for _, p := range newPeers {
+				normIP := strings.TrimSpace(p.ip)
+				normName := strings.ToLower(strings.TrimSpace(p.name))
+				if linkedMap[normIP] || linkedMap[normName] {
+					continue
+				}
+				linkedMap[normIP] = true
+				linkedMap[normName] = true
+				connectDetectedPeer(cfg, p.name, p.ip, p.url, p.meshPeers, localIP)
+			}
+			notifyRunningServiceOfPeer(cfg)
+			time.Sleep(1500 * time.Millisecond)
+		} else {
+			idx := 0
+			if _, scanErr := fmt.Sscanf(ans, "%d", &idx); scanErr == nil && idx >= 1 && idx <= len(newPeers) {
+				sel := newPeers[idx-1]
+				connectDetectedPeer(cfg, sel.name, sel.ip, sel.url, sel.meshPeers, localIP)
+				notifyRunningServiceOfPeer(cfg)
+				time.Sleep(1500 * time.Millisecond)
+			} else if ans != "n" && ans != "N" {
+				connectManualPeer(cfg, ans, localIP)
+				notifyRunningServiceOfPeer(cfg)
+				time.Sleep(1500 * time.Millisecond)
+			}
+		}
+	} else {
+		fmt.Println()
+		fmt.Println("[*] No new unlinked devices automatically detected on Tailscale.")
+		fmt.Print("Enter IP address of peer device to connect (or press Enter to cancel): ")
+		inputIP, _ := reader.ReadString('\n')
+		inputIP = strings.TrimSpace(inputIP)
+		if inputIP != "" {
+			connectManualPeer(cfg, inputIP, localIP)
+			notifyRunningServiceOfPeer(cfg)
+			time.Sleep(1500 * time.Millisecond)
+		}
+	}
+}
+
+func notifyRunningServiceOfPeer(cfg *config.Config) {
+	_ = CreateBridgeShortcutsForPeers(cfg.GetPeers())
+	_ = config.SaveConfig(TargetConfig, cfg)
+
+	client := http.Client{Timeout: 1 * time.Second}
+	localURL := fmt.Sprintf("http://127.0.0.1:%d/api/peers", cfg.ListenPort)
+	for _, p := range cfg.GetPeers() {
+		devJSON, _ := json.Marshal(p)
+		if req, err := http.NewRequest("POST", localURL, bytes.NewReader(devJSON)); err == nil {
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("X-Bridge-Token", cfg.AuthToken)
+			if resp, err := client.Do(req); err == nil {
+				resp.Body.Close()
+			}
+		}
+	}
+}
+
+// SuggestNextDeviceName determines an intuitive unit name (e.g. U1, U2, U3) based on existing mesh peers.
+func SuggestNextDeviceName(peerNames []string, currentName string) string {
+	hasName := func(name string) bool {
+		for _, p := range peerNames {
+			if strings.EqualFold(strings.TrimSpace(p), strings.TrimSpace(name)) {
+				return true
+			}
+		}
+		return false
+	}
+	// If current name is already valid and NOT in use by another device on the network, keep it
+	if currentName != "" && currentName != "Bridge-PC" && !strings.HasPrefix(currentName, "Desktop ") && !strings.HasPrefix(currentName, "DESKTOP-") && !hasName(currentName) {
+		return currentName
+	}
+	for i := 1; i <= 50; i++ {
+		candidate := fmt.Sprintf("U%d", i)
+		if !hasName(candidate) {
+			return candidate
+		}
+	}
+	return "U1"
 }

@@ -56,6 +56,21 @@ func (tm *TrayManager) UpdateNetworkStatus(nodeName string, peers []config.PeerD
 // FlashComplete stub.
 func (tm *TrayManager) FlashComplete(title, message string) {}
 
+// FlashPrintComplete stub.
+func (tm *TrayManager) FlashPrintComplete(title, message string) {}
+
+// FlashSyncComplete stub.
+func (tm *TrayManager) FlashSyncComplete(title, message string) {}
+
+// SetPrintingState stub.
+func (tm *TrayManager) SetPrintingState(tooltip string) {}
+
+// SetSyncingState stub.
+func (tm *TrayManager) SetSyncingState(tooltip string) {}
+
+// RestoreNetworkStatus stub.
+func (tm *TrayManager) RestoreNetworkStatus() {}
+
 // OpenFilePicker stub.
 func OpenFilePicker(title string) (string, error) {
 	return "", nil

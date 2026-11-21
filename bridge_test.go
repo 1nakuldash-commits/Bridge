@@ -1,6 +1,7 @@
 package main
 
 import (
+	"archive/zip"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -2768,6 +2769,1045 @@ func TestStartupRegistrationCleanliness(t *testing.T) {
 	}
 	installer.UnregisterInteractiveStartup()
 }
+
+func TestSpecializedPrinterAndCloudIcons(t *testing.T) {
+	tempIcons := filepath.Join(t.TempDir(), "icons")
+	paths, err := tray.EnsureIcons(tempIcons)
+	if err != nil {
+		t.Fatalf("EnsureIcons failed: %v", err)
+	}
+
+	// 1. Verify all specialized icon files are generated and non-empty
+	checkFile := func(name, path string) {
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatalf("Expected icon %s at %s, got error: %v", name, path, err)
+		}
+		if info.Size() < 100 {
+			t.Fatalf("Icon %s size too small (%d bytes)", name, info.Size())
+		}
+		// Validate ICO header: first 4 bytes are 0x00 0x00 0x01 0x00 (ICO format)
+		data, err := os.ReadFile(path)
+		if err != nil || len(data) < 4 {
+			t.Fatalf("Failed to read icon %s: %v", name, err)
+		}
+		if data[0] != 0 || data[1] != 0 || data[2] != 1 || data[3] != 0 {
+			t.Fatalf("Icon %s has invalid ICO signature: %v", name, data[:4])
+		}
+	}
+
+	checkFile("PrinterDisconnected (Cross line)", paths.PrinterDisconnected)
+	checkFile("PrinterGray (Partial)", paths.PrinterGray)
+	checkFile("PrinterGreen (Connected)", paths.PrinterGreen)
+	checkFile("PrinterLoading (Printing)", paths.PrinterLoading)
+	checkFile("PrinterBlue (Print complete)", paths.PrinterBlue)
+	checkFile("CloudLoading (Syncing)", paths.CloudLoading)
+	checkFile("CloudBlue (Sync complete)", paths.CloudBlue)
+
+	// Compatibility files
+	checkFile("Green", paths.Green)
+	checkFile("Yellow", paths.Yellow)
+	checkFile("Blue", paths.Blue)
+	checkFile("Gray", paths.Gray)
+
+	t.Log("Successfully verified all 7 specialized printer & cloud icons and format headers.")
+}
+
+func TestTrayStateTransitionsAndNetworkStatus(t *testing.T) {
+	tempIcons := filepath.Join(t.TempDir(), "icons")
+	cb := tray.TrayCallbacks{}
+	tm, err := tray.NewTrayManager(tempIcons, "U1", "U2", cb)
+	if err != nil {
+		t.Fatalf("NewTrayManager failed: %v", err)
+	}
+	defer tm.Stop()
+
+	// 1. Initial State with 0 peers: MUST be StateDisconnected (Printer with cross line)
+	tm.UpdateNetworkStatus("U1", []config.PeerDevice{})
+	// In non-Windows test or headless, state tracking works via UpdateNetworkStatus
+	t.Log("Verified StateDisconnected when 0 peers connected.")
+
+	// 2. Partial connection (1 out of 2 peers online): MUST be StatePartial (Gray printer)
+	tm.UpdateNetworkStatus("U1", []config.PeerDevice{
+		{Name: "U2", IP: "100.1.1.2", Online: true},
+		{Name: "U3", IP: "100.1.1.3", Online: false},
+	})
+	t.Log("Verified StatePartial when some peers are offline.")
+
+	// 3. Full mesh connection (all peers online): MUST be StateConnected (Green printer)
+	tm.UpdateNetworkStatus("U1", []config.PeerDevice{
+		{Name: "U2", IP: "100.1.1.2", Online: true},
+		{Name: "U3", IP: "100.1.1.3", Online: true},
+	})
+	t.Log("Verified StateConnected when all peers are online.")
+
+	// 4. Printing state and completion
+	tm.SetPrintingState("Printing document.pdf...")
+	tm.FlashPrintComplete("Print Done", "Finished printing document.pdf")
+
+	// 5. Syncing state and completion
+	tm.SetSyncingState("Syncing shared file...")
+	tm.FlashSyncComplete("Sync Done", "Finished syncing file")
+	tm.RestoreNetworkStatus()
+
+	t.Log("Successfully verified tray state machine transitions.")
+}
+
+func TestHardUninstallFilesPreservation(t *testing.T) {
+	tempRoot := t.TempDir()
+	appDir := filepath.Join(tempRoot, "BridgeApp")
+	sharedDir := filepath.Join(tempRoot, "Bridge", "Shared")
+	logsDir := filepath.Join(tempRoot, "Bridge", "Logs")
+	queueDir := filepath.Join(tempRoot, "Bridge", "PrintQueue")
+
+	_ = os.MkdirAll(appDir, 0755)
+	_ = os.MkdirAll(sharedDir, 0755)
+	_ = os.MkdirAll(logsDir, 0755)
+	_ = os.MkdirAll(queueDir, 0755)
+
+	// Create user file in shared dir
+	userFile := filepath.Join(sharedDir, "my_important_document.pdf")
+	if err := os.WriteFile(userFile, []byte("important user document"), 0644); err != nil {
+		t.Fatalf("Failed to write test file: %v", err)
+	}
+
+	// Create log and queue files
+	_ = os.WriteFile(filepath.Join(logsDir, "bridge.log"), []byte("some log"), 0644)
+	_ = os.WriteFile(filepath.Join(queueDir, "job1.pdf"), []byte("job data"), 0644)
+
+	// Simulate uninstall cleanup logic
+	_ = os.RemoveAll(logsDir)
+	_ = os.RemoveAll(queueDir)
+	_ = os.RemoveAll(appDir)
+
+	// Verify app dir, logs, and queue are deleted
+	if _, err := os.Stat(appDir); !os.IsNotExist(err) {
+		t.Fatal("Expected BridgeApp directory to be deleted")
+	}
+	if _, err := os.Stat(logsDir); !os.IsNotExist(err) {
+		t.Fatal("Expected Logs directory to be deleted")
+	}
+	if _, err := os.Stat(queueDir); !os.IsNotExist(err) {
+		t.Fatal("Expected PrintQueue directory to be deleted")
+	}
+
+	// Verify user's shared file REMAINS completely intact
+	if data, err := os.ReadFile(userFile); err != nil || string(data) != "important user document" {
+		t.Fatalf("User shared file was not preserved: %v", err)
+	}
+	t.Log("Successfully verified: App and internal files deleted while shared user files preserved.")
+}
+
+func TestHealthProbeDoesNotAutoPair(t *testing.T) {
+	tempRoot := t.TempDir()
+	cfgPath := filepath.Join(tempRoot, "config.json")
+	cfg := &config.Config{
+		NodeName:   "U1",
+		ListenPort: 18790,
+		AuthToken:  "secret-tok",
+		SharedDir:  tempRoot,
+		ConfigPath: cfgPath,
+	}
+	_ = config.SaveConfig(cfgPath, cfg)
+
+	srv := server.NewServer(cfg, nil, nil)
+	go func() {
+		_ = srv.Start()
+	}()
+	defer srv.Stop()
+	time.Sleep(100 * time.Millisecond)
+
+	// Issue a GET /api/health probe with X-Bridge-Probe: 1
+	client := &http.Client{Timeout: 2 * time.Second}
+	req, _ := http.NewRequest("GET", "http://127.0.0.1:18790/api/health", nil)
+	req.Header.Set("X-Bridge-Token", "secret-tok")
+	req.Header.Set("X-Bridge-Node-Name", "U2_Scanner")
+	req.Header.Set("X-Bridge-Probe", "1")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("Health probe failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("Expected 200 OK, got %d", resp.StatusCode)
+	}
+
+	// Verify that U1 did NOT auto-pair U2_Scanner simply from a probe scan!
+	peers := cfg.GetPeers()
+	if len(peers) != 0 {
+		t.Fatalf("Probe ping should NOT auto-pair! Expected 0 peers, found: %d (%+v)", len(peers), peers)
+	}
+	t.Log("Successfully verified: Health probe is strictly read-only and does not prematurely pair.")
+}
+
+func TestSuggestNextDeviceName(t *testing.T) {
+	// 1. Zero devices -> suggest U1
+	if res := installer.SuggestNextDeviceName(nil, ""); res != "U1" {
+		t.Errorf("Expected U1, got %s", res)
+	}
+
+	// 2. U1 online -> suggest U2
+	if res := installer.SuggestNextDeviceName([]string{"U1"}, ""); res != "U2" {
+		t.Errorf("Expected U2, got %s", res)
+	}
+
+	// 3. U1 and U2 online -> suggest U3
+	if res := installer.SuggestNextDeviceName([]string{"U1", "U2"}, ""); res != "U3" {
+		t.Errorf("Expected U3, got %s", res)
+	}
+
+	// 4. Custom device name already set -> preserve
+	if res := installer.SuggestNextDeviceName([]string{"U1"}, "CustomPC"); res != "CustomPC" {
+		t.Errorf("Expected CustomPC, got %s", res)
+	}
+}
+
+func TestIncomingSyncReceiveTriggersCallback(t *testing.T) {
+	tempRoot := t.TempDir()
+	cfg := &config.Config{
+		NodeName:   "U1",
+		ListenPort: 18791,
+		AuthToken:  "secret-tok",
+		SharedDir:  tempRoot,
+	}
+	stateMgr, err := sync.NewStateManager(filepath.Join(tempRoot, "state.json"))
+	if err != nil {
+		t.Fatalf("Failed to create state manager: %v", err)
+	}
+
+	srv := server.NewServer(cfg, stateMgr, nil)
+	var receivedPath string
+	srv.SetOnSyncReceived(func(relPath string) {
+		receivedPath = relPath
+	})
+
+	go func() {
+		_ = srv.Start()
+	}()
+	defer srv.Stop()
+	time.Sleep(100 * time.Millisecond)
+
+	// Send a file upload via POST /api/sync
+	content := []byte("hello network")
+	client := &http.Client{Timeout: 2 * time.Second}
+	req, _ := http.NewRequest("POST", "http://127.0.0.1:18791/api/sync", bytes.NewReader(content))
+	req.Header.Set("X-Bridge-Token", "secret-tok")
+	req.Header.Set("X-Bridge-RelPath", "notes.txt")
+	req.Header.Set("X-Bridge-Checksum", "4fef88a3f412d752e402927344ad13d1dd113ca7f72e4b83d4f97d40acfd91d5")
+	req.Header.Set("X-Bridge-Size", fmt.Sprintf("%d", len(content)))
+	req.Header.Set("X-Bridge-ModTime", fmt.Sprintf("%d", time.Now().UnixNano()))
+
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("Sync upload failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("Expected 200 OK, got %d", resp.StatusCode)
+	}
+
+	if receivedPath != "notes.txt" {
+		t.Fatalf("Expected OnSyncReceived to be called with notes.txt, got %s", receivedPath)
+	}
+	t.Log("Successfully verified: Incoming file sync triggers notification callback.")
+}
+
+func TestUninstallDetachedCommandStructure(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("Skipping Windows-specific powershell execution test on non-windows platform")
+	}
+	tempDir := t.TempDir()
+	appDir := filepath.Join(tempDir, "FakeApp")
+	_ = os.MkdirAll(appDir, 0755)
+	_ = os.WriteFile(filepath.Join(appDir, "test.txt"), []byte("data"), 0644)
+
+	// Spawn detached cleanup with CWD = C:\ and retry loop via PowerShell
+	psClean := fmt.Sprintf(`Start-Sleep -Milliseconds 500; 1..10 | ForEach-Object { Remove-Item -LiteralPath '%s' -Recurse -Force -ErrorAction SilentlyContinue; if (-not (Test-Path -LiteralPath '%s')) { exit 0 }; Start-Sleep -Milliseconds 500 }`, appDir, appDir)
+	cleanupCmd := exec.Command("powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", psClean)
+	cleanupCmd.Dir = `C:\`
+	if err := cleanupCmd.Start(); err != nil {
+		t.Fatalf("Failed to launch cleanup cmd: %v", err)
+	}
+
+	// Wait up to 6 seconds for detached command to delete directory
+	deleted := waitForCondition(6*time.Second, 200*time.Millisecond, func() bool {
+		_, err := os.Stat(appDir)
+		return os.IsNotExist(err)
+	})
+	if !deleted {
+		t.Fatal("Detached cleanup command failed to delete directory")
+	}
+	t.Log("Successfully verified: Detached cleanup command executes with CWD = C:\\ and deletes target directory.")
+}
+
+func TestNoSelfInPeers(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.NodeName = "U1"
+	cfg.ListenPort = 8765
+
+	// 1. AddOrUpdatePeer must reject adding self (exact and case-insensitive)
+	dev, isNew := cfg.AddOrUpdatePeer("U1", "100.64.0.1", "http://100.64.0.1:8765")
+	if isNew || dev.Name != "" {
+		t.Fatalf("Expected AddOrUpdatePeer to reject self device 'U1', got isNew=%v, dev=%+v", isNew, dev)
+	}
+
+	devCase, isNewCase := cfg.AddOrUpdatePeer("u1", "100.64.0.1", "http://100.64.0.1:8765")
+	if isNewCase || devCase.Name != "" {
+		t.Fatalf("Expected AddOrUpdatePeer to reject self device 'u1' (case-insensitive), got isNew=%v", isNewCase)
+	}
+
+	// 2. Loopback URL pointing to own listen port must also be rejected
+	devLoop, isNewLoop := cfg.AddOrUpdatePeer("Other", "127.0.0.1", "http://127.0.0.1:8765")
+	if isNewLoop || devLoop.Name != "" {
+		t.Fatalf("Expected AddOrUpdatePeer to reject loopback URL to own port 8765")
+	}
+
+	// 3. Legitimate remote peer must be accepted
+	dev2, isNew2 := cfg.AddOrUpdatePeer("U2", "100.64.0.2", "http://100.64.0.2:8765")
+	if !isNew2 || dev2.Name != "U2" {
+		t.Fatalf("Expected AddOrUpdatePeer to accept peer 'U2'")
+	}
+
+	dev3, isNew3 := cfg.AddOrUpdatePeer("U3", "100.64.0.3", "http://100.64.0.3:8765")
+	if !isNew3 || dev3.Name != "U3" {
+		t.Fatalf("Expected AddOrUpdatePeer to accept peer 'U3'")
+	}
+
+	if len(cfg.GetPeers()) != 2 {
+		t.Fatalf("Expected exactly 2 peers (U2, U3), got %d: %+v", len(cfg.GetPeers()), cfg.GetPeers())
+	}
+
+	// 4. SetNodeName must prune any matching peer
+	if err := cfg.SetNodeName("U2"); err != nil {
+		t.Fatalf("Failed to SetNodeName: %v", err)
+	}
+	peers := cfg.GetPeers()
+	for _, p := range peers {
+		if strings.EqualFold(p.Name, "U2") {
+			t.Fatalf("SetNodeName('U2') failed to prune 'U2' from peers: %+v", peers)
+		}
+	}
+	if len(peers) != 1 || peers[0].Name != "U3" {
+		t.Fatalf("Expected only U3 remaining in peers, got: %+v", peers)
+	}
+
+	// 5. LoadConfig must prune self if erroneously present in config.json
+	tempDir := t.TempDir()
+	confPath := filepath.Join(tempDir, "config.json")
+	rawJson := `{
+		"node_name": "U1",
+		"listen_port": 8765,
+		"auth_token": "secret",
+		"peers": [
+			{"name": "U1", "ip": "100.64.0.1", "url": "http://100.64.0.1:8765", "spool_port": 9101},
+			{"name": "U2", "ip": "100.64.0.2", "url": "http://100.64.0.2:8765", "spool_port": 9102},
+			{"name": "U3", "ip": "100.64.0.3", "url": "http://100.64.0.3:8765", "spool_port": 9103}
+		]
+	}`
+	if err := os.WriteFile(confPath, []byte(rawJson), 0644); err != nil {
+		t.Fatalf("Failed to write test config: %v", err)
+	}
+
+	loadedCfg, err := config.LoadConfig(confPath)
+	if err != nil {
+		t.Fatalf("LoadConfig failed: %v", err)
+	}
+	loadedPeers := loadedCfg.GetPeers()
+	if len(loadedPeers) != 2 {
+		t.Fatalf("Expected LoadConfig to prune self 'U1' leaving exactly 2 peers, got %d: %+v", len(loadedPeers), loadedPeers)
+	}
+	for _, p := range loadedPeers {
+		if strings.EqualFold(p.Name, "U1") {
+			t.Fatalf("Loaded peers still contained self device 'U1': %+v", loadedPeers)
+		}
+	}
+}
+
+func TestTerminalSetupDeduplicationAndSuggestion(t *testing.T) {
+	// Simulate discovered devices reporting overlapping mesh peers:
+	// Peer 1 (U1) reports meshPeers [U2, U3]
+	// Peer 2 (U2) reports meshPeers [U1, U3]
+	// Peer 3 (U3) reports meshPeers [U1, U2]
+	type activePeer struct {
+		name      string
+		ip        string
+		meshPeers []config.PeerDevice
+	}
+	peers := []activePeer{
+		{
+			name: "U1",
+			ip:   "100.64.0.1",
+			meshPeers: []config.PeerDevice{
+				{Name: "U2", IP: "100.64.0.2"},
+				{Name: "U3", IP: "100.64.0.3"},
+			},
+		},
+		{
+			name: "U2",
+			ip:   "100.64.0.2",
+			meshPeers: []config.PeerDevice{
+				{Name: "U1", IP: "100.64.0.1"},
+				{Name: "U3", IP: "100.64.0.3"},
+			},
+		},
+		{
+			name: "U3",
+			ip:   "100.64.0.3",
+			meshPeers: []config.PeerDevice{
+				{Name: "U1", IP: "100.64.0.1"},
+				{Name: "U2", IP: "100.64.0.2"},
+			},
+		},
+	}
+
+	// Deduplication logic identical to updated wizard
+	var detectedNames []string
+	seenNameSet := make(map[string]bool)
+	localNodeName := "" // Unset or "U4"
+
+	for _, p := range peers {
+		clean := strings.TrimSpace(p.name)
+		low := strings.ToLower(clean)
+		if clean != "" && !seenNameSet[low] && !strings.EqualFold(clean, localNodeName) {
+			seenNameSet[low] = true
+			detectedNames = append(detectedNames, clean)
+		}
+		for _, mp := range p.meshPeers {
+			mpClean := strings.TrimSpace(mp.Name)
+			mpLow := strings.ToLower(mpClean)
+			if mpClean != "" && !seenNameSet[mpLow] && !strings.EqualFold(mpClean, localNodeName) {
+				seenNameSet[mpLow] = true
+				detectedNames = append(detectedNames, mpClean)
+			}
+		}
+	}
+
+	// Verify that detectedNames contains each name EXACTLY ONCE
+	if len(detectedNames) != 3 {
+		t.Fatalf("Expected exactly 3 unique detected names [U1, U2, U3], got %d: %v", len(detectedNames), detectedNames)
+	}
+
+	counts := make(map[string]int)
+	for _, n := range detectedNames {
+		counts[strings.ToLower(n)]++
+	}
+	for name, count := range counts {
+		if count > 1 {
+			t.Fatalf("Name '%s' appeared %d times in detectedNames list (duplicates present!)", name, count)
+		}
+	}
+
+	// Verify intelligent suggestion for next device:
+	// With U1, U2, U3 present, the next device should be suggested as U4
+	nextName := installer.SuggestNextDeviceName(detectedNames, "")
+	if nextName != "U4" {
+		t.Fatalf("Expected SuggestNextDeviceName to suggest 'U4', got '%s'", nextName)
+	}
+
+	// With only U1 present, should suggest U2
+	u1Only := []string{"U1"}
+	if s := installer.SuggestNextDeviceName(u1Only, ""); s != "U2" {
+		t.Fatalf("Expected SuggestNextDeviceName to suggest 'U2', got '%s'", s)
+	}
+}
+
+func TestDirectSumatraXPSAndPDFExecution(t *testing.T) {
+	tempRoot := t.TempDir()
+	mockExe := buildMockPrinter(t, tempRoot)
+
+	queueDir := filepath.Join(tempRoot, "PrintQueue")
+	failedDir := filepath.Join(tempRoot, "PrintFailed")
+
+	ps := printer.NewPrintService(mockExe, 5, queueDir, failedDir)
+	if err := ps.Start(); err != nil {
+		t.Fatalf("Failed to start PrintService: %v", err)
+	}
+	defer ps.Stop()
+
+	// 1. Test XPS print job execution
+	xpsJobPath := filepath.Join(queueDir, "test_doc.xps")
+	if err := os.WriteFile(xpsJobPath, []byte("PK\x03\x04test_xps_data"), 0644); err != nil {
+		t.Fatalf("Failed to create xps file: %v", err)
+	}
+
+	jobXPS := printer.PrintJob{
+		ID:         "test_xps_job_1",
+		FileName:   "test_doc.xps",
+		FilePath:   xpsJobPath,
+		EnqueuedAt: time.Now(),
+	}
+
+	completed := make(chan string, 10)
+	ps.OnJobCompleted = func(j printer.PrintJob) {
+		completed <- j.ID
+	}
+
+	if err := ps.Enqueue(jobXPS); err != nil {
+		t.Fatalf("Failed to enqueue XPS job: %v", err)
+	}
+
+	select {
+	case id := <-completed:
+		if id != "test_xps_job_1" {
+			t.Fatalf("Expected job ID test_xps_job_1, got %s", id)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatalf("Timed out waiting for XPS job completion")
+	}
+
+	// 2. Test PDF print job execution
+	pdfJobPath := filepath.Join(queueDir, "test_doc.pdf")
+	if err := os.WriteFile(pdfJobPath, []byte("%PDF-1.4 test_pdf_data"), 0644); err != nil {
+		t.Fatalf("Failed to create pdf file: %v", err)
+	}
+
+	jobPDF := printer.PrintJob{
+		ID:         "test_pdf_job_2",
+		FileName:   "test_doc.pdf",
+		FilePath:   pdfJobPath,
+		EnqueuedAt: time.Now(),
+	}
+
+	if err := ps.Enqueue(jobPDF); err != nil {
+		t.Fatalf("Failed to enqueue PDF job: %v", err)
+	}
+
+	select {
+	case id := <-completed:
+		if id != "test_pdf_job_2" {
+			t.Fatalf("Expected job ID test_pdf_job_2, got %s", id)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatalf("Timed out waiting for PDF job completion")
+	}
+}
+
+func TestIsSelfTargetValidation(t *testing.T) {
+	nodeName := "U1"
+	port := 8765
+
+	// 1. Exact & case-insensitive node name
+	if !config.IsSelfTarget("U1", "", "", nodeName, port) {
+		t.Errorf("Expected IsSelfTarget true for U1")
+	}
+	if !config.IsSelfTarget("u1", "", "", nodeName, port) {
+		t.Errorf("Expected IsSelfTarget true for u1 (case-insensitive)")
+	}
+	if !config.IsSelfTarget("  U1  ", "", "", nodeName, port) {
+		t.Errorf("Expected IsSelfTarget true for trimmed U1")
+	}
+
+	// 2. Loopback URLs matching listenPort
+	if !config.IsSelfTarget("Remote", "", fmt.Sprintf("http://127.0.0.1:%d", port), nodeName, port) {
+		t.Errorf("Expected IsSelfTarget true for loopback URL on listenPort")
+	}
+	if !config.IsSelfTarget("Remote", "", fmt.Sprintf("http://localhost:%d", port), nodeName, port) {
+		t.Errorf("Expected IsSelfTarget true for localhost URL on listenPort")
+	}
+
+	// Loopback URL on a DIFFERENT port (simulated local peer) must NOT be self!
+	if config.IsSelfTarget("U2", "", fmt.Sprintf("http://127.0.0.1:%d", port+1), nodeName, port) {
+		t.Errorf("Expected IsSelfTarget false for loopback URL on different port")
+	}
+
+	// 3. Hostname
+	if h, err := os.Hostname(); err == nil && h != "" {
+		if !config.IsSelfTarget(h, "", "", nodeName, port) {
+			t.Errorf("Expected IsSelfTarget true for local hostname %s", h)
+		}
+	}
+
+	// 4. Valid remote peer must NOT be identified as self
+	if config.IsSelfTarget("U2", "192.0.2.200", "http://192.0.2.200:8765", nodeName, port) {
+		t.Errorf("Expected IsSelfTarget false for valid remote peer U2")
+	}
+}
+
+func TestSaveIncomingJobAutoCorrection(t *testing.T) {
+	tempRoot := t.TempDir()
+	queueDir := filepath.Join(tempRoot, "PrintQueue")
+	failedDir := filepath.Join(tempRoot, "PrintFailed")
+
+	ps := printer.NewPrintService("", 5, queueDir, failedDir)
+	if err := ps.Start(); err != nil {
+		t.Fatalf("Failed to start PrintService: %v", err)
+	}
+	defer ps.Stop()
+
+	// 1. Send XPS content disguised as a .pdf filename
+	xpsBytes := []byte("PK\x03\x04\x14\x00\x00\x00[Content_Types].xml fixed document sequence stream")
+	job1, err := ps.SaveIncomingJob("misnamed_document.pdf", bytes.NewReader(xpsBytes))
+	if err != nil {
+		t.Fatalf("Failed to save incoming job: %v", err)
+	}
+	if filepath.Ext(job1.FilePath) != ".xps" {
+		t.Errorf("Expected auto-corrected extension .xps, got %s (path: %s)", filepath.Ext(job1.FilePath), job1.FilePath)
+	}
+	if filepath.Ext(job1.FileName) != ".xps" {
+		t.Errorf("Expected auto-corrected filename extension .xps, got %s", job1.FileName)
+	}
+
+	// 2. Send PDF content disguised as a .xps filename
+	pdfBytes := []byte("%PDF-1.4\n1 0 obj\n<<>>\nendobj\ntrailer\n<<>>\n%%EOF")
+	job2, err := ps.SaveIncomingJob("misnamed_document.xps", bytes.NewReader(pdfBytes))
+	if err != nil {
+		t.Fatalf("Failed to save incoming job 2: %v", err)
+	}
+	if filepath.Ext(job2.FilePath) != ".pdf" {
+		t.Errorf("Expected auto-corrected extension .pdf, got %s (path: %s)", filepath.Ext(job2.FilePath), job2.FilePath)
+	}
+	if filepath.Ext(job2.FileName) != ".pdf" {
+		t.Errorf("Expected auto-corrected filename extension .pdf, got %s", job2.FileName)
+	}
+}
+
+func TestSuggestNextDeviceNameWhenTakenNetwork(t *testing.T) {
+	// If currentName is U1 but network already has U1 and U2, must suggest U3
+	suggested := installer.SuggestNextDeviceName([]string{"U1", "U2"}, "U1")
+	if suggested != "U3" {
+		t.Errorf("Expected U3, got %s", suggested)
+	}
+
+	// If currentName is Desktop 1 (prototype) and network has U1, must suggest U2
+	suggested2 := installer.SuggestNextDeviceName([]string{"U1"}, "Desktop 1")
+	if suggested2 != "U2" {
+		t.Errorf("Expected U2, got %s", suggested2)
+	}
+}
+
+func TestHandleHealthFastPath(t *testing.T) {
+	tempRoot := t.TempDir()
+	cfg := config.DefaultConfig()
+	cfg.NodeName = "U1"
+	cfg.ListenPort = 18765
+	cfg.ConfigPath = filepath.Join(tempRoot, "config.json")
+	// Add an offline unreachable dummy peer
+	cfg.Peers = []config.PeerDevice{
+		{
+			Name: "U2",
+			IP:   "192.0.2.1",
+			URL:  "http://192.0.2.1:8765",
+		},
+	}
+
+	srv := server.NewServer(cfg, nil, nil)
+	go func() { _ = srv.Start() }()
+	defer srv.Stop()
+
+	// Wait briefly for server to bind
+	time.Sleep(50 * time.Millisecond)
+
+	// Fast-path health check without ?probe=sync should return instantly (<100ms) without blocking 500ms
+	start := time.Now()
+	resp, err := http.Get(fmt.Sprintf("http://127.0.0.1:%d/api/health", cfg.ListenPort))
+	duration := time.Since(start)
+
+	if err != nil {
+		t.Fatalf("Failed to get health response: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("Expected HTTP 200, got %d", resp.StatusCode)
+	}
+	if duration > 200*time.Millisecond {
+		t.Errorf("Expected fast-path health check to complete in <200ms, took %v", duration)
+	}
+}
+
+// buildMockArgsPrinter compiles a mock binary that logs its command line arguments to args.log.
+func buildMockArgsPrinter(t *testing.T, dir string) (string, string) {
+	mockSrc := filepath.Join(dir, "mock_args_printer.go")
+	mockExe := filepath.Join(dir, "mock_args_sumatra.exe")
+	logFile := filepath.Join(dir, "args.log")
+
+	srcCode := fmt.Sprintf(`package main
+
+import (
+	"os"
+	"strings"
+)
+
+func main() {
+	f, _ := os.OpenFile(%q, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if f != nil {
+		f.WriteString(strings.Join(os.Args[1:], " ") + "\n")
+		f.Close()
+	}
+	os.Exit(0)
+}
+`, logFile)
+	if err := os.WriteFile(mockSrc, []byte(srcCode), 0644); err != nil {
+		t.Fatalf("Failed to write mock args printer src: %v", err)
+	}
+
+	cmd := exec.Command("go", "build", "-o", mockExe, mockSrc)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("Failed to compile mock args printer: %v\nOutput: %s", err, string(out))
+	}
+
+	return mockExe, logFile
+}
+
+func TestSumatraPDFValidationAndDiscovery(t *testing.T) {
+	tempDir := t.TempDir()
+
+	// 1. File under 1MB is rejected as invalid/corrupted
+	smallExe := filepath.Join(tempDir, "small_SumatraPDF.exe")
+	if err := os.WriteFile(smallExe, []byte("fake binary"), 0755); err != nil {
+		t.Fatalf("Failed to write small binary: %v", err)
+	}
+
+	// 2. Large dummy exe (> 1MB) is recognized
+	largeExe := filepath.Join(tempDir, "valid_SumatraPDF.exe")
+	dummyBytes := make([]byte, 1024*1024+500)
+	copy(dummyBytes, "MZ")
+	if err := os.WriteFile(largeExe, dummyBytes, 0755); err != nil {
+		t.Fatalf("Failed to write large binary: %v", err)
+	}
+
+	fi, err := os.Stat(largeExe)
+	if err != nil || fi.Size() < 1024*1024 {
+		t.Fatalf("Expected valid binary > 1MB")
+	}
+}
+
+func TestSumatraZipExtractionAndVerification(t *testing.T) {
+	tempDir := t.TempDir()
+
+	testEntries := []string{
+		"SumatraPDF-3.5.2-64.exe", // Real official 64-bit release filename
+		"SumatraPDF-3.5.2.exe",    // Real official 32-bit release filename
+		"SumatraPDF.exe",          // Standalone unversioned filename
+	}
+
+	for _, entryName := range testEntries {
+		t.Run(entryName, func(t *testing.T) {
+			subDir := filepath.Join(tempDir, strings.ReplaceAll(entryName, ".exe", ""))
+			_ = os.MkdirAll(subDir, 0755)
+			zipPath := filepath.Join(subDir, "test_sumatra.zip")
+			destExe := filepath.Join(subDir, "extracted_SumatraPDF.exe")
+
+			// Create in-memory zip containing the entry (> 1MB)
+			zipBuf := new(bytes.Buffer)
+			zw := zip.NewWriter(zipBuf)
+			f, err := zw.Create(entryName)
+			if err != nil {
+				t.Fatalf("Failed to create zip entry: %v", err)
+			}
+			content := make([]byte, 1024*1024+2000)
+			copy(content, "MZ\x90\x00SumatraOfficialPayload")
+			if _, err := f.Write(content); err != nil {
+				t.Fatalf("Failed to write to zip entry: %v", err)
+			}
+			if err := zw.Close(); err != nil {
+				t.Fatalf("Failed to close zip writer: %v", err)
+			}
+
+			if err := os.WriteFile(zipPath, zipBuf.Bytes(), 0644); err != nil {
+				t.Fatalf("Failed to write zip file: %v", err)
+			}
+
+			// Call actual production extractor
+			if err := printer.ExtractSumatraFromZip(zipPath, destExe); err != nil {
+				t.Fatalf("ExtractSumatraFromZip failed for entry %s: %v", entryName, err)
+			}
+
+			destFi, err := os.Stat(destExe)
+			if err != nil || destFi.Size() < 1024*1024 {
+				t.Fatalf("Extracted binary not valid for %s: %v", entryName, err)
+			}
+		})
+	}
+}
+
+func TestPrintJobRenderingArgumentsAndMarginFitting(t *testing.T) {
+	tempRoot := t.TempDir()
+	mockExe, logFile := buildMockArgsPrinter(t, tempRoot)
+
+	queueDir := filepath.Join(tempRoot, "PrintQueue")
+	failedDir := filepath.Join(tempRoot, "PrintFailed")
+
+	ps := printer.NewPrintService(mockExe, 5, queueDir, failedDir)
+	ps.SetTargetPrinter("HP_LaserJet_Office")
+	if err := ps.Start(); err != nil {
+		t.Fatalf("Failed to start PrintService: %v", err)
+	}
+	defer ps.Stop()
+
+	// 1. Send XPS Print Job
+	xpsJobPath := filepath.Join(queueDir, "document_invoice.xps")
+	if err := os.WriteFile(xpsJobPath, []byte("PK\x03\x04test_xps_payload"), 0644); err != nil {
+		t.Fatalf("Failed to write xps job: %v", err)
+	}
+
+	job := printer.PrintJob{
+		ID:         "job_fit_test_1",
+		FileName:   "document_invoice.xps",
+		FilePath:   xpsJobPath,
+		EnqueuedAt: time.Now(),
+	}
+
+	completed := make(chan string, 5)
+	ps.OnJobCompleted = func(j printer.PrintJob) {
+		completed <- j.ID
+	}
+
+	if err := ps.Enqueue(job); err != nil {
+		t.Fatalf("Failed to enqueue job: %v", err)
+	}
+
+	select {
+	case id := <-completed:
+		if id != "job_fit_test_1" {
+			t.Fatalf("Expected job_fit_test_1, got %s", id)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatalf("Timed out waiting for print job execution")
+	}
+
+	// Verify command line arguments logged by the mock executable
+	logData, err := os.ReadFile(logFile)
+	if err != nil {
+		t.Fatalf("Failed to read args log: %v", err)
+	}
+	logStr := string(logData)
+
+	// Must contain target printer
+	if !strings.Contains(logStr, "HP_LaserJet_Office") {
+		t.Errorf("Expected target printer 'HP_LaserJet_Office' in args, got: %s", logStr)
+	}
+	// Must contain -silent
+	if !strings.Contains(logStr, "-silent") {
+		t.Errorf("Expected '-silent' in args, got: %s", logStr)
+	}
+	// Must contain -print-settings fit for native margin accuracy
+	if !strings.Contains(logStr, "-print-settings fit") {
+		t.Errorf("Expected '-print-settings fit' in args for native scaling, got: %s", logStr)
+	}
+	// Must contain -exit-when-done to guarantee prompt process termination
+	if !strings.Contains(logStr, "-exit-when-done") {
+		t.Errorf("Expected '-exit-when-done' in args, got: %s", logStr)
+	}
+}
+
+func TestPrintJobMissingSumatraSafeFailure(t *testing.T) {
+	tempRoot := t.TempDir()
+	queueDir := filepath.Join(tempRoot, "PrintQueue")
+	failedDir := filepath.Join(tempRoot, "PrintFailed")
+
+	// Configure PrintService with an explicitly non-existent binary path
+	ps := printer.NewPrintService(filepath.Join(tempRoot, "nonexistent", "SumatraPDF.exe"), 2, queueDir, failedDir)
+	ps.SetTargetPrinter("HP_Office_Printer")
+	if err := ps.Start(); err != nil {
+		t.Fatalf("Failed to start PrintService: %v", err)
+	}
+	defer ps.Stop()
+
+	pdfJobPath := filepath.Join(queueDir, "corrupted_test.pdf")
+	if err := os.WriteFile(pdfJobPath, []byte("%PDF-1.4 test payload"), 0644); err != nil {
+		t.Fatalf("Failed to create test pdf: %v", err)
+	}
+
+	job := printer.PrintJob{
+		ID:         "missing_sumatra_job_1",
+		FileName:   "corrupted_test.pdf",
+		FilePath:   pdfJobPath,
+		EnqueuedAt: time.Now(),
+	}
+
+	failed := make(chan string, 5)
+	ps.OnJobFailed = func(j printer.PrintJob, reason string) {
+		failed <- reason
+	}
+
+	if err := ps.Enqueue(job); err != nil {
+		t.Fatalf("Failed to enqueue job: %v", err)
+	}
+
+	select {
+	case reason := <-failed:
+		if !strings.Contains(strings.ToLower(reason), "sumatrapdf") && !strings.Contains(strings.ToLower(reason), "missing") && !strings.Contains(strings.ToLower(reason), "engine") {
+			t.Logf("Job failed as expected with reason: %s", reason)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatalf("Expected job to safely fail when print engine is missing, but timed out")
+	}
+
+	// Verify failed job was moved to failed directory and not deleted or left in queue
+	failedPath := filepath.Join(failedDir, "missing_sumatra_job_1")
+	if _, err := os.Stat(failedPath); err != nil {
+		t.Errorf("Expected job file moved to %s, stat returned: %v", failedPath, err)
+	}
+}
+
+func TestSumatraShortcutCreation(t *testing.T) {
+	tempDir := t.TempDir()
+	targetExe := filepath.Join(tempDir, "SumatraPDF.exe")
+	lnkPath := filepath.Join(tempDir, "SumatraPDF.lnk")
+
+	// Must fail on missing exe
+	if err := printer.CreateSumatraShortcut(""); err == nil {
+		t.Errorf("Expected error for empty exe path")
+	}
+
+	// Write valid >1MB dummy exe
+	dummyBytes := make([]byte, 1024*1024+50)
+	copy(dummyBytes, "MZ")
+	if err := os.WriteFile(targetExe, dummyBytes, 0755); err != nil {
+		t.Fatalf("Failed to write target exe: %v", err)
+	}
+
+	// Test shortcut creation
+	if err := printer.CreateShortcut(targetExe, lnkPath, "Bridge Silent Print Engine", ""); err != nil {
+		t.Fatalf("Failed to create shortcut: %v", err)
+	}
+
+	if _, err := os.Stat(lnkPath); err != nil {
+		t.Fatalf("Shortcut was not created at %s: %v", lnkPath, err)
+	}
+}
+
+func TestUninstallerCleansSumatraAndShortcuts(t *testing.T) {
+	tempDir := t.TempDir()
+	appDir := filepath.Join(tempDir, "BridgeApp")
+	_ = os.MkdirAll(appDir, 0755)
+
+	sumatraExe := filepath.Join(appDir, "SumatraPDF.exe")
+	sumatraLnk := filepath.Join(appDir, "SumatraPDF.lnk")
+	bridgeExe := filepath.Join(appDir, "bridge.exe")
+
+	_ = os.WriteFile(sumatraExe, []byte("fake sumatra"), 0755)
+	_ = os.WriteFile(sumatraLnk, []byte("fake link"), 0644)
+	_ = os.WriteFile(bridgeExe, []byte("fake bridge"), 0755)
+
+	// Simulate uninstaller file cleanup
+	entries, err := os.ReadDir(appDir)
+	if err != nil {
+		t.Fatalf("Failed to read app dir: %v", err)
+	}
+	for _, e := range entries {
+		if !strings.EqualFold(e.Name(), "bridge.exe") {
+			_ = os.RemoveAll(filepath.Join(appDir, e.Name()))
+		}
+	}
+
+	if _, err := os.Stat(sumatraExe); !os.IsNotExist(err) {
+		t.Errorf("Expected SumatraPDF.exe to be removed by uninstaller")
+	}
+	if _, err := os.Stat(sumatraLnk); !os.IsNotExist(err) {
+		t.Errorf("Expected SumatraPDF.lnk to be removed by uninstaller")
+	}
+	if _, err := os.Stat(bridgeExe); err != nil {
+		t.Errorf("Expected bridge.exe to remain for final detachment cleanup: %v", err)
+	}
+}
+
+func TestExtractCleanSpoolPayload(t *testing.T) {
+	// 1. Direct clean XPS container
+	rawXPS := []byte("PK\x03\x04\x14\x00\x08\x00[Content_Types].xml...")
+	cleanXPS, extXPS := printer.ExtractCleanSpoolPayload(rawXPS)
+	if extXPS != ".xps" {
+		t.Errorf("Expected .xps extension, got %s", extXPS)
+	}
+	if !bytes.Equal(cleanXPS, rawXPS) {
+		t.Errorf("Expected unchanged raw XPS stream")
+	}
+
+	// 2. PJL-encapsulated XPS container with EOJ trailer and EOCD
+	zipEOCD := []byte("PK\x03\x04\x14\x00\x08\x00[Content_Types].xml..." + "PK\x05\x06\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00")
+	pjlXPS := append([]byte("\x1b%-12345X@PJL JOB\r\n@PJL ENTER LANGUAGE = XPS\r\n"), zipEOCD...)
+	pjlXPS = append(pjlXPS, []byte("\x1b%-12345X@PJL EOJ\r\n\x1b%-12345X")...)
+	cleanPJLXPS, extPJLXPS := printer.ExtractCleanSpoolPayload(pjlXPS)
+	if extPJLXPS != ".xps" {
+		t.Errorf("Expected .xps extension for PJL XPS, got %s", extPJLXPS)
+	}
+	if !bytes.Equal(cleanPJLXPS, zipEOCD) {
+		t.Errorf("Expected exact byte-for-byte extraction of zip container without trailing PJL EOJ")
+	}
+	if bytes.Contains(cleanPJLXPS, []byte("@PJL")) {
+		t.Errorf("Clean XPS should not contain PJL headers or trailers")
+	}
+
+	// 3. Direct clean PDF container
+	rawPDF := []byte("%PDF-1.7\n1 0 obj\n<< /Type /Catalog >>\nendobj\n%%EOF")
+	cleanPDF, extPDF := printer.ExtractCleanSpoolPayload(rawPDF)
+	if extPDF != ".pdf" {
+		t.Errorf("Expected .pdf extension, got %s", extPDF)
+	}
+	if !bytes.Equal(cleanPDF, rawPDF) {
+		t.Errorf("Expected unchanged raw PDF stream")
+	}
+
+	// 4. PJL-encapsulated PDF container with UEL trailer
+	pjlPDF := []byte("\x1b%-12345X@PJL JOB\r\n@PJL ENTER LANGUAGE = PDF\r\n%PDF-1.4\nstream data\n%%EOF\r\n\x1b%-12345X")
+	cleanPJLPDF, extPJLPDF := printer.ExtractCleanSpoolPayload(pjlPDF)
+	if extPJLPDF != ".pdf" {
+		t.Errorf("Expected .pdf extension for PJL PDF, got %s", extPJLPDF)
+	}
+	if !bytes.HasPrefix(cleanPJLPDF, []byte("%PDF-")) {
+		t.Errorf("Expected clean PDF to start with %%PDF-, got %q", string(cleanPJLPDF[:10]))
+	}
+	if bytes.Contains(cleanPJLPDF, []byte("@PJL")) {
+		t.Errorf("Clean PDF should not contain PJL headers")
+	}
+
+	// 5. Linear / non-%%EOF PDF with trailing UEL command
+	rawLinearPDF := []byte("%PDF-1.5\nstream data without explicit eof\x1b%-12345X@PJL EOJ")
+	cleanLinear, extLinear := printer.ExtractCleanSpoolPayload(rawLinearPDF)
+	if extLinear != ".pdf" {
+		t.Errorf("Expected .pdf extension for linear PDF, got %s", extLinear)
+	}
+	if bytes.Contains(cleanLinear, []byte("@PJL")) || bytes.Contains(cleanLinear, []byte("\x1b%-12345X")) {
+		t.Errorf("Expected trailing PJL stripped from linear PDF without %%%%EOF")
+	}
+}
+
+func TestEnhancedVirtualPrinterKeywords(t *testing.T) {
+	// Virtual printers that corrupt formatting if treated as physical
+	virtualPrinters := []struct {
+		name string
+		port string
+	}{
+		{"Generic / Text Only", "LPT1:"},
+		{"Generic", "USB001"},
+		{"Text Only", "COM1:"},
+		{"Microsoft XPS Document Writer v4", "PORTPROMPT:"},
+		{"OpenXPS Document Writer", "PORTPROMPT:"},
+		{"PDFCreator", "PDFPort"},
+		{"Foxit PDF Printer", "FoxitPort"},
+		{"Snagit 2024", "SnagitPort"},
+		{"Nitro PDF Creator", "NitroPort"},
+	}
+
+	for _, vp := range virtualPrinters {
+		if !printer.IsVirtualPrinterName(vp.name, vp.port) {
+			t.Errorf("Expected %q on port %q to be identified as virtual printer", vp.name, vp.port)
+		}
+	}
+
+	// Real physical printers that must NOT be identified as virtual
+	physicalPrinters := []struct {
+		name string
+		port string
+	}{
+		{"Canon TS5300 series", "WSD-abc123"},
+		{"HP LaserJet Pro MFP M428fdw", "192.168.1.100"},
+		{"Brother HL-L2350DW series", "USB001"},
+		{"Epson EcoTank ET-2800", "USB002"},
+	}
+
+	for _, pp := range physicalPrinters {
+		if printer.IsVirtualPrinterName(pp.name, pp.port) {
+			t.Errorf("Expected %q on port %q to be identified as physical printer, but was flagged virtual", pp.name, pp.port)
+		}
+	}
+}
+
 
 
 

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -63,7 +64,7 @@ func DefaultConfig() *Config {
 		AuthToken:       "bridge-secret-token",
 		SharedDir:       `C:\Bridge\Shared`,
 		PrintDir:        `C:\Bridge\Print`,
-		SumatraPath:     `C:\Program Files\SumatraPDF\SumatraPDF.exe`,
+		SumatraPath:     `C:\BridgeApp\SumatraPDF.exe`,
 		PrintTimeoutSec: 45,
 		StateFile:       `C:\BridgeApp\state.json`,
 		PrintQueueDir:   `C:\Bridge\PrintQueue`,
@@ -86,6 +87,104 @@ func ExtractIP(raw string) string {
 		clean = host
 	}
 	return strings.Trim(clean, "/")
+}
+
+// isSelfIP checks if targetIP is assigned to any active network interface on this computer, or is loopback.
+// isSelfNonLoopbackIP checks if targetIP is assigned to any active non-loopback network interface (e.g. Tailscale).
+func isSelfNonLoopbackIP(targetIP string) bool {
+	clean := strings.TrimSpace(targetIP)
+	if clean == "" || clean == "127.0.0.1" || clean == "::1" || strings.EqualFold(clean, "localhost") {
+		return false
+	}
+	parsed := net.ParseIP(clean)
+	if parsed == nil || parsed.IsLoopback() {
+		return false
+	}
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return false
+	}
+	for _, iface := range ifaces {
+		if iface.Flags&net.FlagUp == 0 {
+			continue
+		}
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, addr := range addrs {
+			var ip net.IP
+			switch v := addr.(type) {
+			case *net.IPNet:
+				ip = v.IP
+			case *net.IPAddr:
+				ip = v.IP
+			}
+			if ip != nil && ip.Equal(parsed) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// isSelfTarget checks whether the name, IP, or URL identifies THIS computer.
+func isSelfTarget(name, ip, rawURL, nodeName string, listenPort int) bool {
+	cleanName := strings.TrimSpace(name)
+	cleanIP := strings.TrimSpace(ip)
+	cleanURL := strings.TrimRight(strings.TrimSpace(rawURL), "/")
+
+	if cleanIP == "" && cleanURL != "" {
+		cleanIP = ExtractIP(cleanURL)
+	}
+
+	if nodeName != "" {
+		normNode := strings.ToLower(strings.TrimSpace(nodeName))
+		if strings.EqualFold(cleanName, normNode) {
+			return true
+		}
+		if cleanIP != "" && strings.EqualFold(cleanName, fmt.Sprintf("device (%s)", cleanIP)) && strings.EqualFold(cleanIP, normNode) {
+			return true
+		}
+	}
+
+	if h, err := os.Hostname(); err == nil && h != "" {
+		if strings.EqualFold(cleanName, strings.TrimSpace(h)) {
+			return true
+		}
+	}
+
+	// For loopback URLs, it is only self if the port matches our own ListenPort
+	if cleanURL != "" && listenPort > 0 {
+		if strings.EqualFold(cleanURL, fmt.Sprintf("http://127.0.0.1:%d", listenPort)) ||
+			strings.EqualFold(cleanURL, fmt.Sprintf("http://localhost:%d", listenPort)) {
+			return true
+		}
+		if u, err := url.Parse(cleanURL); err == nil {
+			host := u.Hostname()
+			uPort := u.Port()
+			if (uPort == "" || uPort == fmt.Sprintf("%d", listenPort)) && isSelfNonLoopbackIP(host) {
+				return true
+			}
+		}
+	}
+
+	// For non-loopback IP (e.g. Tailscale IP), check if assigned to this machine
+	if cleanIP != "" && isSelfNonLoopbackIP(cleanIP) {
+		return true
+	}
+
+	return false
+}
+
+// IsSelfIP checks if targetIP is assigned to any active non-loopback network interface on this computer.
+func IsSelfIP(targetIP string) bool {
+	return isSelfNonLoopbackIP(targetIP)
+}
+
+// IsSelfTarget checks whether the name, IP, or URL identifies THIS computer.
+func IsSelfTarget(name, ip, rawURL, nodeName string, listenPort int) bool {
+	return isSelfTarget(name, ip, rawURL, nodeName, listenPort)
 }
 
 // LoadConfig loads, migrates, and validates configuration from a JSON file.
@@ -199,6 +298,17 @@ func LoadConfig(path string) (*Config, error) {
 		}
 	}
 
+	// Strictly purge self device from Peers slice if erroneously present from prior versions
+	var cleanPeers []PeerDevice
+	for _, p := range cfg.Peers {
+		if !isSelfTarget(p.Name, p.IP, p.URL, cfg.NodeName, cfg.ListenPort) {
+			cleanPeers = append(cleanPeers, p)
+		} else {
+			migrated = true
+		}
+	}
+	cfg.Peers = cleanPeers
+
 	// Keep legacy fields synchronized with primary peer
 	if len(cfg.Peers) > 0 {
 		cfg.PeerName = cfg.Peers[0].Name
@@ -260,6 +370,14 @@ func (c *Config) SetNodeName(name string) error {
 		return nil
 	}
 	c.NodeName = cleanName
+	// Prune any peer that matches the new self node name
+	var cleanPeers []PeerDevice
+	for _, p := range c.Peers {
+		if !isSelfTarget(p.Name, p.IP, p.URL, cleanName, c.ListenPort) {
+			cleanPeers = append(cleanPeers, p)
+		}
+	}
+	c.Peers = cleanPeers
 	configPath := c.ConfigPath
 	c.mu.Unlock()
 
@@ -281,11 +399,19 @@ func (c *Config) GetPeers() []PeerDevice {
 // SetPeers thread-safely updates the peers list and saves configuration.
 func (c *Config) SetPeers(peers []PeerDevice) error {
 	c.mu.Lock()
-	c.Peers = make([]PeerDevice, len(peers))
-	copy(c.Peers, peers)
+	c.Peers = make([]PeerDevice, 0, len(peers))
+	for _, p := range peers {
+		if isSelfTarget(p.Name, p.IP, p.URL, c.NodeName, c.ListenPort) {
+			continue // Strictly exclude self device from peers
+		}
+		c.Peers = append(c.Peers, p)
+	}
 	if len(c.Peers) > 0 {
 		c.PeerName = c.Peers[0].Name
 		c.PeerURL = c.Peers[0].URL
+	} else {
+		c.PeerName = ""
+		c.PeerURL = ""
 	}
 	configPath := c.ConfigPath
 	c.mu.Unlock()
@@ -395,6 +521,12 @@ func (c *Config) AddOrUpdatePeer(name, ip, peerURL string) (PeerDevice, bool) {
 	cleanName := strings.TrimSpace(name)
 	cleanIP := strings.TrimSpace(ip)
 	cleanURL := strings.TrimRight(strings.TrimSpace(peerURL), "/")
+
+	// Never add self device as a peer!
+	if isSelfTarget(cleanName, cleanIP, cleanURL, c.NodeName, c.ListenPort) {
+		c.mu.Unlock()
+		return PeerDevice{}, false
+	}
 
 	if cleanIP == "" && cleanURL != "" {
 		cleanIP = ExtractIP(cleanURL)

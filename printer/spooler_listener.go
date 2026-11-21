@@ -3,6 +3,7 @@ package printer
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"log"
@@ -107,11 +108,11 @@ func (sl *SpoolerListener) handleConnection(conn net.Conn) {
 
 	log.Printf("[SpoolerListener] Received %d bytes print stream from %s", len(data), conn.RemoteAddr())
 
-	ext := DetectSpoolFormat(data)
+	cleanData, ext := ExtractCleanSpoolPayload(data)
 	jobName := fmt.Sprintf("print_%d%s", time.Now().UnixNano(), ext)
 
 	tmpFile := filepath.Join(os.TempDir(), jobName)
-	if err := os.WriteFile(tmpFile, data, 0644); err != nil {
+	if err := os.WriteFile(tmpFile, cleanData, 0644); err != nil {
 		log.Printf("[SpoolerListener] Failed to write temp spool file: %v", err)
 		if sl.OnJobFailed != nil {
 			sl.OnJobFailed(jobName, err)
@@ -138,6 +139,85 @@ func (sl *SpoolerListener) handleConnection(conn net.Conn) {
 		sl.OnJobCompleted(jobName)
 	}
 	log.Printf("[SpoolerListener] Print job %s delivered successfully.", jobName)
+}
+
+// ExtractCleanSpoolPayload strips PJL / spool wrappers and returns clean document payload and extension.
+func ExtractCleanSpoolPayload(data []byte) ([]byte, string) {
+	if len(data) == 0 {
+		return data, ".pdf"
+	}
+
+	// 1. Clean XPS / OpenXPS container (PK\x03\x04 at offset 0)
+	if bytes.HasPrefix(data, []byte("PK\x03\x04")) {
+		clean := data
+		// Even if starting at offset 0, strip trailing PJL / spool trailer if present
+		if eocdIdx := bytes.LastIndex(clean, []byte("PK\x05\x06")); eocdIdx != -1 && len(clean) >= eocdIdx+22 {
+			commentLen := int(binary.LittleEndian.Uint16(clean[eocdIdx+20 : eocdIdx+22]))
+			zipEnd := eocdIdx + 22 + commentLen
+			if zipEnd <= len(clean) {
+				clean = clean[:zipEnd]
+			}
+		} else if uelIdx := bytes.Index(clean[4:], []byte("\x1b%-12345X")); uelIdx != -1 {
+			clean = clean[:4+uelIdx]
+		}
+		return clean, ".xps"
+	}
+
+	// 2. Clean PDF container (%PDF- at offset 0)
+	if bytes.HasPrefix(data, []byte("%PDF-")) {
+		clean := data
+		if eofIdx := bytes.LastIndex(clean, []byte("%%EOF")); eofIdx != -1 {
+			end := eofIdx + 5
+			for end < len(clean) && (clean[end] == '\r' || clean[end] == '\n' || clean[end] == ' ') {
+				end++
+			}
+			if end <= len(clean) {
+				clean = clean[:end]
+			}
+		} else if uelIdx := bytes.Index(clean[5:], []byte("\x1b%-12345X")); uelIdx != -1 {
+			clean = clean[:5+uelIdx]
+		}
+		return clean, ".pdf"
+	}
+
+	// 3. PJL / Spool wrapper: check for encapsulated PDF
+	if pdfIdx := bytes.Index(data, []byte("%PDF-")); pdfIdx != -1 {
+		clean := data[pdfIdx:]
+		// Strip trailing PJL UEL \x1b%-12345X if present after %%EOF
+		if eofIdx := bytes.LastIndex(clean, []byte("%%EOF")); eofIdx != -1 {
+			end := eofIdx + 5
+			for end < len(clean) && (clean[end] == '\r' || clean[end] == '\n' || clean[end] == ' ') {
+				end++
+			}
+			if end <= len(clean) {
+				clean = clean[:end]
+			}
+		} else if uelIdx := bytes.Index(clean[5:], []byte("\x1b%-12345X")); uelIdx != -1 {
+			clean = clean[:5+uelIdx]
+		}
+		return clean, ".pdf"
+	}
+
+	// 4. PJL / Spool wrapper: check for encapsulated XPS
+	if xpsIdx := bytes.Index(data, []byte("PK\x03\x04")); xpsIdx != -1 {
+		clean := data[xpsIdx:]
+		// Locate ZIP End of Central Directory record (PK\x05\x06) to find the exact byte boundary of the XPS package
+		if eocdIdx := bytes.LastIndex(clean, []byte("PK\x05\x06")); eocdIdx != -1 && len(clean) >= eocdIdx+22 {
+			commentLen := int(binary.LittleEndian.Uint16(clean[eocdIdx+20 : eocdIdx+22]))
+			zipEnd := eocdIdx + 22 + commentLen
+			if zipEnd <= len(clean) {
+				clean = clean[:zipEnd]
+				return clean, ".xps"
+			}
+		}
+		// Fallback: strip starting from the first trailing UEL command after the XPS stream
+		if uelIdx := bytes.Index(clean[4:], []byte("\x1b%-12345X")); uelIdx != -1 {
+			clean = clean[:4+uelIdx]
+		}
+		return clean, ".xps"
+	}
+
+	return data, DetectSpoolFormat(data)
 }
 
 // DetectSpoolFormat inspects byte headers to determine whether stream is XPS or PDF.
