@@ -43,12 +43,12 @@ Designed for low-end Windows 10/11 machines with **idle RAM < 25 MB** and **idle
 - **Clean Background Autostart & Zero Startup Terminals:**
   - After a one-time setup, Bridge starts automatically at Windows logon via a single canonical registry entry with the `-autostart` flag.
   - Console windows are suppressed immediately upon boot (`CREATE_NO_WINDOW` and early window hiding).
-  - Legacy duplicate startup locations (HKLM, User Startup, Common Startup, old scheduled tasks) are actively purged, guaranteeing that exactly ONE background service instance runs with the taskbar icon, and ZERO terminal windows open on boot.
+  - Legacy duplicate startup locations (HKLM, User Startup, Common Startup, old scheduled tasks) are purged during setup, install, upgrade, and uninstall, guaranteeing that exactly ONE background service instance runs with the taskbar icon, and ZERO terminal windows open on boot.
 - **Single-Instance Protection:**
   - Double-clicking `bridge.exe` while another dashboard is already running brings the existing window to the front, guaranteeing that only 1 terminal window can ever be opened.
 - **No Unsolicited Auto-Updates:**
   - Launching `bridge.exe` presents an intuitive Control Dashboard with clear action options. It never auto-updates, kills processes, or overwrites files behind the user's back.
-  - Upgrading Bridge is an explicit user choice available in the dashboard menu (`Option [8]`).
+  - Upgrading Bridge is an explicit user choice available in the dashboard menu (`Option [3]`).
 
 ### 3. Modern Multi-Function Taskbar Bridge Icon
 - **High-DPI Multi-Resolution Bridge Icon:** Handcrafted architectural bridge icon packed with 16x16, 32x32, and 48x48 RGBA layers for pixel-perfect rendering across standard, 125%, 150%, and 200% Windows High-DPI displays.
@@ -68,7 +68,8 @@ Designed for low-end Windows 10/11 machines with **idle RAM < 25 MB** and **idle
   - ❌ *Exit Bridge*
 
 ### 4. Multi-Device Virtual Printing (Parallel, Native Accuracy & Low Latency)
-- **High-Fidelity Silent Print Engine (SumatraPDF):** Autonomous, self-provisioning standalone print engine (`C:\BridgeApp\SumatraPDF.exe`) renders PDF, XPS, and OpenXPS documents with 99.99% native accuracy and exact margin fitting (`-print-settings "fit"`). Eliminates corrupt raw-byte dumps, page-splitting bugs, and multi-page blank overflows.
+- **High-Fidelity Silent Print Engine (SumatraPDF):** Autonomous, self-provisioning standalone print engine (`C:\BridgeApp\SumatraPDF.exe`) renders PDF, XPS, and OpenXPS documents at true 100% 1:1 scale (`-print-settings` with `noscale`, e.g. `1-N,paper=<PaperName>,<orientation>,noscale`) and direct-printed images with clean page fitting (`-print-settings` with `fit`) so high-DPI images are never cropped.
+- **Supported Formats:** Direct printing (Taskbar *Print on \<PeerName\>...* picker and Explorer *Send to*) supports **PDF** (`.pdf`), **XPS/OpenXPS** (`.xps`, `.oxps`), and **image files** (`.png`, `.jpg`, `.jpeg`, `.tif`, `.tiff`, `.bmp`, `.gif`). Native **Ctrl+P** printing via `Print on <PeerName>` supports **any Windows application** (Word, Excel, Chrome, Acrobat Reader, AutoCAD, etc.).
 - **Autonomous Auto-Provisioning & Self-Healing:** The first-time setup terminal and background service automatically verify, download from direct CDN mirrors, and configure the standalone print engine without external package manager dependencies, complete with Desktop (`Desktop\SumatraPDF.lnk`) and Application (`C:\BridgeApp\SumatraPDF.lnk`) shortcuts.
 - **PJL & Spool Stream Stripping:** In-memory stream parser detects and strips PJL (Printer Job Language) headers/trailers emitted by port monitors, guaranteeing pure, uncorrupted XPS/PDF document payload delivery to the print engine.
 - **Comprehensive Virtual Printer Filtering:** Rejects all non-physical printer drivers (Generic / Text Only, OpenXPS Document Writer, PDFCreator, Fax, OneNote, etc.), guaranteeing that only true physical raster/inkjet/laser print heads receive jobs.
@@ -168,7 +169,7 @@ Designed for low-end Windows 10/11 machines with **idle RAM < 25 MB** and **idle
 - Click **Print**. The document transmits and prints silently on the remote computer's physical printer.
 
 ### 3. Right-Click SendTo Printing
-- Right-click any file in Windows Explorer (Downloads, Desktop, etc.) ➔ **Send to** ➔ **Print on <PeerName>**.
+- Right-click any supported direct-print file (PDF, XPS/OpenXPS, PNG, JPG/JPEG, TIF/TIFF, BMP, or GIF) in Windows Explorer (Downloads, Desktop, etc.) ➔ **Send to** ➔ **Print on <PeerName>**.
 
 ### 4. Taskbar Multi-Function Icon
 - **Left-Click** or **Right-Click** the modern Bridge icon near your clock:
@@ -182,14 +183,10 @@ Designed for low-end Windows 10/11 machines with **idle RAM < 25 MB** and **idle
 - When `bridge.exe` is run after setup, it displays the **Control Dashboard** (guaranteed exactly 1 terminal window):
   - View real-time service status, IP, connected peers, and local physical printer.
   - Quick action menu:
-    - `[1]` Open Shared Folder
-    - `[2]` Print Document to Peer
-    - `[3]` Add Peer Device by IP
-    - `[4]` View Live Service Logs
-    - `[5]` Start or Restart Background Service
-    - `[6]` Re-run Setup Wizard / Change Settings
-    - `[7]` Cleanly Uninstall Bridge Service
-    - `[8]` **Upgrade Bridge Installation** (Safely upgrades Bridge to a new version only when confirmed by the user; no surprise auto-updates!)
+    - `[1]` Connect / Pair a New Device
+    - `[2]` Start or Restart Background Service
+    - `[3]` **Upgrade / Refresh Bridge Installation** (Safely upgrades Bridge to a new version only when confirmed by the user; no surprise auto-updates!)
+    - `[4]` Uninstall Bridge Completely
     - `[0]` Exit Dashboard (Background service continues running in the taskbar)
 - **Computer Reboot / Startup:**
   - Bridge starts silently in the background with the taskbar icon.
@@ -206,6 +203,24 @@ Designed for low-end Windows 10/11 machines with **idle RAM < 25 MB** and **idle
 | **Runtime Dependencies** | None (pure Go, native Win32 APIs, GDI, Winsock, Winspool) |
 | **Idle Resource Usage** | < 25 MB RAM, 0% CPU |
 | **Spooler Engine** | RAW TCP Port Monitor (`127.0.0.1:9101-9120`) |
-| **Silent PDF Engine** | Embedded SumatraPDF integration with 45s watchdog timer |
+| **Silent PDF Engine** | Embedded SumatraPDF integration with 45s watchdog timer (`-print-settings` uses `noscale` for PDF/XPS & `fit` for images) |
+| **Supported Formats** | Direct print: PDF, XPS/OXPS, PNG, JPG/JPEG, TIF/TIFF, BMP, GIF · Ctrl+P virtual printer: Any Windows app |
+| **Document Geometry** | High-precision PDF & XPS geometry parser (MediaBox, CropBox, UserUnit, Rotate, ObjStm, FixedPage) |
+| **Remote Print Fidelity** | 100% 1:1 scale for PDF/XPS, fit-to-page for images, paper matching (A4, Letter, Legal, etc.) & orientation |
 | **Network Security** | Tailscale WireGuard mesh + `X-Bridge-Token` header verification |
 | **Default Printer Safety** | Protected via `LegacyDefaultPrinterMode = 1` registry lock |
+
+---
+
+## 🚀 Release History
+
+### v2.3.x — Lifecycle Reliability, Geometry Precision & Mesh Stability
+- **Atomic Config Persistence & Safe Peer Updates:** Made `SaveConfig` atomic with temp-file + retry rename, avoided rewriting `config.json` on unchanged heartbeat/authenticated requests, and honored explicit `"configured": true` in `LoadConfig`.
+- **Clean Startup, Elevation & Tray Lifecycle:** Fixed UAC self-elevation lock ordering so elevated setup never races with the parent mutex, wired tray *Sync Now* (`OnResync`) to real peer reconciliation, ensured graceful service shutdown on *Exit Bridge*, added 10 MB `bridge.log` startup rotation, and moved heavy legacy startup sweeps out of normal boot/dashboard launches.
+- **Virtual Printer Hygiene:** Verified `-SNMP 0` and `WorkOffline=$false` during virtual printer checks and returned clear errors when elevation is needed.
+
+### v2.3.0 — Zero-Defect 1:1 Scale, Spool Decoupling & Terminal Status Sync
+- **Restored Peer Connectivity in Dashboard:** Live `/api/health` probes accurately reflect reachable peers as `🟢 Online` in both terminal and system tray.
+- **Immediate Port Spool Acknowledgment:** Decoupled Windows RAW TCP spool handshake from remote WAN dispatch in `SpoolerListener`, preventing Windows Print Spooler timeouts.
+- **Full-Document Page Count & Geometry Resolution:** Inspects full PDF/XPS documents up to 32 MB and uses `-print-settings` `noscale` for PDF/XPS and `fit` for direct-printed images while preserving existing user `SumatraPDF-settings.txt` files.
+- **Safe .NET XPS Ticket Fallback & Clean Uninstall:** Null-safe `PrintTicket` resolution and clean removal of Bridge virtual printers, ports, and startup entries on uninstall.
