@@ -9,6 +9,7 @@ import (
 	"runtime"
 	"syscall"
 	"time"
+	"unicode/utf16"
 	"unsafe"
 
 	"bridge/config"
@@ -55,6 +56,7 @@ var (
 	procGlobalAlloc      = kernel32.NewProc("GlobalAlloc")
 	procGlobalLock       = kernel32.NewProc("GlobalLock")
 	procGlobalUnlock     = kernel32.NewProc("GlobalUnlock")
+	procRtlMoveMemory    = kernel32.NewProc("RtlMoveMemory")
 
 	wmTaskbarCreated uint32
 )
@@ -635,7 +637,12 @@ func OpenFilePicker(title string) (string, error) {
 	var ofn OPENFILENAMEW
 	ofn.LStructSize = uint32(unsafe.Sizeof(ofn))
 
-	filter, _ := syscall.UTF16FromString("All Supported Files\x00*.pdf;*.txt;*.png;*.jpg;*.docx;*.doc\x00PDF Documents (*.pdf)\x00*.pdf\x00All Files (*.*)\x00*.*\x00\x00")
+	const printFileFilter = "All Supported Files\x00*.pdf;*.xps;*.oxps;*.png;*.jpg;*.jpeg;*.tif;*.tiff;*.bmp;*.gif\x00" +
+		"PDF Documents (*.pdf)\x00*.pdf\x00" +
+		"XPS Documents (*.xps;*.oxps)\x00*.xps;*.oxps\x00" +
+		"Images (*.png;*.jpg;*.jpeg;*.tif;*.tiff;*.bmp;*.gif)\x00*.png;*.jpg;*.jpeg;*.tif;*.tiff;*.bmp;*.gif\x00" +
+		"All Files (*.*)\x00*.*\x00\x00"
+	filter := utf16.Encode([]rune(printFileFilter))
 	ofn.LpstrFilter = &filter[0]
 
 	fileBuf := make([]uint16, 1024)
@@ -739,7 +746,7 @@ func SetClipboardText(text string) error {
 	if ptr == 0 {
 		return fmt.Errorf("global memory lock failed")
 	}
-	copy((*[1 << 30]byte)(unsafe.Pointer(ptr))[:cb], (*[1 << 30]byte)(unsafe.Pointer(&text16[0]))[:cb])
+	procRtlMoveMemory.Call(ptr, uintptr(unsafe.Pointer(&text16[0])), uintptr(cb))
 	procGlobalUnlock.Call(hMem)
 
 	procSetClipboardData.Call(13 /* CF_UNICODETEXT */, hMem)

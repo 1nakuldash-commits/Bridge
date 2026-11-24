@@ -4,6 +4,7 @@ import (
 	"archive/zip"
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -12,7 +13,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -89,6 +92,7 @@ type PrintJob struct {
 
 // PrintService manages the print queue and the anti-hang sequential worker.
 type PrintService struct {
+	mu             sync.RWMutex
 	sumatraPath    string
 	targetPrinter  string
 	timeout        time.Duration
@@ -118,12 +122,32 @@ func NewPrintService(sumatraPath string, timeoutSec int, queueDir, failedDir str
 	}
 }
 
-// SetTargetPrinter overrides the auto-detected physical printer for testing or fixed routing.
-func (ps *PrintService) SetTargetPrinter(printerName string) {
-	ps.targetPrinter = printerName
+func (ps *PrintService) getSumatraPath() string {
+	ps.mu.RLock()
+	defer ps.mu.RUnlock()
+	return ps.sumatraPath
 }
 
-// Start ensures required directories exist and launches the sequential worker.
+func (ps *PrintService) setSumatraPath(path string) {
+	ps.mu.Lock()
+	ps.sumatraPath = path
+	ps.mu.Unlock()
+}
+
+func (ps *PrintService) getTargetPrinter() string {
+	ps.mu.RLock()
+	defer ps.mu.RUnlock()
+	return ps.targetPrinter
+}
+
+// SetTargetPrinter overrides the auto-detected physical printer for testing or fixed routing.
+func (ps *PrintService) SetTargetPrinter(printerName string) {
+	ps.mu.Lock()
+	ps.targetPrinter = printerName
+	ps.mu.Unlock()
+}
+
+// Start ensures required directories exist, recovers orphaned queued jobs, and launches the sequential worker.
 func (ps *PrintService) Start() error {
 	if err := os.MkdirAll(ps.queueDir, 0755); err != nil {
 		return fmt.Errorf("failed to create print queue dir: %w", err)
@@ -134,23 +158,123 @@ func (ps *PrintService) Start() error {
 
 	// Proactive auto-heal: On Windows, if SumatraPDF is missing, begin background provisioning
 	// so the engine is fully ready and verified before the first print job arrives.
+	initialSumatra := ps.getSumatraPath()
 	if runtime.GOOS == "windows" {
-		ConfigureSumatraDefaults(ps.sumatraPath)
-		if !isUsableSumatra(ps.sumatraPath) && FindSumatraPDF() == "" {
+		ConfigureSumatraDefaults(initialSumatra)
+		if !isUsableSumatra(initialSumatra) && FindSumatraPDF() == "" {
 			go func() {
 				if path, err := EnsureSumatraPDF(); err == nil && path != "" {
-					ps.sumatraPath = path
+					ps.setSumatraPath(path)
 					ConfigureSumatraDefaults(path)
 				}
 			}()
 		}
 	}
 
+	ps.recoverOrphanedJobs()
+
 	ps.wg.Add(1)
 	go ps.workerLoop()
 
-	log.Printf("[Printer] PrintService started (SumatraPath: %s, Timeout: %v)", ps.sumatraPath, ps.timeout)
+	log.Printf("[Printer] PrintService started (SumatraPath: %s, Timeout: %v)", initialSumatra, ps.timeout)
 	return nil
+}
+
+func (ps *PrintService) recoverOrphanedJobs() {
+	entries, err := os.ReadDir(ps.queueDir)
+	if err != nil {
+		return
+	}
+
+	type orphanedEntry struct {
+		name    string
+		path    string
+		modTime time.Time
+	}
+	var orphans []orphanedEntry
+
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		lower := strings.ToLower(name)
+		if strings.HasPrefix(name, ".") || strings.HasSuffix(lower, ".tmp") || strings.HasSuffix(lower, ".part") || strings.HasSuffix(lower, ".clean") {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil || !info.Mode().IsRegular() || info.Size() == 0 {
+			continue
+		}
+		fullPath := filepath.Join(ps.queueDir, name)
+		if !isValidQueuedJobFile(fullPath, lower) {
+			continue
+		}
+		orphans = append(orphans, orphanedEntry{
+			name:    name,
+			path:    fullPath,
+			modTime: info.ModTime(),
+		})
+	}
+
+	sort.Slice(orphans, func(i, j int) bool {
+		if !orphans[i].modTime.Equal(orphans[j].modTime) {
+			return orphans[i].modTime.Before(orphans[j].modTime)
+		}
+		return orphans[i].name < orphans[j].name
+	})
+
+	for _, o := range orphans {
+		job := PrintJob{
+			ID:         o.name,
+			FileName:   extractOriginalJobName(o.name),
+			FilePath:   o.path,
+			EnqueuedAt: o.modTime,
+		}
+		if err := ps.Enqueue(job); err != nil {
+			log.Printf("[Printer] Warning: failed to recover orphaned job %s: %v", o.name, err)
+			break
+		}
+		log.Printf("[Printer] Recovered orphaned queued print job %s", o.name)
+	}
+}
+
+func isValidQueuedJobFile(path, lowerName string) bool {
+	ext := filepath.Ext(lowerName)
+	switch ext {
+	case ".pdf", ".xps", ".oxps", ".png", ".jpg", ".jpeg", ".tif", ".tiff", ".gif", ".bmp":
+		return true
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	buf := make([]byte, 512)
+	n, _ := f.Read(buf)
+	hdr := buf[:n]
+	return detectImageMagic(hdr) != "" ||
+		bytes.HasPrefix(hdr, []byte("%PDF-")) ||
+		bytes.HasPrefix(hdr, []byte("PK\x03\x04")) ||
+		bytes.HasPrefix(hdr, []byte("\x1b%-12345X")) ||
+		bytes.HasPrefix(hdr, []byte("@PJL"))
+}
+
+func extractOriginalJobName(id string) string {
+	idx := strings.IndexByte(id, '_')
+	if idx > 0 && idx < len(id)-1 {
+		allDigits := true
+		for i := 0; i < idx; i++ {
+			if id[i] < '0' || id[i] > '9' {
+				allDigits = false
+				break
+			}
+		}
+		if allDigits {
+			return id[idx+1:]
+		}
+	}
+	return id
 }
 
 // Stop shuts down the worker gracefully.
@@ -199,30 +323,9 @@ func (ps *PrintService) SaveIncomingJob(fileName string, r io.Reader) (PrintJob,
 		return PrintJob{}, fmt.Errorf("failed to write print job data: %w", err)
 	}
 
-	// Inspect binary header to auto-correct mismatched extensions or strip PJL wrappers
-	header := make([]byte, 4096)
-	if hf, err := os.Open(jobPath); err == nil {
-		n, _ := hf.Read(header)
-		_ = hf.Close()
-		cleanHeader, detectedExt := ExtractCleanSpoolPayload(header[:n])
-		// If PJL was detected at start of file, re-write with clean payload
-		if len(cleanHeader) < n && (bytes.HasPrefix(header[:n], []byte("\x1b%-12345X")) || bytes.Index(header[:n], []byte("%PDF-")) > 0 || bytes.Index(header[:n], []byte("PK\x03\x04")) > 0) {
-			if allData, readErr := os.ReadFile(jobPath); readErr == nil {
-				cleaned, cleanExt := ExtractCleanSpoolPayload(allData)
-				_ = os.WriteFile(jobPath, cleaned, 0644)
-				detectedExt = cleanExt
-			}
-		}
-		currExt := strings.ToLower(filepath.Ext(jobPath))
-		if detectedExt != "" && currExt != detectedExt {
-			newJobPath := strings.TrimSuffix(jobPath, currExt) + detectedExt
-			if renErr := os.Rename(jobPath, newJobPath); renErr == nil {
-				jobPath = newJobPath
-				jobID = strings.TrimSuffix(jobID, currExt) + detectedExt
-				cleanName = strings.TrimSuffix(cleanName, currExt) + detectedExt
-			}
-		}
-	}
+	// Inspect binary header to strip genuine PJL wrappers or normalize mislabeled PDF/XPS spool streams.
+	// Never alter or rename valid image files or non-PDF/XPS formats.
+	jobPath, jobID, cleanName = normalizeIncomingJobFile(jobPath, jobID, cleanName)
 
 	job := PrintJob{
 		ID:         jobID,
@@ -237,6 +340,214 @@ func (ps *PrintService) SaveIncomingJob(fileName string, r io.Reader) (PrintJob,
 	}
 
 	return job, nil
+}
+
+func isGenericSpoolExt(ext string) bool {
+	switch ext {
+	case "", ".pdf", ".prn", ".spl", ".bin", ".dat", ".raw":
+		return true
+	default:
+		return false
+	}
+}
+
+func normalizeIncomingJobFile(jobPath, jobID, cleanName string) (string, string, string) {
+	hf, err := os.Open(jobPath)
+	if err != nil {
+		return jobPath, jobID, cleanName
+	}
+	header := make([]byte, 4096)
+	n, _ := hf.Read(header)
+	_ = hf.Close()
+	if n == 0 {
+		return jobPath, jobID, cleanName
+	}
+	hdr := header[:n]
+	currExt := strings.ToLower(filepath.Ext(jobPath))
+
+	// Preserve valid image files and non-PJL/PDF/XPS formats untouched
+	if detectImageMagic(hdr) != "" {
+		return jobPath, jobID, cleanName
+	}
+
+	var detectedExt string
+	isPJL := bytes.HasPrefix(hdr, []byte("\x1b%-12345X")) || bytes.HasPrefix(hdr, []byte("@PJL"))
+
+	if isPJL {
+		if payloadStart, ext, ok := findPJLPayloadStart(jobPath, 1024*1024); ok {
+			payloadEnd := findPayloadEnd(jobPath, payloadStart, ext)
+			if stripFileSlice(jobPath, payloadStart, payloadEnd) == nil {
+				detectedExt = ext
+			}
+		}
+	} else if bytes.HasPrefix(hdr, []byte("%PDF-")) {
+		detectedExt = ".pdf"
+	} else if bytes.HasPrefix(hdr, []byte("PK\x03\x04")) {
+		if currExt == ".oxps" {
+			detectedExt = ".oxps"
+		} else if currExt == ".xps" || isGenericSpoolExt(currExt) {
+			detectedExt = ".xps"
+		}
+	}
+
+	// Never rename valid non-PDF/XPS files when no genuine PDF/XPS stream was detected
+	if detectedExt == "" || currExt == detectedExt {
+		return jobPath, jobID, cleanName
+	}
+	if detectedExt == ".xps" && currExt == ".oxps" {
+		return jobPath, jobID, cleanName
+	}
+
+	newJobPath := strings.TrimSuffix(jobPath, filepath.Ext(jobPath)) + detectedExt
+	if renErr := os.Rename(jobPath, newJobPath); renErr == nil {
+		jobPath = newJobPath
+		jobID = strings.TrimSuffix(jobID, filepath.Ext(jobID)) + detectedExt
+		cleanName = strings.TrimSuffix(cleanName, filepath.Ext(cleanName)) + detectedExt
+	}
+	return jobPath, jobID, cleanName
+}
+
+// findPJLPayloadStart scans a PJL spool file in fixed-size chunks (without loading the full file into RAM)
+// to locate the start offset of an encapsulated %PDF- or PK\x03\x04 stream.
+func findPJLPayloadStart(path string, maxScanBytes int64) (int64, string, bool) {
+	f, err := os.Open(path)
+	if err != nil {
+		return 0, "", false
+	}
+	defer f.Close()
+
+	const chunkSize = 64 * 1024
+	const overlap = 16
+	buf := make([]byte, chunkSize+overlap)
+	carry := 0
+	var offset int64
+
+	for offset < maxScanBytes {
+		n, readErr := f.Read(buf[carry : carry+chunkSize])
+		if n == 0 {
+			break
+		}
+		window := buf[:carry+n]
+		pdfIdx := bytes.Index(window, []byte("%PDF-"))
+		xpsIdx := bytes.Index(window, []byte("PK\x03\x04"))
+
+		if pdfIdx >= 0 && (xpsIdx < 0 || pdfIdx < xpsIdx) {
+			return offset - int64(carry) + int64(pdfIdx), ".pdf", true
+		}
+		if xpsIdx >= 0 {
+			return offset - int64(carry) + int64(xpsIdx), ".xps", true
+		}
+
+		offset += int64(n)
+		if readErr != nil {
+			break
+		}
+		if len(window) >= overlap {
+			copy(buf[:overlap], window[len(window)-overlap:])
+			carry = overlap
+		} else {
+			copy(buf[:len(window)], window)
+			carry = len(window)
+		}
+	}
+	return 0, "", false
+}
+
+func findPayloadEnd(path string, start int64, ext string) int64 {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return -1
+	}
+	size := fi.Size()
+	if start >= size {
+		return size
+	}
+
+	tailSize := int64(4096)
+	if size-start < tailSize {
+		tailSize = size - start
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return size
+	}
+	defer f.Close()
+
+	tailOffset := size - tailSize
+	tail := make([]byte, tailSize)
+	n, _ := f.ReadAt(tail, tailOffset)
+	tail = tail[:n]
+
+	if ext == ".pdf" {
+		if eofIdx := bytes.LastIndex(tail, []byte("%%EOF")); eofIdx != -1 {
+			end := eofIdx + 5
+			for end < len(tail) && (tail[end] == '\r' || tail[end] == '\n' || tail[end] == ' ') {
+				end++
+			}
+			return tailOffset + int64(end)
+		}
+	} else if ext == ".xps" {
+		if eocdIdx := bytes.LastIndex(tail, []byte("PK\x05\x06")); eocdIdx != -1 && len(tail) >= eocdIdx+22 {
+			commentLen := int(binary.LittleEndian.Uint16(tail[eocdIdx+20 : eocdIdx+22]))
+			zipEnd := eocdIdx + 22 + commentLen
+			if zipEnd <= len(tail) {
+				return tailOffset + int64(zipEnd)
+			}
+		}
+	}
+
+	if uelIdx := bytes.Index(tail, []byte("\x1b%-12345X")); uelIdx != -1 {
+		return tailOffset + int64(uelIdx)
+	}
+	return size
+}
+
+func stripFileSlice(path string, start, end int64) error {
+	if start <= 0 && end < 0 {
+		return nil
+	}
+	src, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	fi, err := src.Stat()
+	if err != nil {
+		_ = src.Close()
+		return err
+	}
+	if end < 0 || end > fi.Size() {
+		end = fi.Size()
+	}
+	if start == 0 && end == fi.Size() {
+		_ = src.Close()
+		return nil
+	}
+	if _, err := src.Seek(start, io.SeekStart); err != nil {
+		_ = src.Close()
+		return err
+	}
+
+	tmpPath := path + ".clean"
+	dst, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+	if err != nil {
+		_ = src.Close()
+		return err
+	}
+	_, copyErr := io.CopyN(dst, src, end-start)
+	closeDstErr := dst.Close()
+	_ = src.Close()
+	if copyErr != nil || closeDstErr != nil {
+		_ = os.Remove(tmpPath)
+		if copyErr != nil {
+			return copyErr
+		}
+		return closeDstErr
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	return nil
 }
 
 func (ps *PrintService) workerLoop() {
@@ -522,7 +833,13 @@ func EnsureSumatraPDF() (string, error) {
 	return "", errors.New("provisioned SumatraPDF binary failed validation")
 }
 
-// ConfigureSumatraDefaults ensures SumatraPDF-settings.txt enforces 100% 1:1 scale (noscale) by default.
+var (
+	sumatraPrintScaleLineRe = regexp.MustCompile(`(?im)^([ \t]*PrintScale[ \t]*=[ \t]*)(\S+)([ \t]*)$`)
+	sumatraPrinterDefaultsRe = regexp.MustCompile(`(?im)^([ \t]*PrinterDefaults[ \t]*\[[ \t]*\r?\n)`)
+)
+
+// ConfigureSumatraDefaults ensures SumatraPDF-settings.txt uses valid "PrintScale = none"
+// without clobbering existing user settings.
 func ConfigureSumatraDefaults(exePath string) {
 	if exePath == "" {
 		exePath = FindSumatraPDF()
@@ -531,38 +848,67 @@ func ConfigureSumatraDefaults(exePath string) {
 		exePath = `C:\BridgeApp\SumatraPDF.exe`
 	}
 
-	applySettings := func(settingsPath string) {
-		dir := filepath.Dir(settingsPath)
-		if err := os.MkdirAll(dir, 0755); err != nil {
-			return
-		}
-		content := []byte("Theme = Light\nPrinterDefaults [\n\tPrintScale = noscale\n]\n")
-		if existing, err := os.ReadFile(settingsPath); err == nil {
-			s := string(existing)
-			if strings.Contains(s, "PrintScale = shrink") || strings.Contains(s, "PrintScale = fit") {
-				s = strings.ReplaceAll(s, "PrintScale = shrink", "PrintScale = noscale")
-				s = strings.ReplaceAll(s, "PrintScale = fit", "PrintScale = noscale")
-				_ = os.WriteFile(settingsPath, []byte(s), 0644)
-				return
-			} else if strings.Contains(s, "PrintScale = noscale") {
-				return
-			}
-		}
-		_ = os.WriteFile(settingsPath, content, 0644)
+	paths := []string{
+		filepath.Join(filepath.Dir(exePath), "SumatraPDF-settings.txt"),
+		`C:\BridgeApp\SumatraPDF-settings.txt`,
 	}
 
-	// 1. Target directory next to executable
-	applySettings(filepath.Join(filepath.Dir(exePath), "SumatraPDF-settings.txt"))
-
-	// 2. Global application directory
-	applySettings(`C:\BridgeApp\SumatraPDF-settings.txt`)
-
-	// 3. User profile AppData locations (if present)
+	// User profile AppData locations (create default if missing, or patch PrintScale cleanly)
 	if appData := os.Getenv("APPDATA"); appData != "" {
-		applySettings(filepath.Join(appData, "SumatraPDF", "SumatraPDF-settings.txt"))
+		paths = append(paths, filepath.Join(appData, "SumatraPDF", "SumatraPDF-settings.txt"))
 	}
 	if localAppData := os.Getenv("LOCALAPPDATA"); localAppData != "" {
-		applySettings(filepath.Join(localAppData, "SumatraPDF", "SumatraPDF-settings.txt"))
+		paths = append(paths, filepath.Join(localAppData, "SumatraPDF", "SumatraPDF-settings.txt"))
+	}
+
+	configureSumatraSettingsAt(paths)
+}
+
+func configureSumatraSettingsAt(paths []string) {
+	seen := make(map[string]bool, len(paths))
+	for _, p := range paths {
+		if p == "" {
+			continue
+		}
+		clean := filepath.Clean(p)
+		if seen[clean] {
+			continue
+		}
+		seen[clean] = true
+		applySumatraSettingsFile(clean)
+	}
+}
+
+func applySumatraSettingsFile(settingsPath string) {
+	const defaultContent = "Theme = Light\nPrinterDefaults [\n\tPrintScale = none\n]\n"
+
+	existing, err := os.ReadFile(settingsPath)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			return
+		}
+		if mkErr := os.MkdirAll(filepath.Dir(settingsPath), 0755); mkErr != nil {
+			return
+		}
+		_ = os.WriteFile(settingsPath, []byte(defaultContent), 0644)
+		return
+	}
+
+	s := string(existing)
+	updated := s
+	if sumatraPrintScaleLineRe.MatchString(s) {
+		updated = sumatraPrintScaleLineRe.ReplaceAllString(s, "${1}none${3}")
+	} else if sumatraPrinterDefaultsRe.MatchString(s) {
+		updated = sumatraPrinterDefaultsRe.ReplaceAllString(s, "${1}\tPrintScale = none\n")
+	} else {
+		if updated != "" && !strings.HasSuffix(updated, "\n") {
+			updated += "\n"
+		}
+		updated += "PrinterDefaults [\n\tPrintScale = none\n]\n"
+	}
+
+	if updated != s {
+		_ = os.WriteFile(settingsPath, []byte(updated), 0644)
 	}
 }
 
@@ -594,12 +940,13 @@ func (ps *PrintService) processJob(job PrintJob) {
 		ps.OnJobStarted(job)
 	}
 
-	targetPrinter := ps.targetPrinter
+	targetPrinter := ps.getTargetPrinter()
+	sumatraBin := ps.getSumatraPath()
 	var err error
 	if targetPrinter == "" {
 		targetPrinter, err = GetTargetPhysicalPrinter()
 		if err != nil {
-			if strings.Contains(strings.ToLower(ps.sumatraPath), "mock") {
+			if strings.Contains(strings.ToLower(sumatraBin), "mock") {
 				targetPrinter = "MockPrinter"
 				err = nil
 			}
@@ -618,16 +965,15 @@ func (ps *PrintService) processJob(job PrintJob) {
 	log.Printf("[Printer] Target physical printer for job %s: '%s'", job.ID, targetPrinter)
 
 	// Locate effective SumatraPDF executable: check configured path, then auto-discover
-	sumatraBin := ps.sumatraPath
 	if !isUsableSumatra(sumatraBin) {
 		if discovered := FindSumatraPDF(); isUsableSumatra(discovered) {
 			sumatraBin = discovered
-			ps.sumatraPath = discovered
+			ps.setSumatraPath(discovered)
 		} else {
 			// Auto-heal on the fly: attempt standalone engine download if missing
 			if provisioned, provErr := EnsureSumatraPDF(); provErr == nil && isUsableSumatra(provisioned) {
 				sumatraBin = provisioned
-				ps.sumatraPath = provisioned
+				ps.setSumatraPath(provisioned)
 			}
 		}
 	}

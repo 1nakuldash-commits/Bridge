@@ -3,8 +3,14 @@ package printer
 import (
 	"archive/zip"
 	"bytes"
+	"compress/zlib"
+	"fmt"
+	"image"
+	"image/color"
+	"image/png"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -244,5 +250,279 @@ trailer
 	}
 	if s := BuildPrintSettings(geomA2); s != "1-1,paper=A2,portrait,noscale" {
 		t.Errorf("Expected '1-1,paper=A2,portrait,noscale', got %s", s)
+	}
+}
+
+func TestDetectDocumentGeometryPDF_ObjStmCompressed(t *testing.T) {
+	tempDir := t.TempDir()
+	pdfPath := filepath.Join(tempDir, "compressed_objstm.pdf")
+
+	// Build compressed /ObjStm holding Catalog (1), Pages (2), and Page (3)
+	objs := []struct {
+		id   int
+		body string
+	}{
+		{1, "<< /Type /Catalog /Pages 2 0 R >>"},
+		{2, "<< /Type /Pages /Kids [3 0 R 4 0 R 5 0 R] /Count 3 >>"},
+		{3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612.0 792.0] >>"},
+	}
+	var headerBuf, bodyBuf bytes.Buffer
+	for _, o := range objs {
+		fmt.Fprintf(&headerBuf, "%d %d ", o.id, bodyBuf.Len())
+		bodyBuf.WriteString(o.body)
+		bodyBuf.WriteByte('\n')
+	}
+	firstOffset := headerBuf.Len()
+	var plainStm bytes.Buffer
+	plainStm.Write(headerBuf.Bytes())
+	plainStm.Write(bodyBuf.Bytes())
+
+	var compressed bytes.Buffer
+	zw := zlib.NewWriter(&compressed)
+	_, _ = zw.Write(plainStm.Bytes())
+	_ = zw.Close()
+
+	var pdf bytes.Buffer
+	pdf.WriteString("%PDF-1.5\n")
+	fmt.Fprintf(&pdf, "10 0 obj\n<< /Type /ObjStm /N %d /First %d /Filter /FlateDecode /Length %d >>\nstream\n",
+		len(objs), firstOffset, compressed.Len())
+	pdf.Write(compressed.Bytes())
+	pdf.WriteString("\nendstream\nendobj\n")
+	pdf.WriteString("11 0 obj\n<< /Type /XRef /Size 12 /Root 1 0 R /Length 0 >>\nstream\nendstream\nendobj\n%%EOF\n")
+
+	if err := os.WriteFile(pdfPath, pdf.Bytes(), 0644); err != nil {
+		t.Fatalf("Failed to write compressed PDF: %v", err)
+	}
+
+	geom := DetectDocumentGeometry(pdfPath)
+	if geom.PaperName != "Letter" {
+		t.Errorf("Expected PaperName Letter, got %q", geom.PaperName)
+	}
+	if geom.Orientation != "portrait" {
+		t.Errorf("Expected Orientation portrait, got %q", geom.Orientation)
+	}
+	if geom.PageCount != 3 {
+		t.Errorf("Expected PageCount 3, got %d", geom.PageCount)
+	}
+	if s := BuildPrintSettings(geom); s != "1-3,paper=Letter,portrait,noscale" {
+		t.Errorf("Expected '1-3,paper=Letter,portrait,noscale', got %q", s)
+	}
+}
+
+func TestDetectDocumentGeometryPDF_NestedPages(t *testing.T) {
+	tempDir := t.TempDir()
+	pdfPath := filepath.Join(tempDir, "nested_pages.pdf")
+
+	// Child /Pages node (10 0 obj, /Count 1) appears BEFORE root /Pages node (2 0 obj, /Count 4)
+	pdfContent := `%PDF-1.4
+10 0 obj
+<< /Type /Pages /Parent 2 0 R /Kids [11 0 R] /Count 1 >>
+endobj
+11 0 obj
+<< /Type /Page /Parent 10 0 R >>
+endobj
+20 0 obj
+<< /Type /Pages /Parent 2 0 R /Kids [21 0 R 22 0 R 23 0 R] /Count 3 >>
+endobj
+21 0 obj
+<< /Type /Page /Parent 20 0 R >>
+endobj
+22 0 obj
+<< /Type /Page /Parent 20 0 R >>
+endobj
+23 0 obj
+<< /Type /Page /Parent 20 0 R >>
+endobj
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [10 0 R 20 0 R] /Count 4 /MediaBox [0 0 595.28 841.89] >>
+endobj
+trailer
+<< /Size 24 /Root 1 0 R >>
+%%EOF`
+	if err := os.WriteFile(pdfPath, []byte(pdfContent), 0644); err != nil {
+		t.Fatalf("Failed to write nested pages PDF: %v", err)
+	}
+
+	geom := DetectDocumentGeometry(pdfPath)
+	if geom.PageCount != 4 {
+		t.Errorf("Expected root PageCount 4, got %d", geom.PageCount)
+	}
+	if geom.PaperName != "A4" {
+		t.Errorf("Expected inherited PaperName A4, got %q", geom.PaperName)
+	}
+	if s := BuildPrintSettings(geom); s != "1-4,paper=A4,portrait,noscale" {
+		t.Errorf("Expected '1-4,paper=A4,portrait,noscale', got %q", s)
+	}
+}
+
+func TestDetectDocumentGeometryPDF_UserUnitAndOversized(t *testing.T) {
+	tempDir := t.TempDir()
+
+	// 1. Half-size MediaBox with /UserUnit 2 => A4 portrait at 1:1
+	uuA4Path := filepath.Join(tempDir, "userunit_a4.pdf")
+	uuA4 := `%PDF-1.6
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [3 0 R] /Count 1 >>
+endobj
+3 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 297.64 420.945] /UserUnit 2 >>
+endobj
+trailer
+<< /Size 4 /Root 1 0 R >>
+%%EOF`
+	_ = os.WriteFile(uuA4Path, []byte(uuA4), 0644)
+	geom := DetectDocumentGeometry(uuA4Path)
+	if geom.PaperName != "A4" || geom.ScaleMode != "noscale" {
+		t.Errorf("Expected A4/noscale for UserUnit=2 half-A4, got paper=%q scale=%q", geom.PaperName, geom.ScaleMode)
+	}
+
+	// 2. Oversized A0 PDF (2383.94 x 3370.39 pt) => no invalid paper=A0, shrink fallback
+	a0Path := filepath.Join(tempDir, "oversized_a0.pdf")
+	a0PDF := `%PDF-1.4
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [3 0 R] /Count 1 >>
+endobj
+3 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 2383.94 3370.39] >>
+endobj
+trailer
+<< /Size 4 /Root 1 0 R >>
+%%EOF`
+	_ = os.WriteFile(a0Path, []byte(a0PDF), 0644)
+	geomA0 := DetectDocumentGeometry(a0Path)
+	if geomA0.PaperName != "" {
+		t.Errorf("Expected empty PaperName for oversized A0, got %q", geomA0.PaperName)
+	}
+	if geomA0.ScaleMode != "shrink" {
+		t.Errorf("Expected ScaleMode 'shrink' for oversized A0, got %q", geomA0.ScaleMode)
+	}
+	if s := BuildPrintSettings(geomA0); s != "1-1,portrait,shrink" {
+		t.Errorf("Expected '1-1,portrait,shrink', got %q", s)
+	}
+}
+
+func TestDetectDocumentGeometryPDF_MixedOrientationAndCropBox(t *testing.T) {
+	tempDir := t.TempDir()
+	pdfPath := filepath.Join(tempDir, "mixed_orient.pdf")
+
+	// Page 1: A4 portrait (MediaBox)
+	// Page 2: A4 rotated 90 degrees => landscape (CropBox fallback)
+	pdfContent := `%PDF-1.4
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>
+endobj
+3 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595.28 841.89] >>
+endobj
+4 0 obj
+<< /Type /Page /Parent 2 0 R /CropBox [0 0 595.28 841.89] /Rotate 90 >>
+endobj
+trailer
+<< /Size 5 /Root 1 0 R >>
+%%EOF`
+	_ = os.WriteFile(pdfPath, []byte(pdfContent), 0644)
+
+	geom := DetectDocumentGeometry(pdfPath)
+	if !geom.MixedOrientations {
+		t.Errorf("Expected MixedOrientations=true")
+	}
+	if geom.MixedSizes {
+		t.Errorf("Expected MixedSizes=false (both pages are A4)")
+	}
+	if geom.Orientation != "" {
+		t.Errorf("Expected empty Orientation when mixed, got %q", geom.Orientation)
+	}
+	if s := BuildPrintSettings(geom); s != "1-2,paper=A4,noscale" {
+		t.Errorf("Expected '1-2,paper=A4,noscale', got %q", s)
+	}
+}
+
+func TestDetectDocumentGeometryXPS_FPageOrdering(t *testing.T) {
+	tempDir := t.TempDir()
+	xpsPath := filepath.Join(tempDir, "ordered_pages.xps")
+
+	f, err := os.Create(xpsPath)
+	if err != nil {
+		t.Fatalf("Failed to create xps: %v", err)
+	}
+	zw := zip.NewWriter(f)
+
+	// Intentionally write 10.fpage and 2.fpage before 1.fpage in ZIP directory order.
+	// 1.fpage is Letter portrait; 2.fpage & 10.fpage are also Letter portrait.
+	pages := []struct {
+		name string
+		w, h string
+	}{
+		{"Documents/1/Pages/10.fpage", "816", "1056"},
+		{"Documents/1/Pages/2.fpage", "816", "1056"},
+		{"Documents/1/Pages/1.fpage", "793.7", "1122.5"}, // Page 1 is A4 portrait
+	}
+	for _, p := range pages {
+		w, _ := zw.Create(p.name)
+		_, _ = fmt.Fprintf(w, `<FixedPage xmlns="http://schemas.microsoft.com/xps/2005/06" Width="%s" Height="%s" />`, p.w, p.h)
+	}
+	_ = zw.Close()
+	_ = f.Close()
+
+	geom := DetectDocumentGeometry(xpsPath)
+	if geom.PageCount != 3 {
+		t.Errorf("Expected PageCount 3, got %d", geom.PageCount)
+	}
+	// Page 1 must be 1.fpage (A4: ~595.28 x 841.88 pt), not 10.fpage (Letter: 612 x 792 pt)
+	if geom.WidthPt < 590 || geom.WidthPt > 600 {
+		t.Errorf("Expected WidthPt from 1.fpage (~595.3), got %.2f", geom.WidthPt)
+	}
+	if !geom.MixedSizes {
+		t.Errorf("Expected MixedSizes=true across A4 page 1 and Letter pages 2,10")
+	}
+	if s := BuildPrintSettings(geom); s != "1-3,portrait,noscale" {
+		t.Errorf("Expected '1-3,portrait,noscale', got %q", s)
+	}
+}
+
+func TestDetectDocumentGeometryImage_ScalingMode(t *testing.T) {
+	tempDir := t.TempDir()
+	imgPath := filepath.Join(tempDir, "photo_landscape.png")
+
+	img := image.NewRGBA(image.Rect(0, 0, 200, 100))
+	img.Set(0, 0, color.RGBA{R: 255, A: 255})
+	f, err := os.Create(imgPath)
+	if err != nil {
+		t.Fatalf("Failed to create png: %v", err)
+	}
+	if err := png.Encode(f, img); err != nil {
+		_ = f.Close()
+		t.Fatalf("Failed to encode png: %v", err)
+	}
+	_ = f.Close()
+
+	geom := DetectDocumentGeometry(imgPath)
+	if geom.Format != ".png" {
+		t.Errorf("Expected Format .png, got %q", geom.Format)
+	}
+	if geom.ScaleMode != "fit" {
+		t.Errorf("Expected ScaleMode 'fit' for image, got %q", geom.ScaleMode)
+	}
+	if geom.Orientation != "landscape" {
+		t.Errorf("Expected Orientation 'landscape' for 200x100 PNG, got %q", geom.Orientation)
+	}
+	if geom.PageCount != 1 {
+		t.Errorf("Expected PageCount 1, got %d", geom.PageCount)
+	}
+	s := BuildPrintSettings(geom)
+	if strings.Contains(s, "noscale") || !strings.Contains(s, "fit") {
+		t.Errorf("Expected image print settings to use 'fit' and not 'noscale', got %q", s)
 	}
 }
