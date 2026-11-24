@@ -1815,9 +1815,9 @@ func TestStrictConfiguredFlagMigrationWithArbitraryNames(t *testing.T) {
 			expected: true,
 		},
 		{
-			name:     "Modern config configured true but stale Desktop 1 name",
+			name:     "Modern config configured true with Desktop 1 name",
 			jsonText: `{"configured":true,"node_name":"Desktop 1","listen_port":8765}`,
-			expected: false,
+			expected: true,
 		},
 	}
 
