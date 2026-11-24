@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 )
 
 // FileRecord tracks the known state of a synchronized file.
@@ -62,6 +63,21 @@ func (sm *StateManager) load() error {
 	return nil
 }
 
+// renameWithRetry renames src to dst with brief exponential backoff to tolerate
+// transient Windows file locks (Defender, Search Indexer, Explorer).
+func renameWithRetry(src, dst string) error {
+	var err error
+	for i := 0; i < 6; i++ {
+		err = os.Rename(src, dst)
+		if err == nil {
+			return nil
+		}
+		_ = os.Chmod(dst, 0666)
+		time.Sleep(time.Duration(20*(1<<i)) * time.Millisecond)
+	}
+	return err
+}
+
 // Save writes current state atomically to disk. Must be called with lock held or via public methods.
 func (sm *StateManager) saveLocked() error {
 	dir := filepath.Dir(sm.filePath)
@@ -83,8 +99,8 @@ func (sm *StateManager) saveLocked() error {
 		return err
 	}
 
-	// Atomic replace
-	return os.Rename(tmpPath, sm.filePath)
+	// Atomic replace with brief retry for transient Windows file locks
+	return renameWithRetry(tmpPath, sm.filePath)
 }
 
 // Get returns the recorded state for a relative file path.
