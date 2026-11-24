@@ -530,25 +530,40 @@ func ConfigureSumatraDefaults(exePath string) {
 	if exePath == "" {
 		exePath = `C:\BridgeApp\SumatraPDF.exe`
 	}
-	dir := filepath.Dir(exePath)
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		return
-	}
-	settingsPath := filepath.Join(dir, "SumatraPDF-settings.txt")
-	content := []byte("Theme = Light\nPrinterDefaults [\n\tPrintScale = noscale\n]\n")
 
-	if existing, err := os.ReadFile(settingsPath); err == nil {
-		s := string(existing)
-		if strings.Contains(s, "PrintScale = shrink") || strings.Contains(s, "PrintScale = fit") {
-			s = strings.ReplaceAll(s, "PrintScale = shrink", "PrintScale = noscale")
-			s = strings.ReplaceAll(s, "PrintScale = fit", "PrintScale = noscale")
-			_ = os.WriteFile(settingsPath, []byte(s), 0644)
-			return
-		} else if strings.Contains(s, "PrintScale = noscale") {
+	applySettings := func(settingsPath string) {
+		dir := filepath.Dir(settingsPath)
+		if err := os.MkdirAll(dir, 0755); err != nil {
 			return
 		}
+		content := []byte("Theme = Light\nPrinterDefaults [\n\tPrintScale = noscale\n]\n")
+		if existing, err := os.ReadFile(settingsPath); err == nil {
+			s := string(existing)
+			if strings.Contains(s, "PrintScale = shrink") || strings.Contains(s, "PrintScale = fit") {
+				s = strings.ReplaceAll(s, "PrintScale = shrink", "PrintScale = noscale")
+				s = strings.ReplaceAll(s, "PrintScale = fit", "PrintScale = noscale")
+				_ = os.WriteFile(settingsPath, []byte(s), 0644)
+				return
+			} else if strings.Contains(s, "PrintScale = noscale") {
+				return
+			}
+		}
+		_ = os.WriteFile(settingsPath, content, 0644)
 	}
-	_ = os.WriteFile(settingsPath, content, 0644)
+
+	// 1. Target directory next to executable
+	applySettings(filepath.Join(filepath.Dir(exePath), "SumatraPDF-settings.txt"))
+
+	// 2. Global application directory
+	applySettings(`C:\BridgeApp\SumatraPDF-settings.txt`)
+
+	// 3. User profile AppData locations (if present)
+	if appData := os.Getenv("APPDATA"); appData != "" {
+		applySettings(filepath.Join(appData, "SumatraPDF", "SumatraPDF-settings.txt"))
+	}
+	if localAppData := os.Getenv("LOCALAPPDATA"); localAppData != "" {
+		applySettings(filepath.Join(localAppData, "SumatraPDF", "SumatraPDF-settings.txt"))
+	}
 }
 
 // CreateSumatraShortcut creates a shortcut to SumatraPDF in C:\BridgeApp\SumatraPDF.lnk and across desktop directories.
@@ -695,7 +710,9 @@ $ps = New-Object System.Printing.LocalPrintServer
 $pq = $ps.GetPrintQueue('%s')
 $writer = [System.Printing.PrintQueue]::CreateXpsDocumentWriter($pq)
 $xpsDoc = New-Object System.Windows.Xps.Packaging.XpsDocument('%s', [System.IO.FileAccess]::Read)
-$ticket = $pq.UserPrintTicket.Clone()
+$ticket = $pq.UserPrintTicket
+if (-not $ticket) { $ticket = $pq.DefaultPrintTicket }
+if ($ticket) { $ticket = $ticket.Clone() } else { $ticket = New-Object System.Printing.PrintTicket }
 if ('%s' -eq 'landscape') {
     $ticket.PageOrientation = [System.Printing.PageOrientation]::Landscape
 } else {

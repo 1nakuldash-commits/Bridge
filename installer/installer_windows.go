@@ -373,6 +373,10 @@ try {
 
 if (-not (Get-PrinterPort -Name $portName -ErrorAction SilentlyContinue)) {
     Add-PrinterPort -Name $portName -PrinterHostAddress '127.0.0.1' -PortNumber $portNumber -SNMP 0 -ErrorAction SilentlyContinue
+} else {
+    try {
+        Set-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\Print\Monitors\Standard TCP/IP Port\Ports\$portName" -Name "SNMP Enabled" -Value 0 -Type DWord -ErrorAction SilentlyContinue
+    } catch {}
 }
 
 $preferredDrivers = @('Microsoft XPS Document Writer v4', 'Microsoft XPS Document Writer', 'OpenXPS Document Writer')
@@ -437,13 +441,14 @@ if (-not (Get-Printer -Name $printerName -ErrorAction SilentlyContinue)) {
     Set-Printer -Name $printerName -PortName $portName -DriverName $driver -ErrorAction SilentlyContinue
 }
 
-# Ensure WorkOffline is always disabled so print jobs stream immediately
+# Ensure WorkOffline is always disabled and clear stuck error print jobs
 try {
     $pObj = Get-CimInstance Win32_Printer -Filter "Name = '$($printerName.Replace("'", "''"))'" -ErrorAction SilentlyContinue
     if ($pObj -and $pObj.WorkOffline) {
         $pObj.WorkOffline = $false
         Set-CimInstance -InputObject $pObj -ErrorAction SilentlyContinue
     }
+    Get-PrintJob -PrinterName $printerName -ErrorAction SilentlyContinue | Where-Object { $_.JobStatus -match 'Error|Blocked|Offline|Paused' } | Remove-PrintJob -ErrorAction SilentlyContinue
 } catch {}
 
 # Configure virtual printer default paper size to match regional standard (A4 or Letter)

@@ -482,6 +482,10 @@ func RunDashboard() error {
 		}
 
 		peers := cfg.GetPeers()
+		if len(health.Peers) > len(peers) {
+			peers = health.Peers
+		}
+
 		// Build lookup for live peer online status reported by running server
 		peerOnlineMap := make(map[string]bool)
 		for _, hp := range health.Peers {
@@ -495,6 +499,9 @@ func RunDashboard() error {
 				if hp.URL != "" {
 					peerOnlineMap[strings.TrimSpace(hp.URL)] = true
 				}
+				if hp.SpoolPort > 0 {
+					peerOnlineMap[fmt.Sprintf("port:%d", hp.SpoolPort)] = true
+				}
 			}
 		}
 
@@ -504,7 +511,17 @@ func RunDashboard() error {
 			isOnline := p.Online ||
 				peerOnlineMap[strings.ToLower(strings.TrimSpace(p.Name))] ||
 				peerOnlineMap[strings.TrimSpace(p.IP)] ||
-				(p.URL != "" && peerOnlineMap[strings.TrimSpace(p.URL)])
+				(p.URL != "" && peerOnlineMap[strings.TrimSpace(p.URL)]) ||
+				(p.SpoolPort > 0 && peerOnlineMap[fmt.Sprintf("port:%d", p.SpoolPort)])
+
+			// Fallback: If health.OnlineCount covers all peers, or single peer with health.OnlineCount >= 1 / PeerReachable
+			if !isOnline && health.OnlineCount >= len(peers) && len(peers) > 0 {
+				isOnline = true
+			}
+			if !isOnline && len(peers) == 1 && (health.OnlineCount >= 1 || health.PeerReachable) {
+				isOnline = true
+			}
+
 			if isOnline {
 				p.Online = true
 				onlineCount++

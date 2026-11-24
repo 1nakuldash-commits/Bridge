@@ -65,7 +65,7 @@ func main() {
 
 	// 1. Version Mode
 	if *versionFlag {
-		fmt.Println("Bridge v2.2.0 (High-Fidelity 1:1 Scale & Multi-Device Sync Edition)")
+		fmt.Println("Bridge v2.3.0 (Zero-Defect 1:1 Scale & Instant Mesh Sync Edition)")
 		return
 	}
 
@@ -461,7 +461,7 @@ func runUnifiedService(configPath string, headless bool) {
 				} else {
 					if trayMgr != nil {
 						trayMgr.ShowBalloon("Print Error", fmt.Sprintf("Failed to print on %s: %v", primaryName, err))
-						trayMgr.UpdateNetworkStatus(cfg.GetNodeName(), cfg.GetPeers())
+						trayMgr.RestoreNetworkStatus()
 					}
 				}
 			},
@@ -483,7 +483,7 @@ func runUnifiedService(configPath string, headless bool) {
 				} else {
 					if trayMgr != nil {
 						trayMgr.ShowBalloon("Print Error", fmt.Sprintf("Failed to print on %s: %v", p.Name, err))
-						trayMgr.UpdateNetworkStatus(cfg.GetNodeName(), cfg.GetPeers())
+						trayMgr.RestoreNetworkStatus()
 					}
 				}
 			},

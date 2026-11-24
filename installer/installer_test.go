@@ -1,9 +1,12 @@
 package installer
 
 import (
+	"encoding/json"
 	"testing"
+	"time"
 
 	"bridge/config"
+	"bridge/server"
 )
 
 func TestSanitizeFileName(t *testing.T) {
@@ -54,5 +57,64 @@ func TestPruneObsoleteVirtualPrintersEmpty(t *testing.T) {
 	err := PruneObsoleteVirtualPrinters(peers)
 	if err != nil {
 		t.Logf("PruneObsoleteVirtualPrinters returned note (expected if not elevated): %v", err)
+	}
+}
+
+func TestPeerDeviceOnlineSerialization(t *testing.T) {
+	dev := config.PeerDevice{
+		Name:      "U1(D)",
+		IP:        "100.92.92.87",
+		URL:       "http://100.92.92.87:8765",
+		SpoolPort: 9101,
+		Online:    true,
+		LastSeen:  time.Now(),
+	}
+
+	data, err := json.Marshal(dev)
+	if err != nil {
+		t.Fatalf("Failed to marshal PeerDevice: %v", err)
+	}
+
+	var decoded config.PeerDevice
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		t.Fatalf("Failed to unmarshal PeerDevice: %v", err)
+	}
+
+	if !decoded.Online {
+		t.Errorf("Expected decoded.Online to be true, got false. JSON payload: %s", string(data))
+	}
+}
+
+func TestHealthResponsePeerOnlineSerialization(t *testing.T) {
+	resp := server.HealthResponse{
+		Status:      "healthy",
+		NodeName:    "ST_ND",
+		OnlineCount: 1,
+		Peers: []config.PeerDevice{
+			{
+				Name:      "U1(D)",
+				IP:        "100.92.92.87",
+				URL:       "http://100.92.92.87:8765",
+				SpoolPort: 9101,
+				Online:    true,
+			},
+		},
+	}
+
+	data, err := json.Marshal(resp)
+	if err != nil {
+		t.Fatalf("Failed to marshal HealthResponse: %v", err)
+	}
+
+	var decoded server.HealthResponse
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		t.Fatalf("Failed to unmarshal HealthResponse: %v", err)
+	}
+
+	if len(decoded.Peers) != 1 {
+		t.Fatalf("Expected 1 peer, got %d", len(decoded.Peers))
+	}
+	if !decoded.Peers[0].Online {
+		t.Errorf("Expected decoded.Peers[0].Online to be true, got false. Raw JSON: %s", string(data))
 	}
 }

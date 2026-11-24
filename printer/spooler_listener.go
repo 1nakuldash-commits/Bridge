@@ -121,6 +121,10 @@ func (sl *SpoolerListener) handleConnection(conn net.Conn) {
 	}
 	defer os.Remove(tmpFile)
 
+	// Acknowledge and close local spooler TCP connection immediately so Windows Spooler
+	// marks the spool job completed without stalling or declaring the printer offline.
+	_ = conn.Close()
+
 	if sl.OnJobStarted != nil {
 		sl.OnJobStarted(jobName)
 	}

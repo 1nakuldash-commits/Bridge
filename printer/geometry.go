@@ -46,11 +46,11 @@ type DocumentGeometry struct {
 var (
 	mediaBoxRegex = regexp.MustCompile(`/(?:MediaBox|CropBox)\s*\[\s*([-\d\.]+)\s+([-\d\.]+)\s+([-\d\.]+)\s+([-\d\.]+)\s*\]`)
 	rotateRegex   = regexp.MustCompile(`/Rotate\s+(\d+)`)
-	pageTypeRegex = regexp.MustCompile(`/Type\s*/Page\b`)
-	pageCountRegex = regexp.MustCompile(`(?i)/Type\s*/Pages\b[^>]*\b/Count\s+(\d+)`)
-	pageCountAltRegex = regexp.MustCompile(`(?i)/Count\s+(\d+)\b[^>]*\b/Type\s*/Pages\b`)
-	fpageDimRegex = regexp.MustCompile(`(?i)<FixedPage[^>]*\bWidth\s*=\s*["']([\d\.]+)["'][^>]*\bHeight\s*=\s*["']([\d\.]+)["']`)
-	fpageAltRegex = regexp.MustCompile(`(?i)<FixedPage[^>]*\bHeight\s*=\s*["']([\d\.]+)["'][^>]*\bWidth\s*=\s*["']([\d\.]+)["']`)
+	pageTypeRegex     = regexp.MustCompile(`/Type\s*/Page\b`)
+	pageCountRegex    = regexp.MustCompile(`(?i)/Type\s*/Pages[\s\S]{0,500}?/Count\s+(\d+)`)
+	pageCountAltRegex = regexp.MustCompile(`(?i)/Count\s+(\d+)[\s\S]{0,500}?/Type\s*/Pages`)
+	fpageDimRegex     = regexp.MustCompile(`(?i)<FixedPage[^>]*\bWidth\s*=\s*["']([\d\.]+)["'][^>]*\bHeight\s*=\s*["']([\d\.]+)["']`)
+	fpageAltRegex     = regexp.MustCompile(`(?i)<FixedPage[^>]*\bHeight\s*=\s*["']([\d\.]+)["'][^>]*\bWidth\s*=\s*["']([\d\.]+)["']`)
 )
 
 // DetectDocumentGeometry inspects a PDF or XPS file to determine its native dimensions,
@@ -104,15 +104,34 @@ func DetectDocumentGeometry(filePath string) DocumentGeometry {
 }
 
 func detectPDFGeometry(f *os.File, geom *DocumentGeometry) {
-	_, _ = f.Seek(0, io.SeekStart)
-	buf := make([]byte, 128*1024)
-	n, err := f.Read(buf)
-	if err != nil && err != io.EOF {
+	fi, err := f.Stat()
+	if err != nil {
 		return
 	}
-	sample := buf[:n]
+	_, _ = f.Seek(0, io.SeekStart)
 
-	// Look for MediaBox or CropBox in initial chunk
+	// Read full file up to 32MB to ensure multi-page counts and dictionaries are never truncated
+	readLimit := int64(32 * 1024 * 1024)
+	if fi.Size() < readLimit {
+		readLimit = fi.Size()
+	}
+	sample, err := io.ReadAll(io.LimitReader(f, readLimit))
+	if err != nil && len(sample) == 0 {
+		return
+	}
+
+	// For large PDFs, append trailing 256KB to inspect PDF trailer/catalog
+	if fi.Size() > readLimit {
+		tailSize := int64(256 * 1024)
+		if fi.Size() > tailSize {
+			tailBuf := make([]byte, tailSize)
+			if _, err := f.ReadAt(tailBuf, fi.Size()-tailSize); err == nil {
+				sample = append(sample, tailBuf...)
+			}
+		}
+	}
+
+	// Look for MediaBox or CropBox in document
 	match := mediaBoxRegex.FindSubmatch(sample)
 	if len(match) == 5 {
 		x0, _ := strconv.ParseFloat(string(match[1]), 64)
@@ -147,7 +166,7 @@ func detectPDFGeometry(f *os.File, geom *DocumentGeometry) {
 		}
 	}
 
-	// Fallback: count individual /Type /Page objects in buffer
+	// Fallback: count individual /Type /Page objects across the entire document
 	count := len(pageTypeRegex.FindAll(sample, -1))
 	if count > 0 {
 		geom.PageCount = count

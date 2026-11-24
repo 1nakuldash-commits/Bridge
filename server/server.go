@@ -199,6 +199,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 						onlineCount++
 						anyReachable = true
 						mu.Unlock()
+						s.cfg.SetPeerOnlineStatus(dev.URL, true)
 					}
 				}
 			}(p)

@@ -19,8 +19,8 @@ type PeerDevice struct {
 	IP        string    `json:"ip"`                   // Tailscale IPv4 address (e.g. "100.64.1.2")
 	URL       string    `json:"url"`                  // HTTP endpoint (e.g. "http://100.64.1.2:8765")
 	SpoolPort int       `json:"spool_port,omitempty"` // Local TCP port for virtual printer (e.g. 9101, 9102)
-	Online    bool      `json:"-"`                    // Dynamic connectivity state
-	LastSeen  time.Time `json:"-"`                    // Timestamp of last successful contact
+	Online    bool      `json:"online,omitempty"`     // Dynamic connectivity state
+	LastSeen  time.Time `json:"last_seen,omitempty"`  // Timestamp of last successful contact
 }
 
 // Config represents the multi-device application configuration.

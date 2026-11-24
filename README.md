@@ -216,6 +216,19 @@ Designed for low-end Windows 10/11 machines with **idle RAM < 25 MB** and **idle
 
 ## 🚀 Release History
 
+### v2.3.0 — Zero-Defect 1:1 Scale, Spool Decoupling & Terminal Status Sync
+- **Restored Peer Connectivity in Dashboard:** Fixed `PeerDevice.Online` JSON serialization so live `/api/health` probes reflect reachable peers accurately as `🟢 Online` in both terminal and system tray.
+- **Immediate Port Spool Acknowledgment:** Decoupled Windows RAW TCP spool handshake from remote WAN dispatch in `SpoolerListener`, preventing Windows Print Spooler timeouts and eliminating false "Printer is offline" cross icon toast notifications.
+- **Full-Document Page Count Resolution:** Expanded PDF page geometry inspection to scan full document payloads up to 32 MB, ensuring multi-page PDFs are never prematurely truncated to a single page range.
+- **Global SumatraPDF Settings Hardening:** Extended `ConfigureSumatraDefaults` to sanitize `%APPDATA%\SumatraPDF\SumatraPDF-settings.txt` and `%LOCALAPPDATA%` across user profiles to enforce `PrintScale = noscale`.
+- **Safe .NET XPS Ticket Fallback:** Fortified `printNativeXPS` with null-safe `PrintTicket` resolution for remote printer queues without pre-existing user tickets.
+- **Elevated Clean Upgrade & Uninstallation:** Added complete purging of stuck print jobs, obsolete virtual printers, and orphaned registry artifacts during setup and uninstall.
+
+### v2.2.0 — High-Fidelity 1:1 Scale & Multi-Device Sync
+- **True 1:1 Scale Preservation (`noscale`):** Eliminated roller-margin down-scaling and centering distortion by replacing `shrink` with `noscale` and enforcing exact document page bounds.
+- **Obsolete Printer Pruning:** Automated eradication of legacy virtual printers (`Print on Desktop 1`, `Print on Desktop 2`) and stale TCP ports.
+- **Tray Status Dot State Machine:** Polished notification balloon state handling to avoid falsely displaying disconnected cross icons during network latency.
+
 ### v2.1.0 — High-Fidelity Remote Printing Engine
 - **Dynamic Document Geometry Detection:** Implemented `DetectDocumentGeometry` to inspect incoming PDF and XPS documents at byte level, extracting exact point dimensions, aspect ratio, page count, and orientation.
 - **100% 1:1 Scale & Orientation Matching:** Replaced static `-print-settings fit` with dynamic `paper=<PaperName>,<orientation>,shrink` to strictly maintain 1:1 print fidelity without shrinking or stretching.

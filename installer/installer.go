@@ -482,6 +482,11 @@ func UpgradeInstallation(sourceExe string) error {
 		if sumatra := FindSumatraPDF(); sumatra != "" {
 			cfg.SumatraPath = sumatra
 			printer.ConfigureSumatraDefaults(sumatra)
+		} else {
+			if sumatraPath, err := printer.EnsureSumatraPDF(); err == nil && sumatraPath != "" {
+				cfg.SumatraPath = sumatraPath
+				printer.ConfigureSumatraDefaults(sumatraPath)
+			}
 		}
 		_ = config.SaveConfig(TargetConfig, cfg)
 	}
