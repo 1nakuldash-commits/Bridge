@@ -316,30 +316,38 @@ func getDesktopDirsForShortcuts() []string {
 	return dirs
 }
 
-// CreateShortcut creates a Windows .lnk shortcut using VBScript WScript.Shell.
+// CreateShortcut creates a Windows .lnk shortcut using PowerShell COM WScript.Shell.
 func CreateShortcut(targetPath, lnkPath, description, arguments string) error {
 	_ = os.MkdirAll(filepath.Dir(lnkPath), 0755)
 	if fi, err := os.Stat(lnkPath); err == nil && fi.Size() > 0 {
 		return nil
 	}
 
-	vbsContent := fmt.Sprintf(`Set oWS = WScript.CreateObject("WScript.Shell")
-Set oLink = oWS.CreateShortcut("%s")
-oLink.TargetPath = "%s"
-oLink.Description = "%s"
-oLink.Arguments = "%s"
-oLink.Save
-`, strings.ReplaceAll(lnkPath, `"`, `""`), strings.ReplaceAll(targetPath, `"`, `""`), strings.ReplaceAll(description, `"`, `""`), strings.ReplaceAll(arguments, `"`, `""`))
+	// First try PowerShell WScript.Shell COM object (guaranteed on Windows 10 & 11)
+	psScript := fmt.Sprintf(`$ws = New-Object -ComObject WScript.Shell; $s = $ws.CreateShortcut('%s'); $s.TargetPath = '%s'; $s.Description = '%s'; $s.Arguments = '%s'; $s.Save()`,
+		strings.ReplaceAll(lnkPath, `'`, `''`),
+		strings.ReplaceAll(targetPath, `'`, `''`),
+		strings.ReplaceAll(description, `'`, `''`),
+		strings.ReplaceAll(arguments, `'`, `''`))
 
-	tmpVbs := filepath.Join(os.TempDir(), fmt.Sprintf("mksumatra_%d.vbs", time.Now().UnixNano()))
-	if err := os.WriteFile(tmpVbs, []byte(vbsContent), 0644); err != nil {
-		return err
-	}
-	defer os.Remove(tmpVbs)
-
-	cmd := exec.Command("wscript", "//B", "//nologo", tmpVbs)
+	cmd := exec.Command("powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", psScript)
 	hideCmd(cmd)
-	return cmd.Run()
+	out, err := cmd.CombinedOutput()
+	_ = out
+
+	// Progressive wait for Windows Shell to flush shortcut to disk
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if fi, err := os.Stat(lnkPath); err == nil && fi.Size() > 0 {
+			return nil
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	if fi, err := os.Stat(lnkPath); err == nil && fi.Size() > 0 {
+		return nil
+	}
+	return fmt.Errorf("failed to create shortcut at %s: err=%v out=%s", lnkPath, err, string(out))
 }
 
 func queryPrintersFromRegistry() ([]WindowsPrinter, error) {

@@ -202,10 +202,24 @@ Designed for low-end Windows 10/11 machines with **idle RAM < 25 MB** and **idle
 
 | Component | Specification |
 | :--- | :--- |
-| **Binary** | Single standalone Windows executable (`bridge.exe`, ~8.1 MB) |
+| **Binary** | Single standalone Windows executable (`bridge.exe`, ~8.7 MB) |
 | **Runtime Dependencies** | None (pure Go, native Win32 APIs, GDI, Winsock, Winspool) |
 | **Idle Resource Usage** | < 25 MB RAM, 0% CPU |
 | **Spooler Engine** | RAW TCP Port Monitor (`127.0.0.1:9101-9120`) |
-| **Silent PDF Engine** | Embedded SumatraPDF integration with 45s watchdog timer |
+| **Silent PDF Engine** | Embedded SumatraPDF integration with 45s watchdog timer & dynamic paper sizing |
+| **Document Geometry** | High-precision PDF & XPS geometry parser (MediaBox, CropBox, FixedPage) |
+| **Remote Print Fidelity** | 100% 1:1 scale, paper matching (A4, Letter, Legal), native orientation & margin lock |
 | **Network Security** | Tailscale WireGuard mesh + `X-Bridge-Token` header verification |
 | **Default Printer Safety** | Protected via `LegacyDefaultPrinterMode = 1` registry lock |
+
+---
+
+## 🚀 Release History
+
+### v2.1.0 — High-Fidelity Remote Printing Engine
+- **Dynamic Document Geometry Detection:** Implemented `DetectDocumentGeometry` to inspect incoming PDF and XPS documents at byte level, extracting exact point dimensions, aspect ratio, page count, and orientation.
+- **100% 1:1 Scale & Orientation Matching:** Replaced static `-print-settings fit` with dynamic `paper=<PaperName>,<orientation>,shrink` to strictly maintain 1:1 print fidelity without shrinking or stretching.
+- **Fixed Multi-Page Spills:** Eliminated paper-dimension mismatch (e.g. A4 spilling onto 3-4 pages when printed on Letter default drivers).
+- **Modern Windows 11 Driver Compatibility:** Added `Microsoft Print To PDF` virtual driver fallback on Windows 11 builds where XPS Document Writer is deprecated.
+- **Enhanced .NET PrintTicket Fallback:** For raw XPS rendering fallbacks, dynamically injects `PrintTicket` setting `PageMediaSize` and `PageOrientation` to prevent 16% GDI coordinate downscaling on PCL/GDI printers.
+- **Propagation of Print Headers:** Remote print dispatch attaches `X-Bridge-Paper-Size`, `X-Bridge-Orientation`, and `X-Bridge-Page-Count` HTTP headers for verified network delivery.

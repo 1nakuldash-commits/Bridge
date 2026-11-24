@@ -3585,13 +3585,138 @@ func TestPrintJobRenderingArgumentsAndMarginFitting(t *testing.T) {
 	if !strings.Contains(logStr, "-silent") {
 		t.Errorf("Expected '-silent' in args, got: %s", logStr)
 	}
-	// Must contain -print-settings fit for native margin accuracy
-	if !strings.Contains(logStr, "-print-settings fit") {
-		t.Errorf("Expected '-print-settings fit' in args for native scaling, got: %s", logStr)
+	// Must contain dynamic -print-settings for native margin & 100% scale accuracy
+	if !strings.Contains(logStr, "-print-settings") || (!strings.Contains(logStr, "shrink") && !strings.Contains(logStr, "fit") && !strings.Contains(logStr, "paper=")) {
+		t.Errorf("Expected '-print-settings' with dynamic paper/scale in args, got: %s", logStr)
 	}
 	// Must contain -exit-when-done to guarantee prompt process termination
 	if !strings.Contains(logStr, "-exit-when-done") {
 		t.Errorf("Expected '-exit-when-done' in args, got: %s", logStr)
+	}
+}
+
+func TestHighFidelity100PercentScaleAndPageAccuracy(t *testing.T) {
+	tempRoot := t.TempDir()
+	mockExe, logFile := buildMockArgsPrinter(t, tempRoot)
+
+	queueDir := filepath.Join(tempRoot, "PrintQueue")
+	failedDir := filepath.Join(tempRoot, "PrintFailed")
+
+	ps := printer.NewPrintService(mockExe, 5, queueDir, failedDir)
+	ps.SetTargetPrinter("HP_Smart_Tank_580")
+	if err := ps.Start(); err != nil {
+		t.Fatalf("Failed to start PrintService: %v", err)
+	}
+	defer ps.Stop()
+
+	// 1. Test A4 PDF (300 DPI / 100% scale format)
+	pdfJobPath := filepath.Join(queueDir, "blueprint_a4_300dpi.pdf")
+	a4Pdf := `%PDF-1.4
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [3 0 R] /Count 1 >>
+endobj
+3 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595.28 841.89] >>
+endobj
+trailer
+<< /Size 4 /Root 1 0 R >>
+%%EOF`
+	if err := os.WriteFile(pdfJobPath, []byte(a4Pdf), 0644); err != nil {
+		t.Fatalf("Failed to write test A4 PDF: %v", err)
+	}
+
+	jobA4 := printer.PrintJob{
+		ID:         "job_a4_accuracy",
+		FileName:   "blueprint_a4_300dpi.pdf",
+		FilePath:   pdfJobPath,
+		EnqueuedAt: time.Now(),
+	}
+
+	completedA4 := make(chan bool, 1)
+	ps.OnJobCompleted = func(j printer.PrintJob) {
+		if j.ID == "job_a4_accuracy" {
+			completedA4 <- true
+		}
+	}
+
+	if err := ps.Enqueue(jobA4); err != nil {
+		t.Fatalf("Failed to enqueue job: %v", err)
+	}
+
+	select {
+	case <-completedA4:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("Timed out waiting for A4 print job")
+	}
+
+	logData, _ := os.ReadFile(logFile)
+	logStr := string(logData)
+
+	if !strings.Contains(logStr, "paper=A4") {
+		t.Errorf("Expected 'paper=A4' in SumatraPDF args, got: %s", logStr)
+	}
+	if !strings.Contains(logStr, "portrait") {
+		t.Errorf("Expected 'portrait' in SumatraPDF args, got: %s", logStr)
+	}
+	if !strings.Contains(logStr, "shrink") {
+		t.Errorf("Expected 'shrink' in SumatraPDF args to preserve 100%% scale, got: %s", logStr)
+	}
+
+	// 2. Test Landscape Letter Document
+	_ = os.Remove(logFile)
+	letterJobPath := filepath.Join(queueDir, "cad_drawing_landscape.pdf")
+	letterPdf := `%PDF-1.4
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [3 0 R] /Count 1 >>
+endobj
+3 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 792.0 612.0] >>
+endobj
+trailer
+<< /Size 4 /Root 1 0 R >>
+%%EOF`
+	if err := os.WriteFile(letterJobPath, []byte(letterPdf), 0644); err != nil {
+		t.Fatalf("Failed to write test Letter PDF: %v", err)
+	}
+
+	jobLetter := printer.PrintJob{
+		ID:         "job_letter_landscape",
+		FileName:   "cad_drawing_landscape.pdf",
+		FilePath:   letterJobPath,
+		EnqueuedAt: time.Now(),
+	}
+
+	completedLetter := make(chan bool, 1)
+	ps.OnJobCompleted = func(j printer.PrintJob) {
+		if j.ID == "job_letter_landscape" {
+			completedLetter <- true
+		}
+	}
+
+	if err := ps.Enqueue(jobLetter); err != nil {
+		t.Fatalf("Failed to enqueue job: %v", err)
+	}
+
+	select {
+	case <-completedLetter:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("Timed out waiting for Letter print job")
+	}
+
+	logData2, _ := os.ReadFile(logFile)
+	logStr2 := string(logData2)
+
+	if !strings.Contains(logStr2, "paper=Letter") {
+		t.Errorf("Expected 'paper=Letter' in SumatraPDF args, got: %s", logStr2)
+	}
+	if !strings.Contains(logStr2, "landscape") {
+		t.Errorf("Expected 'landscape' in SumatraPDF args, got: %s", logStr2)
 	}
 }
 
@@ -3656,8 +3781,19 @@ func TestSumatraShortcutCreation(t *testing.T) {
 	}
 
 	// Write valid >1MB dummy exe
-	dummyBytes := make([]byte, 1024*1024+50)
-	copy(dummyBytes, "MZ")
+	var dummyBytes []byte
+	if sumatra := printer.FindSumatraPDF(); sumatra != "" {
+		dummyBytes, _ = os.ReadFile(sumatra)
+	}
+	if len(dummyBytes) == 0 {
+		if exe, err := os.Executable(); err == nil && exe != "" {
+			dummyBytes, _ = os.ReadFile(exe)
+		}
+	}
+	if len(dummyBytes) == 0 {
+		dummyBytes = make([]byte, 1024*1024+50)
+		copy(dummyBytes, "MZ")
+	}
 	if err := os.WriteFile(targetExe, dummyBytes, 0755); err != nil {
 		t.Fatalf("Failed to write target exe: %v", err)
 	}

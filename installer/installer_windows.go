@@ -429,7 +429,12 @@ if (-not $driver) {
     }
 }
 if (-not $driver) {
-    throw "Microsoft XPS Document Writer driver is required for native remote printing but is not installed. Enable 'Printing-XPSServices-Features' in Windows Features."
+    if (Get-PrinterDriver -Name 'Microsoft Print To PDF' -ErrorAction SilentlyContinue) {
+        $driver = 'Microsoft Print To PDF'
+    }
+}
+if (-not $driver) {
+    throw "A compatible virtual printer driver (Microsoft XPS Document Writer or Microsoft Print To PDF) is required for native remote printing but is not installed."
 }
 
 if (-not (Get-Printer -Name $printerName -ErrorAction SilentlyContinue)) {
@@ -437,6 +442,13 @@ if (-not (Get-Printer -Name $printerName -ErrorAction SilentlyContinue)) {
 } else {
     Set-Printer -Name $printerName -PortName $portName -ErrorAction SilentlyContinue
 }
+
+# Configure virtual printer default paper size to match regional standard (A4 or Letter)
+try {
+    $geo = (Get-Culture).Name
+    $defPaper = if ($geo -match 'en-US|en-CA') { 'Letter' } else { 'A4' }
+    Set-PrintConfiguration -PrinterName $printerName -PaperSize $defPaper -ErrorAction SilentlyContinue
+} catch {}
 
 # 3. Default Printer Selection:
 # If current default is a REAL physical printer, keep it.

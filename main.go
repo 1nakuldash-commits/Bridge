@@ -51,6 +51,7 @@ func main() {
 	setupFlag := flag.Bool("setup", false, "Run interactive setup wizard")
 	uninstallFlag := flag.Bool("uninstall", false, "Uninstall Bridge background service")
 	statusFlag := flag.Bool("status", false, "Check status of Bridge background service")
+	versionFlag := flag.Bool("version", false, "Print application version")
 	sendPrintFlag := flag.Bool("send-print", false, "Send file to remote printer (used by Windows Explorer Send-To)")
 
 	upgradeFlag := flag.String("upgrade", "", "Upgrade Bridge installation using specified binary")
@@ -62,7 +63,13 @@ func main() {
 	configPath := flag.String("config", "", "Path to config.json")
 	flag.Parse()
 
-	// 1. Right-Click SendTo Handler ("Print on <PeerName>")
+	// 1. Version Mode
+	if *versionFlag {
+		fmt.Println("Bridge v2.1.0 (High-Fidelity Remote Printing Edition)")
+		return
+	}
+
+	// 2. Right-Click SendTo Handler ("Print on <PeerName>")
 	if *sendPrintFlag || (len(flag.Args()) > 0 && !*serviceFlag && !*autostartFlag && !*trayFlag && !*installFlag && !*setupFlag && !*uninstallFlag && !*statusFlag && *upgradeFlag == "") {
 		targetFile := ""
 		if len(flag.Args()) > 0 {

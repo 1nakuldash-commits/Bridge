@@ -587,29 +587,53 @@ func (ps *PrintService) processJob(job PrintJob) {
 
 	var out []byte
 
+	// 1. Detect exact document geometry (format, dimensions, paper size, orientation, page count)
+	geom := DetectDocumentGeometry(job.FilePath)
+	log.Printf("[Printer] Job %s geometry: format=%s, size=%.1fx%.1f pt, paper=%s, orientation=%s, pages=%d",
+		job.ID, geom.Format, geom.WidthPt, geom.HeightPt, geom.PaperName, geom.Orientation, geom.PageCount)
+
+	printSettings := BuildPrintSettings(geom)
+
 	// Always use SumatraPDF for silent, driver-rendered printing (supports PDF, XPS, OXPS, images, etc.)
 	// This renders each page through the printer's native Windows driver, preventing raw bytes / random page gibberish.
 	if isUsableSumatra(sumatraBin) {
-		log.Printf("[Printer] Rendering and printing via SumatraPDF silently to '%s' (fit-to-page)...", targetPrinter)
-		// -print-settings "fit" guarantees 99.99% native accuracy, scaling pages precisely to printable margins
-		// -exit-when-done guarantees SumatraPDF immediately exits and releases file handles
-		cmd := exec.CommandContext(ctx, sumatraBin, "-print-to", targetPrinter, "-silent", "-print-settings", "fit", "-exit-when-done", job.FilePath)
+		log.Printf("[Printer] Rendering and printing via SumatraPDF silently to '%s' (settings: %s)...", targetPrinter, printSettings)
+		// Dynamic print settings preserve 100% 1:1 scale, exact paper feeding (A4/Letter), and orientation
+		cmd := exec.CommandContext(ctx, sumatraBin, "-print-to", targetPrinter, "-silent", "-print-settings", printSettings, "-exit-when-done", job.FilePath)
 		hideCmd(cmd)
 		out, err = cmd.CombinedOutput()
 	} else if strings.EqualFold(filepath.Ext(job.FilePath), ".xps") {
 		// Native Windows .NET XPS driver rendering fallback:
-		// Uses System.Printing.PrintQueue::CreateXpsDocumentWriter to pass FixedDocumentSequence
-		// through the target printer's native driver, generating proper raster/PCL rather than raw binary bytes.
-		log.Printf("[Printer] SumatraPDF not found, executing native Windows .NET XPS rendering to '%s'...", targetPrinter)
+		// Uses System.Printing.PrintQueue::CreateXpsDocumentWriter with PrintTicket configured
+		// for exact PageMediaSize and PageOrientation to guarantee 1:1 scale without 16% shrinking bug.
+		log.Printf("[Printer] SumatraPDF not found, executing native Windows .NET XPS rendering to '%s' (paper: %s, orientation: %s)...", targetPrinter, geom.PaperName, geom.Orientation)
 		psScript := fmt.Sprintf(`
 Add-Type -AssemblyName ReachFramework, System.Printing
 $ps = New-Object System.Printing.LocalPrintServer
 $pq = $ps.GetPrintQueue('%s')
 $writer = [System.Printing.PrintQueue]::CreateXpsDocumentWriter($pq)
 $xpsDoc = New-Object System.Windows.Xps.Packaging.XpsDocument('%s', [System.IO.FileAccess]::Read)
-$writer.Write($xpsDoc.GetFixedDocumentSequence())
+$ticket = $pq.UserPrintTicket.Clone()
+if ('%s' -eq 'landscape') {
+    $ticket.PageOrientation = [System.Printing.PageOrientation]::Landscape
+} else {
+    $ticket.PageOrientation = [System.Printing.PageOrientation]::Portrait
+}
+if ('%s' -eq 'A4') {
+    $ticket.PageMediaSize = New-Object System.Printing.PageMediaSize([System.Printing.PageMediaSizeName]::ISOA4)
+} elseif ('%s' -eq 'Letter') {
+    $ticket.PageMediaSize = New-Object System.Printing.PageMediaSize([System.Printing.PageMediaSizeName]::NorthAmericaLetter)
+} elseif ('%s' -eq 'Legal') {
+    $ticket.PageMediaSize = New-Object System.Printing.PageMediaSize([System.Printing.PageMediaSizeName]::NorthAmericaLegal)
+}
+$writer.Write($xpsDoc.GetFixedDocumentSequence(), $ticket)
 $xpsDoc.Close()
-`, strings.ReplaceAll(targetPrinter, `'`, `''`), strings.ReplaceAll(job.FilePath, `'`, `''`))
+`, strings.ReplaceAll(targetPrinter, `'`, `''`),
+			strings.ReplaceAll(job.FilePath, `'`, `''`),
+			geom.Orientation,
+			geom.PaperName,
+			geom.PaperName,
+			geom.PaperName)
 		cmd := exec.CommandContext(ctx, "powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", psScript)
 		hideCmd(cmd)
 		out, err = cmd.CombinedOutput()
@@ -1004,6 +1028,18 @@ func SendDirectPrint(ctx context.Context, peerURL, authToken, filePath string, e
 	req.Header.Set("X-Bridge-Token", authToken)
 	req.Header.Set("X-Bridge-FileName", filepath.Base(filePath))
 	req.Header.Set("Content-Type", "application/octet-stream")
+
+	// Pre-inspect geometry to attach high-fidelity print headers for remote peer
+	geom := DetectDocumentGeometry(filePath)
+	if geom.PaperName != "" {
+		req.Header.Set("X-Bridge-Paper-Size", geom.PaperName)
+	}
+	if geom.Orientation != "" {
+		req.Header.Set("X-Bridge-Orientation", geom.Orientation)
+	}
+	if geom.PageCount > 0 {
+		req.Header.Set("X-Bridge-Page-Count", fmt.Sprintf("%d", geom.PageCount))
+	}
 
 	for i := 0; i+1 < len(extraHeaders); i += 2 {
 		req.Header.Set(extraHeaders[i], extraHeaders[i+1])
