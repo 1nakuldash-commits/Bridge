@@ -214,7 +214,7 @@ func LoadConfig(path string) (*Config, error) {
 	migrated := false
 
 	// Automatic Migration from legacy one-way roles
-	if raw.NodeName == "" {
+	if strings.TrimSpace(raw.NodeName) == "" {
 		if strings.EqualFold(raw.Role, "desktop1") {
 			cfg.NodeName = "Desktop 1"
 			if cfg.PeerName == "" {
@@ -237,10 +237,9 @@ func LoadConfig(path string) (*Config, error) {
 	}
 
 	// Flag if this device needs setup naming prompt:
-	// Only explicit configured: true (with a non-prototype name) is considered configured.
-	// Any old prototype (desktop1/desktop2, Desktop 1/2, Bridge-PC) or configs from prior builds
-	// that lack explicit "configured": true must prompt the user for the device name.
-	if raw.Configured && !strings.EqualFold(raw.NodeName, "Desktop 1") && !strings.EqualFold(raw.NodeName, "Desktop 2") && !strings.EqualFold(raw.NodeName, "Bridge-PC") && raw.NodeName != "" {
+	// Explicit "configured": true with a non-empty NodeName is honored regardless of device name.
+	// Only missing/false configured flag or empty NodeName triggers setup.
+	if raw.Configured && strings.TrimSpace(raw.NodeName) != "" {
 		cfg.Configured = true
 	} else {
 		cfg.Configured = false
@@ -571,6 +570,7 @@ func (c *Config) AddOrUpdatePeer(name, ip, peerURL string) (PeerDevice, bool) {
 	}
 
 	isNew := idx == -1
+	changed := isNew
 	var dev PeerDevice
 
 	if isNew {
@@ -605,6 +605,11 @@ func (c *Config) AddOrUpdatePeer(name, ip, peerURL string) (PeerDevice, bool) {
 		c.Peers = append(c.Peers, dev)
 	} else {
 		dev = c.Peers[idx]
+		prevName := dev.Name
+		prevIP := dev.IP
+		prevURL := dev.URL
+		prevPort := dev.SpoolPort
+
 		if cleanName != "" && dev.Name != cleanName {
 			dev.Name = cleanName
 		}
@@ -615,7 +620,20 @@ func (c *Config) AddOrUpdatePeer(name, ip, peerURL string) (PeerDevice, bool) {
 			dev.URL = cleanURL
 		}
 		if dev.SpoolPort <= 0 {
-			dev.SpoolPort = 9101 + idx
+			used := make(map[int]bool)
+			for i, p := range c.Peers {
+				if i != idx && p.SpoolPort > 0 {
+					used[p.SpoolPort] = true
+				}
+			}
+			port := 9101
+			for used[port] {
+				port++
+			}
+			dev.SpoolPort = port
+		}
+		if dev.Name != prevName || dev.IP != prevIP || dev.URL != prevURL || dev.SpoolPort != prevPort {
+			changed = true
 		}
 		dev.Online = true
 		dev.LastSeen = time.Now()
@@ -624,13 +642,19 @@ func (c *Config) AddOrUpdatePeer(name, ip, peerURL string) (PeerDevice, bool) {
 
 	// Update legacy fields to match primary peer
 	if len(c.Peers) > 0 {
-		c.PeerName = c.Peers[0].Name
-		c.PeerURL = c.Peers[0].URL
+		if c.PeerName != c.Peers[0].Name {
+			c.PeerName = c.Peers[0].Name
+			changed = true
+		}
+		if c.PeerURL != c.Peers[0].URL {
+			c.PeerURL = c.Peers[0].URL
+			changed = true
+		}
 	}
 	configPath := c.ConfigPath
 	c.mu.Unlock()
 
-	if configPath != "" {
+	if changed && configPath != "" {
 		_ = SaveConfig(configPath, c)
 	}
 
@@ -794,19 +818,53 @@ func (c *Config) UpdatePeerURL(newURL string) error {
 	return nil
 }
 
-// SaveConfig writes the configuration to a JSON file.
+// SaveConfig writes the configuration to a JSON file atomically.
 func SaveConfig(path string, cfg *Config) error {
 	cfg.mu.RLock()
-	defer cfg.mu.RUnlock()
+	data, err := json.MarshalIndent(cfg, "", "  ")
+	cfg.mu.RUnlock()
+	if err != nil {
+		return err
+	}
 
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return err
 	}
-	data, err := json.MarshalIndent(cfg, "", "  ")
+
+	tmpFile, err := os.CreateTemp(dir, filepath.Base(path)+".tmp-*")
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, data, 0644)
+	tmpPath := tmpFile.Name()
+	cleanupTmp := true
+	defer func() {
+		if cleanupTmp {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+
+	if _, err := tmpFile.Write(data); err != nil {
+		_ = tmpFile.Close()
+		return err
+	}
+	if err := tmpFile.Sync(); err != nil {
+		_ = tmpFile.Close()
+		return err
+	}
+	if err := tmpFile.Close(); err != nil {
+		return err
+	}
+
+	var renameErr error
+	for attempt := 0; attempt < 5; attempt++ {
+		renameErr = os.Rename(tmpPath, path)
+		if renameErr == nil {
+			cleanupTmp = false
+			return nil
+		}
+		time.Sleep(time.Duration(attempt+1) * 15 * time.Millisecond)
+	}
+	return renameErr
 }
 

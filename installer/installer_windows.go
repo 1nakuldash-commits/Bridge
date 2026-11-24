@@ -327,6 +327,9 @@ oLink.Save
 // InstallVirtualPrinter registers a Windows RAW TCP port on 127.0.0.1:port and creates
 // a virtual printer named "Print on <PeerName>".
 func InstallVirtualPrinter(peerName string, port int) error {
+	if strings.TrimSpace(peerName) == "" {
+		return nil
+	}
 	cleanPeer := SanitizeFileName(peerName)
 	if cleanPeer == "" {
 		return nil
@@ -345,17 +348,40 @@ func InstallVirtualPrinter(peerName string, port int) error {
 	}
 	printerName := fmt.Sprintf("Print on %s", cleanPeer)
 	portName := fmt.Sprintf("Bridge_Port_%d", port)
+	const printerAttrWorkOffline = 0x00000400
 
 	// In-Process Fast Registry Check (0 subprocesses, <1ms):
-	// Check if printer already exists in Windows Registry with matching port.
+	// Verify printer exists with matching port, WorkOffline is disabled, and TCP port has SNMP disabled.
+	printerClean := false
 	k, err := registry.OpenKey(registry.LOCAL_MACHINE, `SOFTWARE\Microsoft\Windows NT\CurrentVersion\Print\Printers\`+printerName, registry.QUERY_VALUE)
 	if err == nil {
-		defer k.Close()
-		portVal, _, err := k.GetStringValue("Port")
-		if err == nil && strings.EqualFold(strings.TrimSpace(portVal), portName) {
-			return nil // Already installed and configured properly!
+		portVal, _, portErr := k.GetStringValue("Port")
+		attrs, _, attrErr := k.GetIntegerValue("Attributes")
+		k.Close()
+
+		if portErr == nil && strings.EqualFold(strings.TrimSpace(portVal), portName) &&
+			attrErr == nil && (attrs&printerAttrWorkOffline) == 0 {
+			pk, pkErr := registry.OpenKey(registry.LOCAL_MACHINE, `SYSTEM\CurrentControlSet\Control\Print\Monitors\Standard TCP/IP Port\Ports\`+portName, registry.QUERY_VALUE)
+			if pkErr == nil {
+				snmpVal, _, snmpErr := pk.GetIntegerValue("SNMP Enabled")
+				portNum, _, numErr := pk.GetIntegerValue("PortNumber")
+				pk.Close()
+				if snmpErr == nil && snmpVal == 0 && numErr == nil && int(portNum) == port {
+					printerClean = true
+				}
+			}
 		}
 	}
+	if printerClean {
+		return nil // Already installed and cleanly configured (SNMP=0, WorkOffline=false)
+	}
+
+	if !IsElevated() {
+		return fmt.Errorf("administrator privileges required to configure virtual printer %q on port %d", printerName, port)
+	}
+
+	psPortName := strings.ReplaceAll(portName, `'`, `''`)
+	psPrinterName := strings.ReplaceAll(printerName, `'`, `''`)
 
 	psScript := fmt.Sprintf(`
 $portName = '%s'
@@ -372,12 +398,11 @@ try {
 } catch {}
 
 if (-not (Get-PrinterPort -Name $portName -ErrorAction SilentlyContinue)) {
-    Add-PrinterPort -Name $portName -PrinterHostAddress '127.0.0.1' -PortNumber $portNumber -SNMP 0 -ErrorAction SilentlyContinue
-} else {
-    try {
-        Set-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\Print\Monitors\Standard TCP/IP Port\Ports\$portName" -Name "SNMP Enabled" -Value 0 -Type DWord -ErrorAction SilentlyContinue
-    } catch {}
+    Add-PrinterPort -Name $portName -PrinterHostAddress '127.0.0.1' -PortNumber $portNumber -SNMP 0 -ErrorAction Stop
 }
+try {
+    Set-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\Print\Monitors\Standard TCP/IP Port\Ports\$portName" -Name "SNMP Enabled" -Value 0 -Type DWord -ErrorAction SilentlyContinue
+} catch {}
 
 $preferredDrivers = @('Microsoft XPS Document Writer v4', 'Microsoft XPS Document Writer', 'OpenXPS Document Writer')
 $driver = $null
@@ -499,7 +524,7 @@ if ($isPhysicalDefault) {
         (New-Object -ComObject WScript.Network).SetDefaultPrinter($printerName)
     }
 }
-`, portName, port, printerName)
+`, psPortName, port, psPrinterName)
 
 	cmd := exec.Command("powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", psScript)
 	hideCmd(cmd)
@@ -745,21 +770,37 @@ func ReleaseServiceLock() {
 }
 
 // RegisterInteractiveStartup ensures bridge.exe starts silently in Session 1 at user logon.
-// It aggressively purges legacy duplicate entries (HKLM, User Startup folder, Common Startup folder)
-// and registers ONLY a single canonical HKCU Run entry with the -autostart flag so that exactly ONE
-// instance starts with the system tray icon, and ZERO terminal windows open on boot.
+// It performs only fast in-process HKCU Run registration (no heavy PowerShell or schtasks sweeps)
+// so normal boot and dashboard launches stay instantaneous. Full legacy startup purging runs
+// via UnregisterInteractiveStartup during explicit -install, -setup, -upgrade, or -uninstall flows.
 func RegisterInteractiveStartup() error {
-	// 1. Purge all duplicate/legacy startup locations
-	UnregisterInteractiveStartup()
+	runCmd := fmt.Sprintf(`"%s" -autostart`, TargetExe)
 
-	// 2. Register ONLY HKCU Run Key with -autostart flag
-	k, _, err := registry.CreateKey(registry.CURRENT_USER, `Software\Microsoft\Windows\CurrentVersion\Run`, registry.SET_VALUE)
-	if err == nil {
-		runCmd := fmt.Sprintf(`"%s" -autostart`, TargetExe)
-		_ = k.SetStringValue("BridgeApp", runCmd)
-		k.Close()
+	k, _, err := registry.CreateKey(registry.CURRENT_USER, `Software\Microsoft\Windows\CurrentVersion\Run`, registry.QUERY_VALUE|registry.SET_VALUE)
+	if err != nil {
+		return err
 	}
-	return nil
+	defer k.Close()
+
+	if valNames, err := k.ReadValueNames(-1); err == nil {
+		for _, vn := range valNames {
+			if vn == "BridgeApp" {
+				continue
+			}
+			if strings.Contains(strings.ToLower(vn), "bridge") {
+				_ = k.DeleteValue(vn)
+				continue
+			}
+			if val, _, err := k.GetStringValue(vn); err == nil && strings.Contains(strings.ToLower(val), "bridge.exe") {
+				_ = k.DeleteValue(vn)
+			}
+		}
+	}
+
+	if existing, _, err := k.GetStringValue("BridgeApp"); err == nil && strings.EqualFold(existing, runCmd) {
+		return nil
+	}
+	return k.SetStringValue("BridgeApp", runCmd)
 }
 
 // UnregisterInteractiveStartup cleanly removes startup entries across all possible locations.

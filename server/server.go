@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -84,9 +86,6 @@ func (s *Server) SetPeerUpdater(fn func(peer config.PeerDevice, isNew bool)) {
 // SetSyncEngine attaches a SyncEngine reference to handle mesh file routing and deletion relay.
 func (s *Server) SetSyncEngine(se *bridgesync.SyncEngine) {
 	s.syncEngine = se
-	if se != nil && s.cfg.ListenPort > 0 {
-		se.SetLocalURL(fmt.Sprintf("http://127.0.0.1:%d", s.cfg.ListenPort))
-	}
 }
 
 // SetOnPrintDispatched sets a callback invoked when a local file is dispatched for printing.
@@ -127,24 +126,91 @@ func (s *Server) authMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
+func extractRemoteIP(remoteAddr string) string {
+	addr := strings.TrimSpace(remoteAddr)
+	if addr == "" {
+		return ""
+	}
+	if host, _, err := net.SplitHostPort(addr); err == nil {
+		addr = host
+	}
+	return config.ExtractIP(addr)
+}
+
+func isValidNonLoopbackIP(ipStr string) bool {
+	ip := net.ParseIP(strings.TrimSpace(ipStr))
+	return ip != nil && !ip.IsLoopback() && !ip.IsUnspecified()
+}
+
+func isValidPeerURL(rawURL string) bool {
+	if rawURL == "" {
+		return false
+	}
+	u, err := url.Parse(rawURL)
+	if err != nil || u.Hostname() == "" {
+		return false
+	}
+	return u.Scheme == "http" || u.Scheme == "https"
+}
+
+func isLoopbackURL(rawURL string) bool {
+	if rawURL == "" {
+		return false
+	}
+	host := strings.ToLower(config.ExtractIP(rawURL))
+	if host == "localhost" || host == "127.0.0.1" || host == "::1" {
+		return true
+	}
+	if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
+		return true
+	}
+	return false
+}
+
+// resolvePeerFromRequest resolves a peer's IP and URL from the provided header URL,
+// falling back to r.RemoteAddr's IP when headerURL is empty or loopback and the remote
+// address is a valid non-loopback IP.
+func resolvePeerFromRequest(headerURL string, r *http.Request) (string, string) {
+	cleanURL := strings.TrimRight(strings.TrimSpace(headerURL), "/")
+	remoteIP := extractRemoteIP(r.RemoteAddr)
+
+	if cleanURL == "" || !isValidPeerURL(cleanURL) || isLoopbackURL(cleanURL) {
+		if isValidNonLoopbackIP(remoteIP) {
+			port := "8765"
+			if u, err := url.Parse(cleanURL); err == nil && u.Port() != "" {
+				port = u.Port()
+			}
+			return remoteIP, fmt.Sprintf("http://%s:%s", remoteIP, port)
+		}
+		if isValidPeerURL(cleanURL) && isLoopbackURL(cleanURL) {
+			return config.ExtractIP(cleanURL), cleanURL
+		}
+		return "", ""
+	}
+
+	return config.ExtractIP(cleanURL), cleanURL
+}
+
 func (s *Server) checkAutoPair(r *http.Request) {
 	peerHeader := r.Header.Get("X-Bridge-Peer-URL")
 	nodeHeader := r.Header.Get("X-Bridge-Node-Name")
 
-	cleanPeerURL := strings.TrimRight(strings.TrimSpace(peerHeader), "/")
 	cleanNodeName := strings.TrimSpace(nodeHeader)
+	cleanIP, cleanPeerURL := resolvePeerFromRequest(peerHeader, r)
 
-	if config.IsSelfTarget(cleanNodeName, "", cleanPeerURL, s.cfg.GetNodeName(), s.cfg.ListenPort) {
+	if cleanIP == "" && cleanPeerURL == "" {
+		return
+	}
+
+	if config.IsSelfTarget(cleanNodeName, cleanIP, cleanPeerURL, s.cfg.GetNodeName(), s.cfg.ListenPort) {
 		return // Strictly ignore self
 	}
 
-	if cleanPeerURL != "" || cleanNodeName != "" {
-		dev, isNew := s.cfg.AddOrUpdatePeer(cleanNodeName, "", cleanPeerURL)
-		if isNew && dev.Name != "" {
-			log.Printf("[Server] Discovered new peer: '%s' (%s) -> Assigned SpoolPort %d", dev.Name, dev.URL, dev.SpoolPort)
-			if s.peerUpdater != nil {
-				s.peerUpdater(dev, isNew)
-			}
+	dev, isNew := s.cfg.AddOrUpdatePeer(cleanNodeName, cleanIP, cleanPeerURL)
+	if isNew && dev.Name != "" {
+		log.Printf("[Server] Discovered new peer: '%s' (%s) -> Assigned SpoolPort %d", dev.Name, dev.URL, dev.SpoolPort)
+		if s.peerUpdater != nil {
+			s.peerUpdater(dev, isNew)
 		}
 	}
 }
@@ -403,13 +469,13 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 			modTime, _ = strconv.ParseInt(modTimeStr, 10, 64)
 		}
 
-		senderURL := r.Header.Get("X-Bridge-Peer-URL")
-		if senderURL == "" {
-			senderURL = r.Header.Get("X-Bridge-Sender")
+		rawSender := r.Header.Get("X-Bridge-Peer-URL")
+		if rawSender == "" {
+			rawSender = r.Header.Get("X-Bridge-Sender")
 		}
+		_, senderURL := resolvePeerFromRequest(rawSender, r)
 		if senderURL == "" {
-			remoteIP := config.ExtractIP(r.RemoteAddr)
-			if remoteIP != "" {
+			if remoteIP := extractRemoteIP(r.RemoteAddr); remoteIP != "" {
 				senderURL = fmt.Sprintf("http://%s:8765", remoteIP)
 			}
 		}
@@ -461,6 +527,19 @@ func (s *Server) handlePrint(w http.ResponseWriter, r *http.Request) {
 	fileName := r.Header.Get("X-Bridge-FileName")
 	if fileName == "" {
 		fileName = "print_job.pdf"
+	}
+
+	paperSize := strings.TrimSpace(r.Header.Get("X-Bridge-Paper-Size"))
+	orientation := strings.TrimSpace(r.Header.Get("X-Bridge-Orientation"))
+	pageCountStr := strings.TrimSpace(r.Header.Get("X-Bridge-Page-Count"))
+	var pageCount int
+	if pageCountStr != "" {
+		if n, err := strconv.Atoi(pageCountStr); err == nil && n >= 0 {
+			pageCount = n
+		}
+	}
+	if paperSize != "" || orientation != "" || pageCount > 0 {
+		log.Printf("[Server] Incoming print job %q metadata: paper=%q orientation=%q pages=%d", fileName, paperSize, orientation, pageCount)
 	}
 
 	job, err := s.printService.SaveIncomingJob(fileName, r.Body)

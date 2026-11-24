@@ -2,6 +2,7 @@ package installer
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 
@@ -116,5 +117,35 @@ func TestHealthResponsePeerOnlineSerialization(t *testing.T) {
 	}
 	if !decoded.Peers[0].Online {
 		t.Errorf("Expected decoded.Peers[0].Online to be true, got false. Raw JSON: %s", string(data))
+	}
+}
+
+func TestInstallVirtualPrinterNonElevatedHandling(t *testing.T) {
+	// Empty peer name must always be a safe no-op
+	if err := InstallVirtualPrinter("   ", 9199); err != nil {
+		t.Fatalf("Expected nil error for empty peer name, got: %v", err)
+	}
+
+	if IsElevated() {
+		t.Skip("Running elevated; skipping non-elevated InstallVirtualPrinter test")
+	}
+
+	err := InstallVirtualPrinter("NonExistentTestPeer_Bridge9199", 9199)
+	if err == nil {
+		t.Fatalf("Expected explicit privilege error when installing missing virtual printer while non-elevated")
+	}
+	if !strings.Contains(strings.ToLower(err.Error()), "administrator") {
+		t.Fatalf("Expected clear administrator privileges error, got: %v", err)
+	}
+}
+
+func TestRegisterInteractiveStartupFast(t *testing.T) {
+	start := time.Now()
+	if err := RegisterInteractiveStartup(); err != nil {
+		t.Fatalf("RegisterInteractiveStartup failed: %v", err)
+	}
+	elapsed := time.Since(start)
+	if elapsed > 2*time.Second {
+		t.Fatalf("RegisterInteractiveStartup took too long (%v); should be fast in-process registry update", elapsed)
 	}
 }
