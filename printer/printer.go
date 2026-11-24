@@ -718,12 +718,25 @@ if ('%s' -eq 'landscape') {
 } else {
     $ticket.PageOrientation = [System.Printing.PageOrientation]::Portrait
 }
-if ('%s' -eq 'A4') {
+$paper = '%s'
+if ($paper -eq 'A4') {
     $ticket.PageMediaSize = New-Object System.Printing.PageMediaSize([System.Printing.PageMediaSizeName]::ISOA4)
-} elseif ('%s' -eq 'Letter') {
+} elseif ($paper -eq 'A3') {
+    $ticket.PageMediaSize = New-Object System.Printing.PageMediaSize([System.Printing.PageMediaSizeName]::ISOA3)
+} elseif ($paper -eq 'A2') {
+    $ticket.PageMediaSize = New-Object System.Printing.PageMediaSize([System.Printing.PageMediaSizeName]::ISOA2)
+} elseif ($paper -eq 'A1') {
+    $ticket.PageMediaSize = New-Object System.Printing.PageMediaSize([System.Printing.PageMediaSizeName]::ISOA1)
+} elseif ($paper -eq 'A0') {
+    $ticket.PageMediaSize = New-Object System.Printing.PageMediaSize([System.Printing.PageMediaSizeName]::ISOA0)
+} elseif ($paper -eq 'A5') {
+    $ticket.PageMediaSize = New-Object System.Printing.PageMediaSize([System.Printing.PageMediaSizeName]::ISOA5)
+} elseif ($paper -eq 'Letter') {
     $ticket.PageMediaSize = New-Object System.Printing.PageMediaSize([System.Printing.PageMediaSizeName]::NorthAmericaLetter)
-} elseif ('%s' -eq 'Legal') {
+} elseif ($paper -eq 'Legal') {
     $ticket.PageMediaSize = New-Object System.Printing.PageMediaSize([System.Printing.PageMediaSizeName]::NorthAmericaLegal)
+} elseif ($paper -eq 'Tabloid') {
+    $ticket.PageMediaSize = New-Object System.Printing.PageMediaSize([System.Printing.PageMediaSizeName]::NorthAmericaTabloid)
 }
 $ticket.PageScalingFactor = 100
 $writer.Write($xpsDoc.GetFixedDocumentSequence(), $ticket)
@@ -731,8 +744,6 @@ $xpsDoc.Close()
 `, strings.ReplaceAll(targetPrinter, `'`, `''`),
 		strings.ReplaceAll(filePath, `'`, `''`),
 		geom.Orientation,
-		geom.PaperName,
-		geom.PaperName,
 		geom.PaperName)
 	cmd := exec.CommandContext(ctx, "powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", psScript)
 	hideCmd(cmd)

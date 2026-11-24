@@ -188,3 +188,61 @@ func TestDetectDocumentGeometryLargePDF(t *testing.T) {
 		t.Errorf("Expected settings %q, got %q", expectedSettings, settings)
 	}
 }
+
+func TestDetectDocumentGeometryPDF_A2_A3(t *testing.T) {
+	tempDir := t.TempDir()
+
+	// Test A3 PDF: 841.89 x 1190.55 pt
+	a3Path := filepath.Join(tempDir, "test_a3.pdf")
+	a3Content := `%PDF-1.4
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [3 0 R] /Count 1 >>
+endobj
+3 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 841.89 1190.55] >>
+endobj
+xref
+trailer
+<< /Size 4 /Root 1 0 R >>
+%%EOF`
+	if err := os.WriteFile(a3Path, []byte(a3Content), 0644); err != nil {
+		t.Fatalf("Failed to create A3 PDF: %v", err)
+	}
+	geomA3 := DetectDocumentGeometry(a3Path)
+	if geomA3.PaperName != "A3" {
+		t.Errorf("Expected PaperName A3, got %s", geomA3.PaperName)
+	}
+	if s := BuildPrintSettings(geomA3); s != "1-1,paper=A3,portrait,noscale" {
+		t.Errorf("Expected '1-1,paper=A3,portrait,noscale', got %s", s)
+	}
+
+	// Test A2 PDF: 1190.55 x 1683.78 pt
+	a2Path := filepath.Join(tempDir, "test_a2.pdf")
+	a2Content := `%PDF-1.4
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [3 0 R] /Count 1 >>
+endobj
+3 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 1190.55 1683.78] >>
+endobj
+xref
+trailer
+<< /Size 4 /Root 1 0 R >>
+%%EOF`
+	if err := os.WriteFile(a2Path, []byte(a2Content), 0644); err != nil {
+		t.Fatalf("Failed to create A2 PDF: %v", err)
+	}
+	geomA2 := DetectDocumentGeometry(a2Path)
+	if geomA2.PaperName != "A2" {
+		t.Errorf("Expected PaperName A2, got %s", geomA2.PaperName)
+	}
+	if s := BuildPrintSettings(geomA2); s != "1-1,paper=A2,portrait,noscale" {
+		t.Errorf("Expected '1-1,paper=A2,portrait,noscale', got %s", s)
+	}
+}

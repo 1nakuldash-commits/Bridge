@@ -18,18 +18,24 @@ const (
 	ptPerMm = 72.0 / 25.4 // ~2.8346 pt per mm
 
 	// Standard ISO & ANSI page sizes (in points, normalized: short edge, long edge)
-	a4ShortPt  = 210.0 * ptPerMm // 595.276
-	a4LongPt   = 297.0 * ptPerMm // 841.890
-	ltrShortPt = 8.5 * 72.0      // 612.0
-	ltrLongPt  = 11.0 * 72.0     // 792.0
-	lglShortPt = 8.5 * 72.0      // 612.0
-	lglLongPt  = 14.0 * 72.0     // 1008.0
-	a3ShortPt  = 297.0 * ptPerMm // 841.890
-	a3LongPt   = 420.0 * ptPerMm // 1190.551
-	a5ShortPt  = 148.0 * ptPerMm // 419.528
-	a5LongPt   = 210.0 * ptPerMm // 595.276
-	tabShortPt = 11.0 * 72.0     // 792.0
-	tabLongPt  = 17.0 * 72.0     // 1224.0
+	a0ShortPt  = 841.0 * ptPerMm  // 2383.937
+	a0LongPt   = 1189.0 * ptPerMm // 3370.394
+	a1ShortPt  = 594.0 * ptPerMm  // 1683.780
+	a1LongPt   = 841.0 * ptPerMm  // 2383.937
+	a2ShortPt  = 420.0 * ptPerMm  // 1190.551
+	a2LongPt   = 594.0 * ptPerMm  // 1683.780
+	a3ShortPt  = 297.0 * ptPerMm  // 841.890
+	a3LongPt   = 420.0 * ptPerMm  // 1190.551
+	a4ShortPt  = 210.0 * ptPerMm  // 595.276
+	a4LongPt   = 297.0 * ptPerMm  // 841.890
+	a5ShortPt  = 148.0 * ptPerMm  // 419.528
+	a5LongPt   = 210.0 * ptPerMm  // 595.276
+	ltrShortPt = 8.5 * 72.0       // 612.0
+	ltrLongPt  = 11.0 * 72.0      // 792.0
+	lglShortPt = 8.5 * 72.0       // 612.0
+	lglLongPt  = 14.0 * 72.0      // 1008.0
+	tabShortPt = 11.0 * 72.0      // 792.0
+	tabLongPt  = 17.0 * 72.0      // 1224.0
 )
 
 // DocumentGeometry captures the detected dimensions, orientation, paper size, and page count.
@@ -241,12 +247,27 @@ func matchStandardPaper(shortPt, longPt float64) string {
 		return "A3"
 	}
 
-	// 5. A5 check (419.53 x 595.28 pt): tolerance +/- 12 pt
+	// 5. A2 check (1190.55 x 1683.78 pt): tolerance +/- 25 pt
+	if math.Abs(shortPt-a2ShortPt) <= 25.0 && math.Abs(longPt-a2LongPt) <= 25.0 {
+		return "A2"
+	}
+
+	// 6. A1 check (1683.78 x 2383.94 pt): tolerance +/- 25 pt
+	if math.Abs(shortPt-a1ShortPt) <= 25.0 && math.Abs(longPt-a1LongPt) <= 25.0 {
+		return "A1"
+	}
+
+	// 7. A0 check (2383.94 x 3370.39 pt): tolerance +/- 30 pt
+	if math.Abs(shortPt-a0ShortPt) <= 30.0 && math.Abs(longPt-a0LongPt) <= 30.0 {
+		return "A0"
+	}
+
+	// 8. A5 check (419.53 x 595.28 pt): tolerance +/- 12 pt
 	if math.Abs(shortPt-a5ShortPt) <= 12.0 && math.Abs(longPt-a5LongPt) <= 12.0 {
 		return "A5"
 	}
 
-	// 6. Tabloid / Ledger check (792.0 x 1224.0 pt): tolerance +/- 20 pt
+	// 9. Tabloid / Ledger check (792.0 x 1224.0 pt): tolerance +/- 20 pt
 	if math.Abs(shortPt-tabShortPt) <= 20.0 && math.Abs(longPt-tabLongPt) <= 20.0 {
 		return "Tabloid"
 	}
@@ -256,7 +277,13 @@ func matchStandardPaper(shortPt, longPt float64) string {
 		ratio := longPt / shortPt
 		// ISO A-series aspect ratio is sqrt(2) ~ 1.4142
 		if math.Abs(ratio-1.4142) <= 0.08 {
-			if shortPt > 700 {
+			if shortPt > 2000 {
+				return "A0"
+			} else if shortPt > 1400 {
+				return "A1"
+			} else if shortPt > 1000 {
+				return "A2"
+			} else if shortPt > 700 {
 				return "A3"
 			} else if shortPt < 500 {
 				return "A5"
