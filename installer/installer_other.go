@@ -106,6 +106,11 @@ func RemoveVirtualPrinter(peerName string) error {
 	return nil
 }
 
+// PruneObsoleteVirtualPrinters stub.
+func PruneObsoleteVirtualPrinters(activePeers []config.PeerDevice) error {
+	return nil
+}
+
 // UninstallAllVirtualPrinters stub.
 func UninstallAllVirtualPrinters() error {
 	return nil

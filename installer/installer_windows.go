@@ -362,12 +362,6 @@ $portName = '%s'
 $portNumber = %d
 $printerName = '%s'
 
-# Fast-path idempotency: If virtual printer and port already exist, return immediately without changes
-$existing = Get-Printer -Name $printerName -ErrorAction SilentlyContinue
-if ($existing -and ($existing.PortName -eq $portName)) {
-    exit 0
-}
-
 # 1. Protect Windows default printer mode
 Set-ItemProperty "HKCU:\Software\Microsoft\Windows NT\CurrentVersion\Windows" -Name "LegacyDefaultPrinterMode" -Value 1 -Type DWord -ErrorAction SilentlyContinue
 
@@ -378,7 +372,7 @@ try {
 } catch {}
 
 if (-not (Get-PrinterPort -Name $portName -ErrorAction SilentlyContinue)) {
-    Add-PrinterPort -Name $portName -PrinterHostAddress '127.0.0.1' -PortNumber $portNumber -ErrorAction Stop
+    Add-PrinterPort -Name $portName -PrinterHostAddress '127.0.0.1' -PortNumber $portNumber -SNMP 0 -ErrorAction SilentlyContinue
 }
 
 $preferredDrivers = @('Microsoft XPS Document Writer v4', 'Microsoft XPS Document Writer', 'OpenXPS Document Writer')
@@ -440,8 +434,17 @@ if (-not $driver) {
 if (-not (Get-Printer -Name $printerName -ErrorAction SilentlyContinue)) {
     Add-Printer -Name $printerName -DriverName $driver -PortName $portName -ErrorAction Stop
 } else {
-    Set-Printer -Name $printerName -PortName $portName -ErrorAction SilentlyContinue
+    Set-Printer -Name $printerName -PortName $portName -DriverName $driver -ErrorAction SilentlyContinue
 }
+
+# Ensure WorkOffline is always disabled so print jobs stream immediately
+try {
+    $pObj = Get-CimInstance Win32_Printer -Filter "Name = '$($printerName.Replace("'", "''"))'" -ErrorAction SilentlyContinue
+    if ($pObj -and $pObj.WorkOffline) {
+        $pObj.WorkOffline = $false
+        Set-CimInstance -InputObject $pObj -ErrorAction SilentlyContinue
+    }
+} catch {}
 
 # Configure virtual printer default paper size to match regional standard (A4 or Letter)
 try {
@@ -512,6 +515,53 @@ $pName = '%s'
 Get-Printer -Name $pName -ErrorAction SilentlyContinue | Remove-Printer -ErrorAction SilentlyContinue
 Get-CimInstance Win32_Printer -Filter "Name = '$($pName.Replace("'", "''"))'" -ErrorAction SilentlyContinue | Remove-CimInstance -ErrorAction SilentlyContinue
 `, strings.ReplaceAll(printerName, `'`, `''`))
+	cmd := exec.Command("powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", psScript)
+	hideCmd(cmd)
+	return cmd.Run()
+}
+
+// PruneObsoleteVirtualPrinters removes any virtual printers and TCP ports that do not match the active peers.
+func PruneObsoleteVirtualPrinters(activePeers []config.PeerDevice) error {
+	var validPrinters []string
+	var validPorts []string
+
+	for _, p := range activePeers {
+		clean := SanitizeFileName(p.Name)
+		validPrinters = append(validPrinters, fmt.Sprintf("'%s'", strings.ReplaceAll(fmt.Sprintf("Print on %s", clean), `'`, `''`)))
+		port := p.SpoolPort
+		if port <= 0 {
+			port = 9101
+		}
+		validPorts = append(validPorts, fmt.Sprintf("'Bridge_Port_%d'", port))
+	}
+
+	printersArray := strings.Join(validPrinters, ", ")
+	portsArray := strings.Join(validPorts, ", ")
+
+	psScript := fmt.Sprintf(`
+$validPrinters = @( %s )
+$validPorts = @( %s )
+
+# 1. Remove obsolete Bridge virtual printers that are not in validPrinters
+Get-Printer -ErrorAction SilentlyContinue | Where-Object {
+    ($_.Name -like 'Print on *' -or $_.PortName -like 'Bridge_Port_*' -or $_.PortName -eq 'Bridge_TCP_Port') -and ($_.Name -notin $validPrinters)
+} | ForEach-Object {
+    $pName = $_.Name
+    Get-PrintJob -PrinterName $pName -ErrorAction SilentlyContinue | Remove-PrintJob -ErrorAction SilentlyContinue
+    Remove-Printer -Name $pName -ErrorAction SilentlyContinue
+    try {
+        Get-CimInstance Win32_Printer -Filter "Name = '$($pName.Replace("'", "''"))'" -ErrorAction SilentlyContinue | Remove-CimInstance -ErrorAction SilentlyContinue
+    } catch {}
+}
+
+# 2. Remove obsolete Bridge TCP ports that are not in validPorts
+Get-PrinterPort -ErrorAction SilentlyContinue | Where-Object {
+    ($_.Name -like 'Bridge_Port_*' -or $_.Name -eq 'Bridge_TCP_Port') -and ($_.Name -notin $validPorts)
+} | ForEach-Object {
+    Remove-PrinterPort -Name $_.Name -ErrorAction SilentlyContinue
+}
+`, printersArray, portsArray)
+
 	cmd := exec.Command("powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", psScript)
 	hideCmd(cmd)
 	return cmd.Run()

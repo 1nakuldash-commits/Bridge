@@ -147,6 +147,12 @@ func GetDefaultWindowsPrinter() (string, error) {
 	return syscall.UTF16ToString(buf), nil
 }
 
+var (
+	lastVirtualNotice string
+	lastAutoSelect    string
+	noticeMu          sync.Mutex
+)
+
 // GetTargetPhysicalPrinter detects the true physical printer connected to this machine.
 func GetTargetPhysicalPrinter() (string, error) {
 	// 1. Check current Windows default printer
@@ -172,13 +178,23 @@ func GetTargetPhysicalPrinter() (string, error) {
 		if !isVirtual && !IsVirtualPrinterName(defPrinter, "") {
 			return defPrinter, nil
 		}
-		log.Printf("[Printer] Notice: Default printer '%s' is virtual. Searching for physical printer...", defPrinter)
+		noticeMu.Lock()
+		if lastVirtualNotice != defPrinter {
+			lastVirtualNotice = defPrinter
+			log.Printf("[Printer] Notice: Default printer '%s' is virtual. Searching for physical printer...", defPrinter)
+		}
+		noticeMu.Unlock()
 	}
 
 	// Default was virtual or empty: find first physical printer
 	for _, p := range printers {
 		if !IsVirtualPrinterName(p.Name, p.PortName) {
-			log.Printf("[Printer] Auto-selected physical printer '%s' (port: %s)", p.Name, p.PortName)
+			noticeMu.Lock()
+			if lastAutoSelect != p.Name {
+				lastAutoSelect = p.Name
+				log.Printf("[Printer] Auto-selected physical printer '%s' (port: %s)", p.Name, p.PortName)
+			}
+			noticeMu.Unlock()
 			return p.Name, nil
 		}
 	}

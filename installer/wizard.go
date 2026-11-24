@@ -482,7 +482,39 @@ func RunDashboard() error {
 		}
 
 		peers := cfg.GetPeers()
-		fmt.Printf(" Connected Peers:  %d total (%d online)\n", len(peers), health.OnlineCount)
+		// Build lookup for live peer online status reported by running server
+		peerOnlineMap := make(map[string]bool)
+		for _, hp := range health.Peers {
+			if hp.Online {
+				if hp.Name != "" {
+					peerOnlineMap[strings.ToLower(strings.TrimSpace(hp.Name))] = true
+				}
+				if hp.IP != "" {
+					peerOnlineMap[strings.TrimSpace(hp.IP)] = true
+				}
+				if hp.URL != "" {
+					peerOnlineMap[strings.TrimSpace(hp.URL)] = true
+				}
+			}
+		}
+
+		onlineCount := 0
+		for i := range peers {
+			p := &peers[i]
+			isOnline := p.Online ||
+				peerOnlineMap[strings.ToLower(strings.TrimSpace(p.Name))] ||
+				peerOnlineMap[strings.TrimSpace(p.IP)] ||
+				(p.URL != "" && peerOnlineMap[strings.TrimSpace(p.URL)])
+			if isOnline {
+				p.Online = true
+				onlineCount++
+			}
+		}
+		if health.OnlineCount > onlineCount {
+			onlineCount = health.OnlineCount
+		}
+
+		fmt.Printf(" Connected Peers:  %d total (%d online)\n", len(peers), onlineCount)
 		if len(peers) > 0 {
 			for i, p := range peers {
 				statusStr := "⚪ Offline"
@@ -619,8 +651,8 @@ func RunDashboard() error {
 }
 
 func queryHealth(port int) server.HealthResponse {
-	client := http.Client{Timeout: 1 * time.Second}
-	url := fmt.Sprintf("http://127.0.0.1:%d/api/health", port)
+	client := http.Client{Timeout: 2 * time.Second}
+	url := fmt.Sprintf("http://127.0.0.1:%d/api/health?probe=sync", port)
 	resp, err := client.Get(url)
 	if err != nil {
 		return server.HealthResponse{

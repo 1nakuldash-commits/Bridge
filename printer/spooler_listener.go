@@ -261,6 +261,7 @@ func DetectSpoolFormat(data []byte) string {
 type MultiSpoolerListener struct {
 	mu           sync.Mutex
 	listeners    map[int]*SpoolerListener
+	peersByPort  map[int]config.PeerDevice
 	dispatchFunc func(peer config.PeerDevice, filePath string) error
 
 	OnJobStarted   func(peer config.PeerDevice, fileName string)
@@ -272,6 +273,7 @@ type MultiSpoolerListener struct {
 func NewMultiSpoolerListener(dispatchFunc func(peer config.PeerDevice, filePath string) error) *MultiSpoolerListener {
 	return &MultiSpoolerListener{
 		listeners:    make(map[int]*SpoolerListener),
+		peersByPort:  make(map[int]config.PeerDevice),
 		dispatchFunc: dispatchFunc,
 	}
 }
@@ -286,33 +288,50 @@ func (msl *MultiSpoolerListener) EnsurePeerListener(peer config.PeerDevice) erro
 		return fmt.Errorf("invalid spool port %d for peer %s", port, peer.Name)
 	}
 
+	if msl.peersByPort == nil {
+		msl.peersByPort = make(map[int]config.PeerDevice)
+	}
+	msl.peersByPort[port] = peer
+
 	if _, exists := msl.listeners[port]; exists {
-		return nil // already active
+		return nil // already active, peer state updated
 	}
 
 	addr := fmt.Sprintf("127.0.0.1:%d", port)
-	capturedPeer := peer
+	listenerPort := port
 
 	listener := NewSpoolerListener(addr, func(filePath string) error {
+		msl.mu.Lock()
+		curPeer := msl.peersByPort[listenerPort]
+		msl.mu.Unlock()
 		if msl.dispatchFunc != nil {
-			return msl.dispatchFunc(capturedPeer, filePath)
+			return msl.dispatchFunc(curPeer, filePath)
 		}
 		return nil
 	})
 
 	listener.OnJobStarted = func(fileName string) {
+		msl.mu.Lock()
+		curPeer := msl.peersByPort[listenerPort]
+		msl.mu.Unlock()
 		if msl.OnJobStarted != nil {
-			msl.OnJobStarted(capturedPeer, fileName)
+			msl.OnJobStarted(curPeer, fileName)
 		}
 	}
 	listener.OnJobCompleted = func(fileName string) {
+		msl.mu.Lock()
+		curPeer := msl.peersByPort[listenerPort]
+		msl.mu.Unlock()
 		if msl.OnJobCompleted != nil {
-			msl.OnJobCompleted(capturedPeer, fileName)
+			msl.OnJobCompleted(curPeer, fileName)
 		}
 	}
 	listener.OnJobFailed = func(fileName string, err error) {
+		msl.mu.Lock()
+		curPeer := msl.peersByPort[listenerPort]
+		msl.mu.Unlock()
 		if msl.OnJobFailed != nil {
-			msl.OnJobFailed(capturedPeer, fileName, err)
+			msl.OnJobFailed(curPeer, fileName, err)
 		}
 	}
 

@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"bridge/config"
+	"bridge/printer"
 	"bridge/tray"
 )
 
@@ -317,6 +318,9 @@ func CreateBridgeShortcutsForPeers(peers []config.PeerDevice) error {
 	shortcutsMu.Lock()
 	defer shortcutsMu.Unlock()
 
+	// Prune any obsolete virtual printers and ports from older versions
+	_ = PruneObsoleteVirtualPrinters(peers)
+
 	// 0. Determine local node name to strictly prevent self virtual printers or shortcuts
 	localNodeName := ""
 	if cfg, err := config.LoadConfig(TargetConfig); err == nil && cfg.NodeName != "" {
@@ -477,6 +481,7 @@ func UpgradeInstallation(sourceExe string) error {
 	if cfg != nil {
 		if sumatra := FindSumatraPDF(); sumatra != "" {
 			cfg.SumatraPath = sumatra
+			printer.ConfigureSumatraDefaults(sumatra)
 		}
 		_ = config.SaveConfig(TargetConfig, cfg)
 	}

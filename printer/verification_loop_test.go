@@ -78,7 +78,7 @@ trailer
 			wantFormat:      ".pdf",
 			wantPaper:       "A4",
 			wantOrientation: "portrait",
-			wantSettings:    "paper=A4,portrait,shrink",
+			wantSettings:    "1-1,paper=A4,portrait,noscale",
 			wantPages:       1,
 		},
 		{
@@ -104,7 +104,7 @@ trailer
 			wantFormat:      ".pdf",
 			wantPaper:       "A4",
 			wantOrientation: "landscape",
-			wantSettings:    "paper=A4,landscape,shrink",
+			wantSettings:    "1-1,paper=A4,landscape,noscale",
 			wantPages:       1,
 		},
 		{
@@ -130,7 +130,7 @@ trailer
 			wantFormat:      ".pdf",
 			wantPaper:       "Letter",
 			wantOrientation: "portrait",
-			wantSettings:    "paper=Letter,portrait,shrink",
+			wantSettings:    "1-1,paper=Letter,portrait,noscale",
 			wantPages:       1,
 		},
 		{
@@ -149,7 +149,7 @@ trailer
 			wantFormat:      ".xps",
 			wantPaper:       "A4",
 			wantOrientation: "portrait",
-			wantSettings:    "paper=A4,portrait,shrink",
+			wantSettings:    "1-1,paper=A4,portrait,noscale",
 			wantPages:       1,
 		},
 		{
@@ -178,7 +178,7 @@ trailer
 			wantFormat:      ".pdf",
 			wantPaper:       "A4",
 			wantOrientation: "portrait",
-			wantSettings:    "paper=A4,portrait,shrink",
+			wantSettings:    "1-2,paper=A4,portrait,noscale",
 			wantPages:       2,
 		},
 	}

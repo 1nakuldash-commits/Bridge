@@ -47,8 +47,8 @@ startxref
 	}
 
 	settings := BuildPrintSettings(geom)
-	if settings != "paper=A4,portrait,shrink" {
-		t.Errorf("Expected 'paper=A4,portrait,shrink', got %s", settings)
+	if settings != "1-1,paper=A4,portrait,noscale" {
+		t.Errorf("Expected '1-1,paper=A4,portrait,noscale', got %s", settings)
 	}
 }
 
@@ -87,8 +87,8 @@ trailer
 	}
 
 	settings := BuildPrintSettings(geom)
-	if settings != "paper=Letter,landscape,shrink" {
-		t.Errorf("Expected 'paper=Letter,landscape,shrink', got %s", settings)
+	if settings != "1-1,paper=Letter,landscape,noscale" {
+		t.Errorf("Expected '1-1,paper=Letter,landscape,noscale', got %s", settings)
 	}
 }
 
@@ -123,8 +123,8 @@ func TestDetectDocumentGeometryXPS_A4(t *testing.T) {
 	}
 
 	settings := BuildPrintSettings(geom)
-	if settings != "paper=A4,portrait,shrink" {
-		t.Errorf("Expected 'paper=A4,portrait,shrink', got %s", settings)
+	if settings != "1-1,paper=A4,portrait,noscale" {
+		t.Errorf("Expected '1-1,paper=A4,portrait,noscale', got %s", settings)
 	}
 }
 

@@ -134,12 +134,16 @@ func (ps *PrintService) Start() error {
 
 	// Proactive auto-heal: On Windows, if SumatraPDF is missing, begin background provisioning
 	// so the engine is fully ready and verified before the first print job arrives.
-	if runtime.GOOS == "windows" && !isUsableSumatra(ps.sumatraPath) && FindSumatraPDF() == "" {
-		go func() {
-			if path, err := EnsureSumatraPDF(); err == nil && path != "" {
-				ps.sumatraPath = path
-			}
-		}()
+	if runtime.GOOS == "windows" {
+		ConfigureSumatraDefaults(ps.sumatraPath)
+		if !isUsableSumatra(ps.sumatraPath) && FindSumatraPDF() == "" {
+			go func() {
+				if path, err := EnsureSumatraPDF(); err == nil && path != "" {
+					ps.sumatraPath = path
+					ConfigureSumatraDefaults(path)
+				}
+			}()
+		}
 	}
 
 	ps.wg.Add(1)
@@ -497,6 +501,7 @@ func EnsureSumatraPDF() (string, error) {
 	if err := DownloadSumatraPDF(targetPath); err == nil && isValidSumatraExe(targetPath) {
 		log.Printf("[Printer] Successfully provisioned standalone SumatraPDF at %s", targetPath)
 		_ = CreateSumatraShortcut(targetPath)
+		ConfigureSumatraDefaults(targetPath)
 		return targetPath, nil
 	}
 
@@ -508,12 +513,42 @@ func EnsureSumatraPDF() (string, error) {
 	for i := 0; i < 15; i++ {
 		if found := FindSumatraPDF(); found != "" {
 			_ = CreateSumatraShortcut(found)
+			ConfigureSumatraDefaults(found)
 			return found, nil
 		}
 		time.Sleep(1 * time.Second)
 	}
 
 	return "", errors.New("provisioned SumatraPDF binary failed validation")
+}
+
+// ConfigureSumatraDefaults ensures SumatraPDF-settings.txt enforces 100% 1:1 scale (noscale) by default.
+func ConfigureSumatraDefaults(exePath string) {
+	if exePath == "" {
+		exePath = FindSumatraPDF()
+	}
+	if exePath == "" {
+		exePath = `C:\BridgeApp\SumatraPDF.exe`
+	}
+	dir := filepath.Dir(exePath)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return
+	}
+	settingsPath := filepath.Join(dir, "SumatraPDF-settings.txt")
+	content := []byte("Theme = Light\nPrinterDefaults [\n\tPrintScale = noscale\n]\n")
+
+	if existing, err := os.ReadFile(settingsPath); err == nil {
+		s := string(existing)
+		if strings.Contains(s, "PrintScale = shrink") || strings.Contains(s, "PrintScale = fit") {
+			s = strings.ReplaceAll(s, "PrintScale = shrink", "PrintScale = noscale")
+			s = strings.ReplaceAll(s, "PrintScale = fit", "PrintScale = noscale")
+			_ = os.WriteFile(settingsPath, []byte(s), 0644)
+			return
+		} else if strings.Contains(s, "PrintScale = noscale") {
+			return
+		}
+	}
+	_ = os.WriteFile(settingsPath, content, 0644)
 }
 
 // CreateSumatraShortcut creates a shortcut to SumatraPDF in C:\BridgeApp\SumatraPDF.lnk and across desktop directories.
@@ -598,45 +633,17 @@ func (ps *PrintService) processJob(job PrintJob) {
 	// This renders each page through the printer's native Windows driver, preventing raw bytes / random page gibberish.
 	if isUsableSumatra(sumatraBin) {
 		log.Printf("[Printer] Rendering and printing via SumatraPDF silently to '%s' (settings: %s)...", targetPrinter, printSettings)
-		// Dynamic print settings preserve 100% 1:1 scale, exact paper feeding (A4/Letter), and orientation
+		// Dynamic print settings preserve 100% 1:1 scale, exact page count, exact paper feeding (A4/Letter), and orientation
 		cmd := exec.CommandContext(ctx, sumatraBin, "-print-to", targetPrinter, "-silent", "-print-settings", printSettings, "-exit-when-done", job.FilePath)
 		hideCmd(cmd)
 		out, err = cmd.CombinedOutput()
+		if err != nil && strings.EqualFold(filepath.Ext(job.FilePath), ".xps") {
+			log.Printf("[Printer] SumatraPDF returned warning (%v). Attempting native Windows .NET XPS fallback to '%s'...", err, targetPrinter)
+			out, err = printNativeXPS(ctx, targetPrinter, job.FilePath, geom)
+		}
 	} else if strings.EqualFold(filepath.Ext(job.FilePath), ".xps") {
-		// Native Windows .NET XPS driver rendering fallback:
-		// Uses System.Printing.PrintQueue::CreateXpsDocumentWriter with PrintTicket configured
-		// for exact PageMediaSize and PageOrientation to guarantee 1:1 scale without 16% shrinking bug.
 		log.Printf("[Printer] SumatraPDF not found, executing native Windows .NET XPS rendering to '%s' (paper: %s, orientation: %s)...", targetPrinter, geom.PaperName, geom.Orientation)
-		psScript := fmt.Sprintf(`
-Add-Type -AssemblyName ReachFramework, System.Printing
-$ps = New-Object System.Printing.LocalPrintServer
-$pq = $ps.GetPrintQueue('%s')
-$writer = [System.Printing.PrintQueue]::CreateXpsDocumentWriter($pq)
-$xpsDoc = New-Object System.Windows.Xps.Packaging.XpsDocument('%s', [System.IO.FileAccess]::Read)
-$ticket = $pq.UserPrintTicket.Clone()
-if ('%s' -eq 'landscape') {
-    $ticket.PageOrientation = [System.Printing.PageOrientation]::Landscape
-} else {
-    $ticket.PageOrientation = [System.Printing.PageOrientation]::Portrait
-}
-if ('%s' -eq 'A4') {
-    $ticket.PageMediaSize = New-Object System.Printing.PageMediaSize([System.Printing.PageMediaSizeName]::ISOA4)
-} elseif ('%s' -eq 'Letter') {
-    $ticket.PageMediaSize = New-Object System.Printing.PageMediaSize([System.Printing.PageMediaSizeName]::NorthAmericaLetter)
-} elseif ('%s' -eq 'Legal') {
-    $ticket.PageMediaSize = New-Object System.Printing.PageMediaSize([System.Printing.PageMediaSizeName]::NorthAmericaLegal)
-}
-$writer.Write($xpsDoc.GetFixedDocumentSequence(), $ticket)
-$xpsDoc.Close()
-`, strings.ReplaceAll(targetPrinter, `'`, `''`),
-			strings.ReplaceAll(job.FilePath, `'`, `''`),
-			geom.Orientation,
-			geom.PaperName,
-			geom.PaperName,
-			geom.PaperName)
-		cmd := exec.CommandContext(ctx, "powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", psScript)
-		hideCmd(cmd)
-		out, err = cmd.CombinedOutput()
+		out, err = printNativeXPS(ctx, targetPrinter, job.FilePath, geom)
 	} else {
 		// Strict safeguard: NEVER execute shell PrintTo with Notepad (which dumps raw binary bytes as text across 20 pages)
 		log.Printf("[Printer] ERROR: Silent print engine (SumatraPDF) not installed on host! Cannot safely render %s.", job.FileName)
@@ -679,6 +686,40 @@ func (ps *PrintService) moveToFailed(job PrintJob, reason string) {
 	destPath := filepath.Join(ps.failedDir, job.ID)
 	_ = os.Rename(job.FilePath, destPath)
 	log.Printf("[Printer] Moved failed job %s to %s (reason: %s)", job.ID, destPath, reason)
+}
+
+func printNativeXPS(ctx context.Context, targetPrinter, filePath string, geom DocumentGeometry) ([]byte, error) {
+	psScript := fmt.Sprintf(`
+Add-Type -AssemblyName ReachFramework, System.Printing
+$ps = New-Object System.Printing.LocalPrintServer
+$pq = $ps.GetPrintQueue('%s')
+$writer = [System.Printing.PrintQueue]::CreateXpsDocumentWriter($pq)
+$xpsDoc = New-Object System.Windows.Xps.Packaging.XpsDocument('%s', [System.IO.FileAccess]::Read)
+$ticket = $pq.UserPrintTicket.Clone()
+if ('%s' -eq 'landscape') {
+    $ticket.PageOrientation = [System.Printing.PageOrientation]::Landscape
+} else {
+    $ticket.PageOrientation = [System.Printing.PageOrientation]::Portrait
+}
+if ('%s' -eq 'A4') {
+    $ticket.PageMediaSize = New-Object System.Printing.PageMediaSize([System.Printing.PageMediaSizeName]::ISOA4)
+} elseif ('%s' -eq 'Letter') {
+    $ticket.PageMediaSize = New-Object System.Printing.PageMediaSize([System.Printing.PageMediaSizeName]::NorthAmericaLetter)
+} elseif ('%s' -eq 'Legal') {
+    $ticket.PageMediaSize = New-Object System.Printing.PageMediaSize([System.Printing.PageMediaSizeName]::NorthAmericaLegal)
+}
+$ticket.PageScalingFactor = 100
+$writer.Write($xpsDoc.GetFixedDocumentSequence(), $ticket)
+$xpsDoc.Close()
+`, strings.ReplaceAll(targetPrinter, `'`, `''`),
+		strings.ReplaceAll(filePath, `'`, `''`),
+		geom.Orientation,
+		geom.PaperName,
+		geom.PaperName,
+		geom.PaperName)
+	cmd := exec.CommandContext(ctx, "powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", psScript)
+	hideCmd(cmd)
+	return cmd.CombinedOutput()
 }
 
 // --- Print Watcher (Watches C:\Bridge\Print to send jobs to peer) ---

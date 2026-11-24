@@ -47,6 +47,8 @@ var (
 	mediaBoxRegex = regexp.MustCompile(`/(?:MediaBox|CropBox)\s*\[\s*([-\d\.]+)\s+([-\d\.]+)\s+([-\d\.]+)\s+([-\d\.]+)\s*\]`)
 	rotateRegex   = regexp.MustCompile(`/Rotate\s+(\d+)`)
 	pageTypeRegex = regexp.MustCompile(`/Type\s*/Page\b`)
+	pageCountRegex = regexp.MustCompile(`(?i)/Type\s*/Pages\b[^>]*\b/Count\s+(\d+)`)
+	pageCountAltRegex = regexp.MustCompile(`(?i)/Count\s+(\d+)\b[^>]*\b/Type\s*/Pages\b`)
 	fpageDimRegex = regexp.MustCompile(`(?i)<FixedPage[^>]*\bWidth\s*=\s*["']([\d\.]+)["'][^>]*\bHeight\s*=\s*["']([\d\.]+)["']`)
 	fpageAltRegex = regexp.MustCompile(`(?i)<FixedPage[^>]*\bHeight\s*=\s*["']([\d\.]+)["'][^>]*\bWidth\s*=\s*["']([\d\.]+)["']`)
 )
@@ -58,7 +60,7 @@ func DetectDocumentGeometry(filePath string) DocumentGeometry {
 		Format:      strings.ToLower(filepath.Ext(filePath)),
 		Orientation: "portrait",
 		PaperName:   "A4", // Sensible default for non-US regions
-		ScaleMode:   "shrink",
+		ScaleMode:   "noscale",
 		PageCount:   1,
 	}
 
@@ -132,7 +134,20 @@ func detectPDFGeometry(f *os.File, geom *DocumentGeometry) {
 		geom.HeightPt = h
 	}
 
-	// Count pages by counting /Type /Page matches across file
+	// Count pages: first check root /Pages /Count attribute for absolute accuracy
+	if cm := pageCountRegex.FindSubmatch(sample); len(cm) == 2 {
+		if c, err := strconv.Atoi(string(cm[1])); err == nil && c > 0 {
+			geom.PageCount = c
+			return
+		}
+	} else if cm := pageCountAltRegex.FindSubmatch(sample); len(cm) == 2 {
+		if c, err := strconv.Atoi(string(cm[1])); err == nil && c > 0 {
+			geom.PageCount = c
+			return
+		}
+	}
+
+	// Fallback: count individual /Type /Page objects in buffer
 	count := len(pageTypeRegex.FindAll(sample, -1))
 	if count > 0 {
 		geom.PageCount = count
@@ -239,22 +254,30 @@ func matchStandardPaper(shortPt, longPt float64) string {
 }
 
 // BuildPrintSettings constructs the SumatraPDF -print-settings arguments that guarantee
-// 100% 1:1 scale preservation, exact paper feed matching, correct orientation, and no margin clipping.
+// 100% 1:1 scale preservation, exact page count, exact paper feed matching, and correct orientation.
 func BuildPrintSettings(geom DocumentGeometry) string {
 	var settings []string
 
+	// 1. Explicit page range: strictly restricts printing to exact document pages,
+	// preventing hardware roller boundary overflow and eliminating trailing 4-5 page spilling.
+	if geom.PageCount > 0 {
+		settings = append(settings, fmt.Sprintf("1-%d", geom.PageCount))
+	}
+
+	// 2. Paper size matching document geometry
 	if geom.PaperName != "" {
 		settings = append(settings, fmt.Sprintf("paper=%s", geom.PaperName))
 	}
+
+	// 3. Orientation matching document geometry
 	if geom.Orientation != "" {
 		settings = append(settings, geom.Orientation)
 	}
 
-	// "shrink": Keeps the print at exact 100% scale without artificial resizing,
-	// while protecting against hardware roller boundary overflow that triggers 3-4 page spilling.
+	// 4. "noscale": Keeps the print at exact 100% 1:1 scale without down-scaling, centering distortion, or margin shifts
 	scale := geom.ScaleMode
 	if scale == "" {
-		scale = "shrink"
+		scale = "noscale"
 	}
 	settings = append(settings, scale)
 

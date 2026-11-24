@@ -65,7 +65,7 @@ func main() {
 
 	// 1. Version Mode
 	if *versionFlag {
-		fmt.Println("Bridge v2.1.0 (High-Fidelity Remote Printing Edition)")
+		fmt.Println("Bridge v2.2.0 (High-Fidelity 1:1 Scale & Multi-Device Sync Edition)")
 		return
 	}
 
@@ -352,9 +352,24 @@ func runUnifiedService(configPath string, headless bool) {
 		if trayMgr != nil {
 			trayMgr.SetPrintingState(fmt.Sprintf("Bridge: Sending print to %s...", peer.Name))
 		}
+
+		targetPeer := peer
+		if p := cfg.FindPeer(peer.Name); p != nil {
+			targetPeer = *p
+		} else if p := cfg.FindPeer(peer.IP); p != nil {
+			targetPeer = *p
+		}
+		targetURL := targetPeer.URL
+		if targetURL == "" && targetPeer.IP != "" {
+			targetURL = fmt.Sprintf("http://%s:%d", targetPeer.IP, cfg.ListenPort)
+		}
+		if targetURL == "" {
+			return fmt.Errorf("peer %s is not connected yet (no reachable URL or IP)", targetPeer.Name)
+		}
+
 		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 		defer cancel()
-		return printer.SendDirectPrint(ctx, peer.URL, cfg.AuthToken, filePath,
+		return printer.SendDirectPrint(ctx, targetURL, cfg.AuthToken, filePath,
 			"X-Bridge-Node-Name", cfg.GetNodeName(),
 			"X-Bridge-Origin", cfg.GetNodeName(),
 		)
@@ -373,7 +388,7 @@ func runUnifiedService(configPath string, headless bool) {
 	multiSpooler.OnJobFailed = func(peer config.PeerDevice, fileName string, err error) {
 		if trayMgr != nil {
 			trayMgr.ShowBalloon("Print Error", fmt.Sprintf("Failed to print on %s: %v", peer.Name, err))
-			trayMgr.UpdateNetworkStatus(cfg.GetNodeName(), cfg.GetPeers())
+			trayMgr.RestoreNetworkStatus()
 		}
 	}
 

@@ -3661,8 +3661,8 @@ trailer
 	if !strings.Contains(logStr, "portrait") {
 		t.Errorf("Expected 'portrait' in SumatraPDF args, got: %s", logStr)
 	}
-	if !strings.Contains(logStr, "shrink") {
-		t.Errorf("Expected 'shrink' in SumatraPDF args to preserve 100%% scale, got: %s", logStr)
+	if !strings.Contains(logStr, "noscale") {
+		t.Errorf("Expected 'noscale' in SumatraPDF args to preserve 100%% scale, got: %s", logStr)
 	}
 
 	// 2. Test Landscape Letter Document
