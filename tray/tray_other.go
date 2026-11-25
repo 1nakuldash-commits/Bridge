@@ -23,53 +23,19 @@ func (tm *TrayManager) Start() error {
 	return nil
 }
 
-// Stop stub.
-func (tm *TrayManager) Stop() {}
-
-// SetState stub.
-func (tm *TrayManager) SetState(state TrayState, tooltip string) {
+// Stop marks the tray manager stopped.
+func (tm *TrayManager) Stop() {
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
-	tm.currentState = state
-	tm.currentTip = tooltip
+	tm.stopped = true
 }
 
 // ShowBalloon stub.
 func (tm *TrayManager) ShowBalloon(title, message string) {}
 
-// UpdateNames stub.
-func (tm *TrayManager) UpdateNames(nodeName, peerName string) {
-	tm.mu.Lock()
-	defer tm.mu.Unlock()
-	tm.nodeName = nodeName
-	tm.peerName = peerName
-}
+func (tm *TrayManager) modifyNotifyLocked() {}
 
-// UpdateNetworkStatus stub.
-func (tm *TrayManager) UpdateNetworkStatus(nodeName string, peers []config.PeerDevice) {
-	tm.mu.Lock()
-	defer tm.mu.Unlock()
-	tm.nodeName = nodeName
-	tm.peers = peers
-}
-
-// FlashComplete stub.
-func (tm *TrayManager) FlashComplete(title, message string) {}
-
-// FlashPrintComplete stub.
-func (tm *TrayManager) FlashPrintComplete(title, message string) {}
-
-// FlashSyncComplete stub.
-func (tm *TrayManager) FlashSyncComplete(title, message string) {}
-
-// SetPrintingState stub.
-func (tm *TrayManager) SetPrintingState(tooltip string) {}
-
-// SetSyncingState stub.
-func (tm *TrayManager) SetSyncingState(tooltip string) {}
-
-// RestoreNetworkStatus stub.
-func (tm *TrayManager) RestoreNetworkStatus() {}
+func (tm *TrayManager) showBalloonLocked(title, message string) {}
 
 // OpenFilePicker stub.
 func OpenFilePicker(title string) (string, error) {
