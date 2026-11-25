@@ -3,6 +3,7 @@
 package installer
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"os/exec"
@@ -55,6 +56,15 @@ func IsElevated() bool {
 	return token.IsElevated()
 }
 
+// formatElevatedArgs escapes each argument per Windows command-line rules so paths with spaces/quotes survive UAC relaunch.
+func formatElevatedArgs(args []string) string {
+	escaped := make([]string, len(args))
+	for i, a := range args {
+		escaped[i] = windows.EscapeArg(a)
+	}
+	return strings.Join(escaped, " ")
+}
+
 // SelfElevate relaunches the current executable with administrative privileges (UAC prompt).
 func SelfElevate(args []string) error {
 	exe, err := os.Executable()
@@ -75,7 +85,7 @@ func SelfElevate(args []string) error {
 
 	var argPtr *uint16
 	if len(args) > 0 {
-		argsStr := strings.Join(args, " ")
+		argsStr := formatElevatedArgs(args)
 		argPtr, _ = windows.UTF16PtrFromString(argsStr)
 	}
 
@@ -217,7 +227,7 @@ func InstallSumatraPDF() (string, error) {
 		_, _ = cmd.CombinedOutput()
 		for i := 0; i < 5; i++ {
 			if found := printer.FindSumatraPDF(); found != "" {
-				_ = printer.CreateSumatraShortcut(found)
+				removeSumatraShortcuts()
 				return found, nil
 			}
 			time.Sleep(1 * time.Second)
@@ -225,12 +235,47 @@ func InstallSumatraPDF() (string, error) {
 		return "", fmt.Errorf("failed to install SumatraPDF: %w", err)
 	}
 
-	_ = printer.CreateSumatraShortcut(path)
+	removeSumatraShortcuts()
 	return path, nil
 }
 
-// GetAllDesktopDirs collects all valid desktop directories on the system.
-func GetAllDesktopDirs() []string {
+func expandDesktopRegistryPath(val string) string {
+	val = strings.TrimSpace(val)
+	if val == "" {
+		return ""
+	}
+	if exp, err := registry.ExpandString(val); err == nil && strings.TrimSpace(exp) != "" {
+		val = exp
+	}
+	return os.ExpandEnv(val)
+}
+
+func isExistingDir(p string) bool {
+	if strings.TrimSpace(p) == "" {
+		return false
+	}
+	info, err := os.Stat(filepath.Clean(p))
+	return err == nil && info.IsDir()
+}
+
+func readRegistryDesktopDir(subkey string) string {
+	k, err := registry.OpenKey(registry.CURRENT_USER, subkey, registry.QUERY_VALUE)
+	if err != nil {
+		return ""
+	}
+	defer k.Close()
+	val, _, err := k.GetStringValue("Desktop")
+	if err != nil || strings.TrimSpace(val) == "" {
+		return ""
+	}
+	expanded := filepath.Clean(expandDesktopRegistryPath(val))
+	if isExistingDir(expanded) {
+		return expanded
+	}
+	return ""
+}
+
+func collectAllDesktopDirs() []string {
 	desktopMap := make(map[string]bool)
 	var dirs []string
 
@@ -240,40 +285,26 @@ func GetAllDesktopDirs() []string {
 		}
 		clean := filepath.Clean(d)
 		low := strings.ToLower(clean)
-		if _, err := os.Stat(clean); err == nil && !desktopMap[low] {
+		if isExistingDir(clean) && !desktopMap[low] {
 			desktopMap[low] = true
 			dirs = append(dirs, clean)
 		}
 	}
 
-	// 1. Current user's desktop and OneDrive desktop
+	// 1. User Shell Folders & Shell Folders registry keys
+	addDir(readRegistryDesktopDir(`Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders`))
+	addDir(readRegistryDesktopDir(`Software\Microsoft\Windows\CurrentVersion\Explorer\Shell Folders`))
+
+	// 2. Current user's desktop and OneDrive desktop
 	if u := os.Getenv("USERPROFILE"); u != "" {
 		addDir(filepath.Join(u, "Desktop"))
 		addDir(filepath.Join(u, "OneDrive", "Desktop"))
 	}
 
-	// 2. Public Desktop
+	// 3. Public Desktop
 	addDir(`C:\Users\Public\Desktop`)
 
-	// 3. User Shell Folders registry key
-	k, err := registry.OpenKey(registry.CURRENT_USER, `Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders`, registry.QUERY_VALUE)
-	if err == nil {
-		if val, _, err := k.GetStringValue("Desktop"); err == nil && val != "" {
-			addDir(os.ExpandEnv(val))
-		}
-		k.Close()
-	}
-
-	// 4. Current user Shell Folders
-	k2, err := registry.OpenKey(registry.CURRENT_USER, `Software\Microsoft\Windows\CurrentVersion\Explorer\Shell Folders`, registry.QUERY_VALUE)
-	if err == nil {
-		if val, _, err := k2.GetStringValue("Desktop"); err == nil && val != "" {
-			addDir(os.ExpandEnv(val))
-		}
-		k2.Close()
-	}
-
-	// 5. Scan C:\Users for interactive user profiles
+	// 4. Scan C:\Users for interactive user profiles
 	entries, err := os.ReadDir(`C:\Users`)
 	if err == nil {
 		ignored := map[string]bool{
@@ -291,6 +322,59 @@ func GetAllDesktopDirs() []string {
 		}
 	}
 
+	return dirs
+}
+
+// GetPrimaryDesktopDir resolves the single active Windows Desktop directory for the current user.
+func GetPrimaryDesktopDir() string {
+	if d := readRegistryDesktopDir(`Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders`); d != "" {
+		return d
+	}
+	if d := readRegistryDesktopDir(`Software\Microsoft\Windows\CurrentVersion\Explorer\Shell Folders`); d != "" {
+		return d
+	}
+	if u := os.Getenv("USERPROFILE"); u != "" {
+		for _, cand := range []string{
+			filepath.Join(u, "Desktop"),
+			filepath.Join(u, "OneDrive", "Desktop"),
+		} {
+			clean := filepath.Clean(cand)
+			if isExistingDir(clean) {
+				return clean
+			}
+		}
+	}
+	if all := collectAllDesktopDirs(); len(all) > 0 {
+		return all[0]
+	}
+	return ""
+}
+
+// GetAllDesktopDirs collects all valid desktop directories on the system, placing GetPrimaryDesktopDir() at index 0.
+func GetAllDesktopDirs() []string {
+	primary := GetPrimaryDesktopDir()
+	rest := collectAllDesktopDirs()
+
+	desktopMap := make(map[string]bool)
+	var dirs []string
+	addDir := func(d string) {
+		if strings.TrimSpace(d) == "" {
+			return
+		}
+		clean := filepath.Clean(d)
+		low := strings.ToLower(clean)
+		if isExistingDir(clean) && !desktopMap[low] {
+			desktopMap[low] = true
+			dirs = append(dirs, clean)
+		}
+	}
+
+	if primary != "" {
+		addDir(primary)
+	}
+	for _, d := range rest {
+		addDir(d)
+	}
 	return dirs
 }
 
@@ -769,11 +853,97 @@ func ReleaseServiceLock() {
 	}
 }
 
+const bridgeRegSubkey = `Software\BridgeApp`
+
+func isBridgeLogonTaskCurrent() bool {
+	sysRoot := os.Getenv("SystemRoot")
+	if sysRoot == "" {
+		sysRoot = `C:\Windows`
+	}
+	taskXMLPath := filepath.Join(sysRoot, "System32", "Tasks", LogonTaskName)
+	raw, err := os.ReadFile(taskXMLPath)
+	if err != nil || len(raw) == 0 {
+		return false
+	}
+	clean := strings.ToLower(string(bytes.ReplaceAll(raw, []byte{0}, nil)))
+	return strings.Contains(clean, strings.ToLower(TargetExe)) &&
+		strings.Contains(clean, "-autostart") &&
+		strings.Contains(clean, "<logontrigger>") &&
+		strings.Contains(clean, "<runlevel>highestavailable</runlevel>") &&
+		strings.Contains(clean, "<logontype>interactivetoken</logontype>")
+}
+
+func removeHKCURunBridgeEntries() {
+	k, err := registry.OpenKey(registry.CURRENT_USER, `Software\Microsoft\Windows\CurrentVersion\Run`, registry.QUERY_VALUE|registry.SET_VALUE)
+	if err != nil {
+		return
+	}
+	defer k.Close()
+
+	if valNames, err := k.ReadValueNames(-1); err == nil {
+		for _, vn := range valNames {
+			if strings.Contains(strings.ToLower(vn), "bridge") {
+				_ = k.DeleteValue(vn)
+				continue
+			}
+			if val, _, err := k.GetStringValue(vn); err == nil && strings.Contains(strings.ToLower(val), "bridge.exe") {
+				_ = k.DeleteValue(vn)
+			}
+		}
+	}
+}
+
+func setStartupModeMarker(mode string) {
+	k, _, err := registry.CreateKey(registry.CURRENT_USER, bridgeRegSubkey, registry.SET_VALUE)
+	if err == nil {
+		_ = k.SetStringValue("StartupMode", mode)
+		k.Close()
+	}
+}
+
+func clearStartupModeMarker() {
+	_ = registry.DeleteKey(registry.CURRENT_USER, bridgeRegSubkey)
+}
+
+func hasBridgeLogonMarker() bool {
+	k, err := registry.OpenKey(registry.CURRENT_USER, bridgeRegSubkey, registry.QUERY_VALUE)
+	if err != nil {
+		return false
+	}
+	defer k.Close()
+	val, _, err := k.GetStringValue("StartupMode")
+	return err == nil && strings.EqualFold(strings.TrimSpace(val), LogonTaskName)
+}
+
 // RegisterInteractiveStartup ensures bridge.exe starts silently in Session 1 at user logon.
-// It performs only fast in-process HKCU Run registration (no heavy PowerShell or schtasks sweeps)
-// so normal boot and dashboard launches stay instantaneous. Full legacy startup purging runs
-// via UnregisterInteractiveStartup during explicit -install, -setup, -upgrade, or -uninstall flows.
+// When elevated, it registers the interactive elevated logon task BridgeAppLogon (so virtual
+// printers auto-register silently on peer changes after reboots) and removes HKCU\Run\BridgeApp
+// to avoid dual-launch races, falling back cleanly to HKCU\Run if schtasks fails.
+// Non-elevated calls stay fast and in-process (<1ms).
 func RegisterInteractiveStartup() error {
+	if IsElevated() {
+		if isBridgeLogonTaskCurrent() {
+			removeHKCURunBridgeEntries()
+			setStartupModeMarker(LogonTaskName)
+			return nil
+		}
+
+		trCmd := fmt.Sprintf(`"%s" -autostart`, TargetExe)
+		cmd := exec.Command("schtasks", "/Create", "/TN", LogonTaskName, "/TR", trCmd, "/SC", "ONLOGON", "/RL", "HIGHEST", "/IT", "/F")
+		hideCmd(cmd)
+		if err := cmd.Run(); err == nil {
+			removeHKCURunBridgeEntries()
+			setStartupModeMarker(LogonTaskName)
+			return nil
+		}
+		// Fall back to HKCU\Run if schtasks creation is blocked by policy
+		clearStartupModeMarker()
+	} else if hasBridgeLogonMarker() {
+		// Elevated logon task is already registered; keep HKCU\Run clean so two instances never race
+		removeHKCURunBridgeEntries()
+		return nil
+	}
+
 	runCmd := fmt.Sprintf(`"%s" -autostart`, TargetExe)
 
 	k, _, err := registry.CreateKey(registry.CURRENT_USER, `Software\Microsoft\Windows\CurrentVersion\Run`, registry.QUERY_VALUE|registry.SET_VALUE)
@@ -805,22 +975,10 @@ func RegisterInteractiveStartup() error {
 
 // UnregisterInteractiveStartup cleanly removes startup entries across all possible locations.
 func UnregisterInteractiveStartup() {
+	clearStartupModeMarker()
+
 	// 1. In-process HKCU Run Key clean
-	k, err := registry.OpenKey(registry.CURRENT_USER, `Software\Microsoft\Windows\CurrentVersion\Run`, registry.QUERY_VALUE|registry.SET_VALUE)
-	if err == nil {
-		if valNames, err := k.ReadValueNames(-1); err == nil {
-			for _, vn := range valNames {
-				if strings.Contains(strings.ToLower(vn), "bridge") {
-					_ = k.DeleteValue(vn)
-					continue
-				}
-				if val, _, err := k.GetStringValue(vn); err == nil && strings.Contains(strings.ToLower(val), "bridge.exe") {
-					_ = k.DeleteValue(vn)
-				}
-			}
-		}
-		k.Close()
-	}
+	removeHKCURunBridgeEntries()
 
 	// 2. In-process HKLM Run Key clean (if process is elevated)
 	kAdmin, err := registry.OpenKey(registry.LOCAL_MACHINE, `Software\Microsoft\Windows\CurrentVersion\Run`, registry.QUERY_VALUE|registry.SET_VALUE)
@@ -909,8 +1067,10 @@ Get-ScheduledTask -ErrorAction SilentlyContinue | Where-Object {
 	hideCmd(psCmd)
 	_ = psCmd.Run()
 
-	// 5. Legacy Session 0 Scheduled Task (purge)
-	cmdSch := exec.Command("schtasks", "/Delete", "/TN", TaskName, "/F")
-	hideCmd(cmdSch)
-	_ = cmdSch.Run()
+	// 5. Explicit Task Scheduler removals (Interactive Logon task + Legacy Session 0 task)
+	for _, tn := range []string{LogonTaskName, TaskName} {
+		cmdSch := exec.Command("schtasks", "/Delete", "/TN", tn, "/F")
+		hideCmd(cmdSch)
+		_ = cmdSch.Run()
+	}
 }

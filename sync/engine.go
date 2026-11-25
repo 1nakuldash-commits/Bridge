@@ -38,10 +38,17 @@ type SyncEngine struct {
 	// In-flight processing deduplication
 	inFlightMu        sync.Mutex
 	inFlight          map[string]bool
+	inFlightDirty     map[string]bool
 	inFlightDeletesMu sync.Mutex
 	inFlightDeletes   map[string]bool
 	reconcileMu       sync.Mutex
 	reconcilingPeer   map[string]bool
+	reconcileDone     map[string]chan struct{}
+
+	stopMu    sync.RWMutex
+	stopped   bool
+	watcherMu sync.Mutex
+	watcher   *fsnotify.Watcher
 
 	OnSyncStarted   func(relPath string)
 	OnSyncCompleted func(relPath string)
@@ -77,8 +84,10 @@ func NewSyncEngine(sharedDir, initialPeerURL, authToken string, stateMgr *StateM
 		ctx:             ctx,
 		cancel:          cancel,
 		inFlight:        make(map[string]bool),
+		inFlightDirty:   make(map[string]bool),
 		inFlightDeletes: make(map[string]bool),
 		reconcilingPeer: make(map[string]bool),
+		reconcileDone:   make(map[string]chan struct{}),
 	}
 
 	if clean := strings.TrimRight(strings.TrimSpace(initialPeerURL), "/"); clean != "" {
@@ -86,6 +95,37 @@ func NewSyncEngine(sharedDir, initialPeerURL, authToken string, stateMgr *StateM
 	}
 
 	return se
+}
+
+func (se *SyncEngine) spawnTracked(fn func()) bool {
+	se.stopMu.RLock()
+	if se.stopped || se.ctx.Err() != nil {
+		se.stopMu.RUnlock()
+		return false
+	}
+	se.wg.Add(1)
+	se.stopMu.RUnlock()
+
+	go func() {
+		defer se.wg.Done()
+		fn()
+	}()
+	return true
+}
+
+func (se *SyncEngine) isInFlight(cleanRel string) bool {
+	se.inFlightMu.Lock()
+	defer se.inFlightMu.Unlock()
+	return se.inFlight[cleanRel]
+}
+
+func (se *SyncEngine) removeWatcher(dirPath string) {
+	se.watcherMu.Lock()
+	w := se.watcher
+	se.watcherMu.Unlock()
+	if w != nil {
+		_ = w.Remove(dirPath)
+	}
 }
 
 // Start begins watching the shared directory and running the periodic scan.
@@ -104,6 +144,10 @@ func (se *SyncEngine) Start() error {
 		return fmt.Errorf("failed to watch shared directory: %w", err)
 	}
 
+	se.watcherMu.Lock()
+	se.watcher = watcher
+	se.watcherMu.Unlock()
+
 	se.wg.Add(1)
 	go se.watchLoop(watcher)
 
@@ -116,7 +160,10 @@ func (se *SyncEngine) Start() error {
 
 // Stop halts the sync engine gracefully.
 func (se *SyncEngine) Stop() {
+	se.stopMu.Lock()
+	se.stopped = true
 	se.cancel()
+	se.stopMu.Unlock()
 	se.wg.Wait()
 	log.Printf("[SyncEngine] Stopped.")
 }
@@ -159,7 +206,9 @@ func (se *SyncEngine) addWatchersAndScanDir(watcher *fsnotify.Watcher, root stri
 				return nil
 			}
 		}
-		go se.handleLocalFileChange(relPath)
+		se.spawnTracked(func() {
+			se.handleLocalFileEvent(relPath, true)
+		})
 		return nil
 	})
 }
@@ -167,7 +216,14 @@ func (se *SyncEngine) addWatchersAndScanDir(watcher *fsnotify.Watcher, root stri
 // watchLoop handles fsnotify events.
 func (se *SyncEngine) watchLoop(watcher *fsnotify.Watcher) {
 	defer se.wg.Done()
-	defer watcher.Close()
+	defer func() {
+		se.watcherMu.Lock()
+		if se.watcher == watcher {
+			se.watcher = nil
+		}
+		se.watcherMu.Unlock()
+		watcher.Close()
+	}()
 
 	for {
 		select {
@@ -188,27 +244,33 @@ func (se *SyncEngine) watchLoop(watcher *fsnotify.Watcher) {
 				if err == nil && fi.IsDir() {
 					// Run watcher.Add outside the event-reader loop so fsnotify's
 					// Windows readDirChangesW cannot deadlock on an unbuffered sendEvent.
-					se.wg.Add(1)
-					go func(dirPath string) {
-						defer se.wg.Done()
-						_ = se.addWatchersAndScanDir(watcher, dirPath)
-					}(event.Name)
+					se.spawnTracked(func() {
+						_ = se.addWatchersAndScanDir(watcher, event.Name)
+					})
 					continue
 				}
 			}
 
 			if event.Has(fsnotify.Remove) || event.Has(fsnotify.Rename) {
 				relPath, err := filepath.Rel(se.sharedDir, event.Name)
-				if err == nil && !strings.HasPrefix(relPath, "..") {
-					go se.handleLocalFileDeletion(relPath)
+				if err == nil && !strings.HasPrefix(relPath, "..") && relPath != "." {
+					se.spawnTracked(func() {
+						se.handleLocalFileDeletion(relPath)
+					})
 				}
 				continue
 			}
 
 			if event.Has(fsnotify.Create) || event.Has(fsnotify.Write) {
+				if fi, err := os.Stat(event.Name); err == nil && fi.IsDir() {
+					continue
+				}
 				relPath, err := filepath.Rel(se.sharedDir, event.Name)
-				if err == nil && !strings.HasPrefix(relPath, "..") {
-					go se.handleLocalFileChange(relPath)
+				if err == nil && !strings.HasPrefix(relPath, "..") && relPath != "." {
+					isCreate := event.Has(fsnotify.Create)
+					se.spawnTracked(func() {
+						se.handleLocalFileEvent(relPath, isCreate)
+					})
 				}
 			}
 
@@ -323,7 +385,9 @@ func (se *SyncEngine) scanDirectory() {
 			}
 		}
 
-		go se.handleLocalFileChange(relPath)
+		se.spawnTracked(func() {
+			se.handleLocalFileEvent(relPath, false)
+		})
 		return nil
 	})
 
@@ -333,7 +397,10 @@ func (se *SyncEngine) scanDirectory() {
 		info, err := os.Stat(fullPath)
 		if os.IsNotExist(err) {
 			if !rec.Deleted {
-				go se.handleLocalFileDeletion(relPath)
+				rp := relPath
+				se.spawnTracked(func() {
+					se.handleLocalFileDeletion(rp)
+				})
 			}
 		} else if err == nil && !info.IsDir() {
 			if rec.Deleted && info.ModTime().UnixNano() <= rec.ModTime {
@@ -341,6 +408,103 @@ func (se *SyncEngine) scanDirectory() {
 				_ = RobustRemove(fullPath)
 			}
 		}
+	}
+}
+
+type localScanDelta struct {
+	updated []FileRecord
+	deleted []FileRecord
+}
+
+func (se *SyncEngine) scanDirectorySync() localScanDelta {
+	var delta localScanDelta
+
+	_ = filepath.Walk(se.sharedDir, func(path string, info os.FileInfo, err error) error {
+		if se.ctx.Err() != nil {
+			return filepath.SkipAll
+		}
+		if err != nil || info.IsDir() {
+			return nil
+		}
+
+		if strings.HasSuffix(path, ".part") || strings.HasSuffix(path, ".tmp") {
+			return nil
+		}
+
+		relPath, err := filepath.Rel(se.sharedDir, path)
+		if err != nil || strings.HasPrefix(relPath, "..") || relPath == "." {
+			return nil
+		}
+		cleanRel := filepath.Clean(relPath)
+
+		if se.isInFlight(cleanRel) {
+			return nil
+		}
+
+		diskModTime := info.ModTime().UnixNano()
+		rec, exists := se.stateMgr.Get(cleanRel)
+		if exists {
+			if rec.Deleted {
+				if diskModTime <= rec.ModTime {
+					_ = RobustRemove(path)
+					return nil
+				}
+			} else if rec.Size == info.Size() && rec.ModTime == diskModTime {
+				return nil
+			}
+		}
+
+		hash, size, hashErr := ComputeHash(path)
+		if hashErr != nil {
+			return nil
+		}
+
+		newRec := FileRecord{
+			RelPath: cleanRel,
+			Hash:    hash,
+			Size:    size,
+			ModTime: diskModTime,
+		}
+		if err := se.stateMgr.Set(cleanRel, newRec); err == nil {
+			delta.updated = append(delta.updated, newRec)
+		}
+		return nil
+	})
+
+	for relPath, rec := range se.stateMgr.GetAll() {
+		if se.ctx.Err() != nil {
+			break
+		}
+		fullPath := filepath.Join(se.sharedDir, filepath.FromSlash(relPath))
+		info, err := os.Stat(fullPath)
+		if os.IsNotExist(err) {
+			if !rec.Deleted && !se.isInFlight(filepath.Clean(relPath)) {
+				deleteTime := time.Now().UnixNano()
+				_ = se.stateMgr.MarkAsDeleted(relPath, deleteTime)
+				delta.deleted = append(delta.deleted, FileRecord{
+					RelPath: filepath.Clean(relPath),
+					ModTime: deleteTime,
+					Deleted: true,
+				})
+			}
+		} else if err == nil && !info.IsDir() {
+			if rec.Deleted && info.ModTime().UnixNano() <= rec.ModTime {
+				_ = RobustRemove(fullPath)
+			}
+		}
+	}
+
+	return delta
+}
+
+func sleepWithContext(ctx context.Context, d time.Duration) error {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-t.C:
+		return nil
 	}
 }
 
@@ -353,10 +517,8 @@ func WaitForStableFile(ctx context.Context, fullPath string) (os.FileInfo, error
 	var lastSize int64 = -1
 
 	for {
-		select {
-		case <-ctx.Done():
+		if ctx.Err() != nil {
 			return nil, ctx.Err()
-		default:
 		}
 
 		if time.Now().After(deadline) {
@@ -368,15 +530,23 @@ func WaitForStableFile(ctx context.Context, fullPath string) (os.FileInfo, error
 			if os.IsNotExist(err) {
 				return nil, err
 			}
-			time.Sleep(100 * time.Millisecond)
+			if err := sleepWithContext(ctx, 100*time.Millisecond); err != nil {
+				return nil, err
+			}
 			continue
+		}
+
+		if info.IsDir() {
+			return info, nil
 		}
 
 		// Try opening for read to ensure no exclusive locks
 		f, err := OpenSharedFileForRead(fullPath)
 		if err != nil {
 			// File is still being written or locked
-			time.Sleep(200 * time.Millisecond)
+			if err := sleepWithContext(ctx, 200*time.Millisecond); err != nil {
+				return nil, err
+			}
 			continue
 		}
 		_ = f.Close()
@@ -388,64 +558,103 @@ func WaitForStableFile(ctx context.Context, fullPath string) (os.FileInfo, error
 		}
 
 		lastSize = currentSize
-		time.Sleep(checkInterval)
+		if err := sleepWithContext(ctx, checkInterval); err != nil {
+			return nil, err
+		}
 	}
 }
 
 func (se *SyncEngine) handleLocalFileChange(relPath string) {
-	cleanRel := filepath.Clean(relPath)
+	se.handleLocalFileEvent(relPath, false)
+}
+
+func (se *SyncEngine) handleLocalFileEvent(relPath string, fromCreate bool) {
+	cleanRel := filepath.Clean(filepath.FromSlash(relPath))
+	if cleanRel == "" || cleanRel == "." || strings.HasPrefix(cleanRel, "..") || filepath.IsAbs(cleanRel) {
+		return
+	}
+
 	se.inFlightMu.Lock()
 	if se.inFlight[cleanRel] {
+		se.inFlightDirty[cleanRel] = true
 		se.inFlightMu.Unlock()
 		return
 	}
 	se.inFlight[cleanRel] = true
+	delete(se.inFlightDirty, cleanRel)
 	se.inFlightMu.Unlock()
 
 	defer func() {
 		se.inFlightMu.Lock()
 		delete(se.inFlight, cleanRel)
+		delete(se.inFlightDirty, cleanRel)
 		se.inFlightMu.Unlock()
 	}()
 
-	fullPath := filepath.Join(se.sharedDir, cleanRel)
-
-	info, err := WaitForStableFile(se.ctx, fullPath)
-	if err != nil {
-		if os.IsNotExist(err) {
-			se.handleLocalFileDeletion(cleanRel)
-		}
-		return
-	}
-
-	// Zombie file defense: if tombstone exists and file on disk is not newer than tombstone,
-	// do NOT upload; purge zombie file from disk!
-	if rec, exists := se.stateMgr.Get(cleanRel); exists && rec.Deleted {
-		if info.ModTime().UnixNano() <= rec.ModTime {
-			log.Printf("[SyncEngine] Suppressing upload of zombie deleted file %s (purging from disk)", cleanRel)
-			_ = RobustRemove(fullPath)
+	for {
+		if se.ctx.Err() != nil {
 			return
 		}
-		log.Printf("[SyncEngine] Detected genuine re-creation of file %s after deletion", cleanRel)
-	}
 
-	hash, size, err := ComputeHash(fullPath)
-	if err != nil {
-		log.Printf("[SyncEngine] Failed to compute hash for %s: %v", relPath, err)
-		return
-	}
+		fullPath := filepath.Join(se.sharedDir, cleanRel)
 
-	// Loop Prevention: if already synced with this hash, suppress re-upload!
-	if se.stateMgr.IsSynced(relPath, hash) {
-		return
-	}
+		info, err := WaitForStableFile(se.ctx, fullPath)
+		if err != nil {
+			if os.IsNotExist(err) {
+				if rec, exists := se.stateMgr.Get(cleanRel); exists && !rec.Deleted {
+					se.handleLocalFileDeletion(cleanRel)
+				}
+			}
+			return
+		}
+		if info.IsDir() {
+			return
+		}
 
-	log.Printf("[SyncEngine] Detected modified/new file %s (size: %d, sha256: %s)", relPath, size, hash[:8])
-	se.broadcastToPeers(relPath, fullPath, hash, size, info.ModTime().UnixNano())
+		uploadModTime := info.ModTime().UnixNano()
+
+		// Zombie file defense: if tombstone exists and file on disk is not newer than tombstone,
+		// purge zombie on background scans, but honor genuine local create/rename events so
+		// moving/renaming directories back into place doesn't destroy user files.
+		if rec, exists := se.stateMgr.Get(cleanRel); exists && rec.Deleted {
+			if uploadModTime <= rec.ModTime {
+				if !fromCreate {
+					log.Printf("[SyncEngine] Suppressing upload of zombie deleted file %s (purging from disk)", cleanRel)
+					_ = RobustRemove(fullPath)
+					return
+				}
+				uploadModTime = rec.ModTime + int64(time.Millisecond)
+				mtime := time.Unix(0, uploadModTime)
+				_ = os.Chtimes(fullPath, mtime, mtime)
+			}
+			log.Printf("[SyncEngine] Detected genuine re-creation of file %s after deletion", cleanRel)
+		}
+
+		hash, size, err := ComputeHash(fullPath)
+		if err != nil {
+			log.Printf("[SyncEngine] Failed to compute hash for %s: %v", cleanRel, err)
+		} else if !se.stateMgr.IsSynced(cleanRel, hash) {
+			log.Printf("[SyncEngine] Detected modified/new file %s (size: %d, sha256: %s)", cleanRel, size, hash[:8])
+			se.broadcastToPeers(cleanRel, fullPath, hash, size, uploadModTime)
+		}
+
+		se.inFlightMu.Lock()
+		dirty := se.inFlightDirty[cleanRel]
+		delete(se.inFlightDirty, cleanRel)
+		if !dirty {
+			se.inFlightMu.Unlock()
+			return
+		}
+		se.inFlightMu.Unlock()
+		fromCreate = false
+	}
 }
 
 func (se *SyncEngine) handleLocalFileDeletion(relPath string) {
-	cleanRel := filepath.Clean(relPath)
+	cleanRel := filepath.Clean(filepath.FromSlash(relPath))
+	if cleanRel == "" || cleanRel == "." || strings.HasPrefix(cleanRel, "..") || filepath.IsAbs(cleanRel) {
+		return
+	}
 	fullPath := filepath.Join(se.sharedDir, cleanRel)
 
 	// Verify file is genuinely deleted on disk
@@ -453,14 +662,22 @@ func (se *SyncEngine) handleLocalFileDeletion(relPath string) {
 		return
 	}
 
+	// Release any directory watch handle for removed/renamed folders
+	se.removeWatcher(fullPath)
+
 	// Check if this path was a directory containing tracked files
 	normSlash := filepath.ToSlash(cleanRel)
 	hasPrefixFiles := false
-	for k := range se.stateMgr.GetAll() {
+	for k, childRec := range se.stateMgr.GetAll() {
 		kSlash := filepath.ToSlash(k)
 		if strings.HasPrefix(kSlash, normSlash+"/") {
 			hasPrefixFiles = true
-			go se.handleLocalFileDeletion(k)
+			if !childRec.Deleted {
+				childPath := k
+				se.spawnTracked(func() {
+					se.handleLocalFileDeletion(childPath)
+				})
+			}
 		}
 	}
 	if hasPrefixFiles {
@@ -481,8 +698,10 @@ func (se *SyncEngine) handleLocalFileDeletion(relPath string) {
 		se.inFlightDeletesMu.Unlock()
 	}()
 
-	// If already recorded as deleted, suppress re-broadcast
-	if rec, exists := se.stateMgr.Get(cleanRel); exists && rec.Deleted {
+	// Only tombstone and propagate paths that were actually tracked as active files.
+	// This prevents empty directories or untracked transient rename paths from leaving stale tombstones.
+	rec, exists := se.stateMgr.Get(cleanRel)
+	if !exists || rec.Deleted {
 		return
 	}
 
@@ -534,7 +753,10 @@ func (se *SyncEngine) broadcastDeleteToPeers(relPath string, modTime int64, excl
 		if normExclude != "" && normalizeHostPort(peer) == normExclude {
 			continue
 		}
-		go se.uploadDeleteToPeerWithRetry(peer, relPath, modTime)
+		p := peer
+		se.spawnTracked(func() {
+			se.uploadDeleteToPeerWithRetry(p, relPath, modTime)
+		})
 	}
 }
 
@@ -634,12 +856,15 @@ func (se *SyncEngine) broadcastToPeers(relPath, fullPath, hash string, size, mod
 		}(peer)
 	}
 
-	go func() {
+	finish := func() {
 		wg.Wait()
 		if se.OnSyncCompleted != nil {
 			se.OnSyncCompleted(relPath)
 		}
-	}()
+	}
+	if !se.spawnTracked(finish) {
+		finish()
+	}
 }
 
 func (se *SyncEngine) uploadToPeerWithRetry(peerURL, relPath, fullPath, hash string, size, modTime int64) {
@@ -677,6 +902,76 @@ func (se *SyncEngine) uploadToPeerWithRetry(peerURL, relPath, fullPath, hash str
 	}
 }
 
+// ResyncNow synchronously scans the shared directory for local changes and
+// reconciles inventory across all configured peers.
+func (se *SyncEngine) ResyncNow() {
+	se.stopMu.RLock()
+	if se.stopped || se.ctx.Err() != nil {
+		se.stopMu.RUnlock()
+		return
+	}
+	se.wg.Add(1)
+	se.stopMu.RUnlock()
+	defer se.wg.Done()
+
+	se.scanDirectorySync()
+
+	peers := se.getPeerURLs()
+	if len(peers) == 0 {
+		return
+	}
+
+	var wg sync.WaitGroup
+	for _, peer := range peers {
+		cleanPeer := strings.TrimRight(strings.TrimSpace(peer), "/")
+		if cleanPeer == "" {
+			continue
+		}
+		wg.Add(1)
+		go func(p string) {
+			defer wg.Done()
+			se.waitAndReconcilePeer(p, false)
+		}(cleanPeer)
+	}
+	wg.Wait()
+}
+
+func (se *SyncEngine) waitAndReconcilePeer(cleanPeer string, runScan bool) {
+	for {
+		if se.ctx.Err() != nil {
+			return
+		}
+		se.reconcileMu.Lock()
+		if se.reconcilingPeer[cleanPeer] {
+			doneCh := se.reconcileDone[cleanPeer]
+			se.reconcileMu.Unlock()
+			if doneCh != nil {
+				select {
+				case <-doneCh:
+				case <-se.ctx.Done():
+					return
+				}
+			} else {
+				return
+			}
+			continue
+		}
+		doneCh := make(chan struct{})
+		se.reconcilingPeer[cleanPeer] = true
+		se.reconcileDone[cleanPeer] = doneCh
+		se.reconcileMu.Unlock()
+
+		se.executeReconcilePeer(cleanPeer, runScan)
+
+		se.reconcileMu.Lock()
+		delete(se.reconcilingPeer, cleanPeer)
+		delete(se.reconcileDone, cleanPeer)
+		close(doneCh)
+		se.reconcileMu.Unlock()
+		return
+	}
+}
+
 // ReconcileWithPeer reconciles inventory with a peer to push missed files, pull remote files, and synchronize deletions.
 func (se *SyncEngine) ReconcileWithPeer(peerURL string) {
 	cleanPeer := strings.TrimRight(strings.TrimSpace(peerURL), "/")
@@ -684,169 +979,212 @@ func (se *SyncEngine) ReconcileWithPeer(peerURL string) {
 		return
 	}
 
-	se.reconcileMu.Lock()
-	if se.reconcilingPeer[cleanPeer] || se.ctx.Err() != nil {
-		se.reconcileMu.Unlock()
+	se.stopMu.RLock()
+	if se.stopped || se.ctx.Err() != nil {
+		se.stopMu.RUnlock()
 		return
 	}
+	se.reconcileMu.Lock()
+	if se.reconcilingPeer[cleanPeer] {
+		se.reconcileMu.Unlock()
+		se.stopMu.RUnlock()
+		return
+	}
+	doneCh := make(chan struct{})
 	se.reconcilingPeer[cleanPeer] = true
+	se.reconcileDone[cleanPeer] = doneCh
 	se.wg.Add(1)
 	se.reconcileMu.Unlock()
+	se.stopMu.RUnlock()
 
 	go func() {
 		defer se.wg.Done()
 		defer func() {
 			se.reconcileMu.Lock()
 			delete(se.reconcilingPeer, cleanPeer)
+			delete(se.reconcileDone, cleanPeer)
+			close(doneCh)
 			se.reconcileMu.Unlock()
 		}()
 
-		ctx, cancel := context.WithTimeout(se.ctx, 30*time.Second)
-		defer cancel()
+		se.executeReconcilePeer(cleanPeer, true)
+	}()
+}
 
-		req, err := http.NewRequestWithContext(ctx, "GET", fmt.Sprintf("%s/api/sync/inventory", cleanPeer), nil)
-		if err != nil {
-			return
-		}
-		req.Header.Set("X-Bridge-Token", se.authToken)
-
-		resp, err := se.client.Do(req)
-		if err != nil {
-			return
-		}
-		defer resp.Body.Close()
-		if resp.StatusCode != http.StatusOK {
-			return
-		}
-
-		var remoteRecords map[string]FileRecord
-		if err := json.NewDecoder(resp.Body).Decode(&remoteRecords); err != nil {
-			return
-		}
-
-		localRecords := se.stateMgr.GetAll()
-
-		// 1. Check local records against remote records
-		for relPath, locRec := range localRecords {
-			if se.ctx.Err() != nil {
-				return
-			}
-			fullPath := filepath.Join(se.sharedDir, filepath.FromSlash(relPath))
-			remRec, remExists := remoteRecords[relPath]
-			if !remExists {
-				if alt, ok := remoteRecords[filepath.ToSlash(relPath)]; ok {
-					remRec = alt
-					remExists = true
-				}
-			}
-
-			if locRec.Deleted {
-				// Local has a tombstone for this file. Ensure file is purged from disk.
-				_ = RobustRemove(fullPath)
-				if remExists && !remRec.Deleted {
-					if locRec.ModTime >= remRec.ModTime {
-						log.Printf("[SyncEngine] Catch-up reconciliation: pushing deletion of %s to peer %s", relPath, cleanPeer)
-						_ = se.uploadDelete(cleanPeer, relPath, locRec.ModTime)
-					} else {
-						log.Printf("[SyncEngine] Catch-up reconciliation: pulling newer file %s from peer %s", relPath, cleanPeer)
-						_ = se.downloadFile(cleanPeer, relPath, remRec.Hash, remRec.Size, remRec.ModTime)
-					}
-				}
+func (se *SyncEngine) executeReconcilePeer(cleanPeer string, runScan bool) {
+	if runScan {
+		delta := se.scanDirectorySync()
+		for _, peer := range se.getPeerURLs() {
+			if strings.EqualFold(peer, cleanPeer) {
 				continue
 			}
-
-			// Local file is active
-			info, err := os.Stat(fullPath)
-			if err != nil || info.IsDir() {
-				// Local file is missing from disk!
-				go se.handleLocalFileDeletion(relPath)
-				continue
+			p := peer
+			for _, rec := range delta.updated {
+				r := rec
+				fp := filepath.Join(se.sharedDir, filepath.FromSlash(r.RelPath))
+				se.spawnTracked(func() {
+					se.uploadToPeerWithRetry(p, r.RelPath, fp, r.Hash, r.Size, r.ModTime)
+				})
 			}
-
-			diskModTime := info.ModTime().UnixNano()
-			if info.Size() != locRec.Size || diskModTime != locRec.ModTime {
-				if diskHash, diskSize, hashErr := ComputeHash(fullPath); hashErr == nil {
-					locRec.Hash = diskHash
-					locRec.Size = diskSize
-					locRec.ModTime = diskModTime
-					_ = se.stateMgr.Set(relPath, locRec)
-				}
+			for _, rec := range delta.deleted {
+				r := rec
+				se.spawnTracked(func() {
+					se.uploadDeleteToPeerWithRetry(p, r.RelPath, r.ModTime)
+				})
 			}
+		}
+	}
 
-			if !remExists {
-				log.Printf("[SyncEngine] Catch-up reconciliation: pushing %s to online peer %s", relPath, cleanPeer)
-				_ = se.uploadFile(cleanPeer, relPath, fullPath, locRec.Hash, locRec.Size, locRec.ModTime)
-			} else if remRec.Deleted {
-				if remRec.ModTime >= locRec.ModTime {
-					log.Printf("[SyncEngine] Catch-up reconciliation: applying remote deletion of %s from peer %s", relPath, cleanPeer)
-					_ = se.ReceiveSyncDelete(cleanPeer, relPath, remRec.ModTime)
-				} else {
-					log.Printf("[SyncEngine] Catch-up reconciliation: re-pushing newer file %s to peer %s", relPath, cleanPeer)
-					_ = se.uploadFile(cleanPeer, relPath, fullPath, locRec.Hash, locRec.Size, locRec.ModTime)
-				}
-			} else if remRec.Hash != locRec.Hash {
+	ctx, cancel := context.WithTimeout(se.ctx, 30*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, "GET", fmt.Sprintf("%s/api/sync/inventory", cleanPeer), nil)
+	if err != nil {
+		return
+	}
+	req.Header.Set("X-Bridge-Token", se.authToken)
+
+	resp, err := se.client.Do(req)
+	if err != nil {
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return
+	}
+
+	var remoteRecords map[string]FileRecord
+	if err := json.NewDecoder(resp.Body).Decode(&remoteRecords); err != nil {
+		return
+	}
+
+	localRecords := se.stateMgr.GetAll()
+
+	// 1. Check local records against remote records
+	for relPath, locRec := range localRecords {
+		if se.ctx.Err() != nil {
+			return
+		}
+		fullPath := filepath.Join(se.sharedDir, filepath.FromSlash(relPath))
+		remRec, remExists := remoteRecords[relPath]
+		if !remExists {
+			if alt, ok := remoteRecords[filepath.ToSlash(relPath)]; ok {
+				remRec = alt
+				remExists = true
+			}
+		}
+
+		if locRec.Deleted {
+			// Local has a tombstone for this file. Ensure file is purged from disk.
+			_ = RobustRemove(fullPath)
+			if remExists && !remRec.Deleted {
 				if locRec.ModTime >= remRec.ModTime {
-					log.Printf("[SyncEngine] Catch-up reconciliation: pushing newer version of %s to peer %s", relPath, cleanPeer)
-					_ = se.uploadFile(cleanPeer, relPath, fullPath, locRec.Hash, locRec.Size, locRec.ModTime)
+					log.Printf("[SyncEngine] Catch-up reconciliation: pushing deletion of %s to peer %s", relPath, cleanPeer)
+					_ = se.uploadDelete(cleanPeer, relPath, locRec.ModTime)
 				} else {
-					log.Printf("[SyncEngine] Catch-up reconciliation: pulling newer version of %s from peer %s", relPath, cleanPeer)
+					log.Printf("[SyncEngine] Catch-up reconciliation: pulling newer file %s from peer %s", relPath, cleanPeer)
 					_ = se.downloadFile(cleanPeer, relPath, remRec.Hash, remRec.Size, remRec.ModTime)
 				}
 			}
+			continue
 		}
 
-		// 2. Check remote records that local does NOT have
-		for relPath, remRec := range remoteRecords {
-			if se.ctx.Err() != nil {
-				return
+		// Local file is active
+		info, err := os.Stat(fullPath)
+		if err != nil || info.IsDir() {
+			// Local file is missing from disk!
+			deleteTime := time.Now().UnixNano()
+			_ = se.stateMgr.MarkAsDeleted(relPath, deleteTime)
+			if remExists && !remRec.Deleted {
+				_ = se.uploadDelete(cleanPeer, relPath, deleteTime)
 			}
-			cleanRel := filepath.Clean(filepath.FromSlash(relPath))
-			if strings.HasPrefix(cleanRel, "..") || filepath.IsAbs(cleanRel) {
+			se.broadcastDeleteToPeers(relPath, deleteTime, cleanPeer)
+			continue
+		}
+
+		diskModTime := info.ModTime().UnixNano()
+		if info.Size() != locRec.Size || diskModTime != locRec.ModTime {
+			if diskHash, diskSize, hashErr := ComputeHash(fullPath); hashErr == nil {
+				locRec.Hash = diskHash
+				locRec.Size = diskSize
+				locRec.ModTime = diskModTime
+				_ = se.stateMgr.Set(relPath, locRec)
+			}
+		}
+
+		if !remExists {
+			log.Printf("[SyncEngine] Catch-up reconciliation: pushing %s to online peer %s", relPath, cleanPeer)
+			_ = se.uploadFile(cleanPeer, relPath, fullPath, locRec.Hash, locRec.Size, locRec.ModTime)
+		} else if remRec.Deleted {
+			if remRec.ModTime >= locRec.ModTime {
+				log.Printf("[SyncEngine] Catch-up reconciliation: applying remote deletion of %s from peer %s", relPath, cleanPeer)
+				_ = se.ReceiveSyncDelete(cleanPeer, relPath, remRec.ModTime)
+			} else {
+				log.Printf("[SyncEngine] Catch-up reconciliation: re-pushing newer file %s to peer %s", relPath, cleanPeer)
+				_ = se.uploadFile(cleanPeer, relPath, fullPath, locRec.Hash, locRec.Size, locRec.ModTime)
+			}
+		} else if remRec.Hash != locRec.Hash {
+			if locRec.ModTime >= remRec.ModTime {
+				log.Printf("[SyncEngine] Catch-up reconciliation: pushing newer version of %s to peer %s", relPath, cleanPeer)
+				_ = se.uploadFile(cleanPeer, relPath, fullPath, locRec.Hash, locRec.Size, locRec.ModTime)
+			} else {
+				log.Printf("[SyncEngine] Catch-up reconciliation: pulling newer version of %s from peer %s", relPath, cleanPeer)
+				_ = se.downloadFile(cleanPeer, relPath, remRec.Hash, remRec.Size, remRec.ModTime)
+			}
+		}
+	}
+
+	// 2. Check remote records that local does NOT have
+	for relPath, remRec := range remoteRecords {
+		if se.ctx.Err() != nil {
+			return
+		}
+		cleanRel := filepath.Clean(filepath.FromSlash(relPath))
+		if strings.HasPrefix(cleanRel, "..") || filepath.IsAbs(cleanRel) {
+			continue
+		}
+		if _, locExists := localRecords[cleanRel]; locExists {
+			continue // Already processed
+		}
+		if _, locExists := localRecords[relPath]; locExists {
+			continue // Already processed
+		}
+
+		fullPath := filepath.Join(se.sharedDir, cleanRel)
+		if remRec.Deleted {
+			// Remote has deleted tombstone; purge any stale file on disk and record tombstone locally
+			_ = RobustRemove(fullPath)
+			_ = se.stateMgr.MarkAsDeleted(cleanRel, remRec.ModTime)
+			continue
+		}
+
+		info, err := os.Stat(fullPath)
+		if os.IsNotExist(err) {
+			log.Printf("[SyncEngine] Catch-up reconciliation: pulling %s from online peer %s", cleanRel, cleanPeer)
+			_ = se.downloadFile(cleanPeer, cleanRel, remRec.Hash, remRec.Size, remRec.ModTime)
+		} else if err == nil && !info.IsDir() {
+			diskHash, diskSize, hashErr := ComputeHash(fullPath)
+			if hashErr != nil {
 				continue
 			}
-			if _, locExists := localRecords[cleanRel]; locExists {
-				continue // Already processed
-			}
-			if _, locExists := localRecords[relPath]; locExists {
-				continue // Already processed
-			}
-
-			fullPath := filepath.Join(se.sharedDir, cleanRel)
-			if remRec.Deleted {
-				// Remote has deleted tombstone; purge any stale file on disk and record tombstone locally
-				_ = RobustRemove(fullPath)
-				_ = se.stateMgr.MarkAsDeleted(cleanRel, remRec.ModTime)
-				continue
-			}
-
-			info, err := os.Stat(fullPath)
-			if os.IsNotExist(err) {
-				log.Printf("[SyncEngine] Catch-up reconciliation: pulling %s from online peer %s", cleanRel, cleanPeer)
+			diskModTime := info.ModTime().UnixNano()
+			if diskHash == remRec.Hash {
+				_ = se.stateMgr.MarkAsReceived(cleanRel, diskHash, diskSize, diskModTime)
+			} else if remRec.ModTime > diskModTime {
+				log.Printf("[SyncEngine] Catch-up reconciliation: pulling newer remote %s over untracked local file from peer %s", cleanRel, cleanPeer)
 				_ = se.downloadFile(cleanPeer, cleanRel, remRec.Hash, remRec.Size, remRec.ModTime)
-			} else if err == nil && !info.IsDir() {
-				diskHash, diskSize, hashErr := ComputeHash(fullPath)
-				if hashErr != nil {
-					continue
-				}
-				diskModTime := info.ModTime().UnixNano()
-				if diskHash == remRec.Hash {
-					_ = se.stateMgr.MarkAsReceived(cleanRel, diskHash, diskSize, diskModTime)
-				} else if remRec.ModTime > diskModTime {
-					log.Printf("[SyncEngine] Catch-up reconciliation: pulling newer remote %s over untracked local file from peer %s", cleanRel, cleanPeer)
-					_ = se.downloadFile(cleanPeer, cleanRel, remRec.Hash, remRec.Size, remRec.ModTime)
-				} else {
-					log.Printf("[SyncEngine] Catch-up reconciliation: pushing newer untracked local %s to peer %s", cleanRel, cleanPeer)
-					_ = se.stateMgr.Set(cleanRel, FileRecord{
-						RelPath: cleanRel,
-						Hash:    diskHash,
-						Size:    diskSize,
-						ModTime: diskModTime,
-					})
-					_ = se.uploadFile(cleanPeer, cleanRel, fullPath, diskHash, diskSize, diskModTime)
-				}
+			} else {
+				log.Printf("[SyncEngine] Catch-up reconciliation: pushing newer untracked local %s to peer %s", cleanRel, cleanPeer)
+				_ = se.stateMgr.Set(cleanRel, FileRecord{
+					RelPath: cleanRel,
+					Hash:    diskHash,
+					Size:    diskSize,
+					ModTime: diskModTime,
+				})
+				_ = se.uploadFile(cleanPeer, cleanRel, fullPath, diskHash, diskSize, diskModTime)
 			}
 		}
-	}()
+	}
 }
 
 func (se *SyncEngine) downloadFile(peerURL, relPath, expectedHash string, size, modTime int64) error {

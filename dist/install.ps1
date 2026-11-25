@@ -99,7 +99,7 @@ if ($tailscaleBin) {
                         $PeerIP = $v4
                         $discoveredName = $p.HostName
                         try {
-                            $h = Invoke-RestMethod -Uri "http://${v4}:8765/api/health" -Method Get -TimeoutSec 1 -ErrorAction SilentlyContinue
+                            $h = Invoke-RestMethod -Uri "http://${v4}:8765/api/health" -Method Get -Headers @{ "X-Bridge-Probe" = "1" } -TimeoutSec 4 -ErrorAction SilentlyContinue
                             if ($h -and $h.node_name) {
                                 $discoveredName = $h.node_name
                             }
@@ -166,18 +166,11 @@ if (-not $sumatraBin) {
 }
 if ($sumatraBin) {
     Write-Host "SumatraPDF located: $sumatraBin" -ForegroundColor Green
-    # Create background engine shortcut in C:\BridgeApp\SumatraPDF.lnk
-    try {
-        $wscript = New-Object -ComObject WScript.Shell
-        $sc = $wscript.CreateShortcut("C:\BridgeApp\SumatraPDF.lnk")
-        $sc.TargetPath = $sumatraBin
-        $sc.Description = "Bridge Silent Print Engine"
-        $sc.Save()
-    } catch {}
 } else {
     Write-Host "Warning: SumatraPDF could not be auto-installed. Silent printing will auto-provision on first job." -ForegroundColor Yellow
     $sumatraBin = "C:\BridgeApp\SumatraPDF.exe"
 }
+Remove-Item "C:\BridgeApp\SumatraPDF.lnk" -Force -ErrorAction SilentlyContinue
 
 # 3. Create Required Directories
 Write-Host "`n[3/5] Setting up directory structure..." -ForegroundColor Cyan
@@ -286,8 +279,9 @@ Write-Host "Firewall inbound rule added for TCP ports 8765 and 9100-9120." -Fore
 # 5. Register Interactive Startup & Launch (Session 1 Taskbar Tray Dot)
 Write-Host "`n[5/5] Registering Interactive Startup, Virtual Printer & Shortcuts..." -ForegroundColor Cyan
 
-# Remove legacy Session 0 scheduled task so it won't block Session 1 tray icon
+# Remove legacy Session 0 scheduled task and prior logon task before re-registering
 Unregister-ScheduledTask -TaskName "BridgeSystemService" -Confirm:$false -ErrorAction SilentlyContinue | Out-Null
+Unregister-ScheduledTask -TaskName "BridgeAppLogon" -Confirm:$false -ErrorAction SilentlyContinue | Out-Null
 
 # Clean up legacy duplicate startup registrations (HKLM, WOW6432Node, User Startup, Common Startup, and HKEY_USERS)
 $runKeys = @(
@@ -334,8 +328,21 @@ foreach ($sd in $legacyStartupDirs) {
     }
 }
 
-# Register ONLY HKCU Run key with -autostart flag for clean Session 1 tray startup
-Set-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" -Name "BridgeApp" -Value '"C:\BridgeApp\bridge.exe" -autostart' -Force
+# Register Interactive Elevated Logon task (Session 1 + Admin rights for virtual printers), falling back to HKCU Run
+$logonTaskOk = $false
+try {
+    & schtasks.exe /Create /TN "BridgeAppLogon" /TR '"C:\BridgeApp\bridge.exe" -autostart' /SC ONLOGON /RL HIGHEST /IT /F 2>&1 | Out-Null
+    if ($LASTEXITCODE -eq 0) {
+        $logonTaskOk = $true
+        Remove-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" -Name "BridgeApp" -Force -ErrorAction SilentlyContinue | Out-Null
+        if (-not (Test-Path "HKCU:\Software\BridgeApp")) { New-Item -Path "HKCU:\Software\BridgeApp" -Force | Out-Null }
+        Set-ItemProperty -Path "HKCU:\Software\BridgeApp" -Name "StartupMode" -Value "BridgeAppLogon" -Force -ErrorAction SilentlyContinue
+    }
+} catch {}
+if (-not $logonTaskOk) {
+    Remove-ItemProperty -Path "HKCU:\Software\BridgeApp" -Name "StartupMode" -Force -ErrorAction SilentlyContinue | Out-Null
+    Set-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" -Name "BridgeApp" -Value '"C:\BridgeApp\bridge.exe" -autostart' -Force
+}
 
 # Register Windows Virtual Printer for Ctrl+P Native Printing
 $portName = 'Bridge_Port_9101'
@@ -431,37 +438,70 @@ if ($existingDefault -and -not ($existingDefault -like "Print on *")) {
     }
 }
 
-# Create Desktop Shortcuts (Public, User, and OneDrive) - ONLY ONE shared folder shortcut
+# Create Desktop Shortcut ONLY ONCE in the active user Desktop, cleaning duplicates and SumatraPDF.lnk everywhere
 $wscript = New-Object -ComObject WScript.Shell
-$desktopDirs = @([Environment]::GetFolderPath("Desktop"), "C:\Users\Public\Desktop")
+$primaryDesktop = $null
+$desktopCandidates = @()
+try {
+    $usfDesktop = (Get-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders" -Name "Desktop" -ErrorAction SilentlyContinue).Desktop
+    if ($usfDesktop) { $desktopCandidates += [Environment]::ExpandEnvironmentVariables($usfDesktop) }
+} catch {}
+try {
+    $sfDesktop = (Get-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Shell Folders" -Name "Desktop" -ErrorAction SilentlyContinue).Desktop
+    if ($sfDesktop) { $desktopCandidates += [Environment]::ExpandEnvironmentVariables($sfDesktop) }
+} catch {}
+$desktopCandidates += [Environment]::GetFolderPath("Desktop")
 if ($env:USERPROFILE) {
-    $desktopDirs += (Join-Path $env:USERPROFILE "OneDrive\Desktop")
+    $desktopCandidates += (Join-Path $env:USERPROFILE "Desktop")
+    $desktopCandidates += (Join-Path $env:USERPROFILE "OneDrive\Desktop")
+}
+foreach ($cand in $desktopCandidates) {
+    if ($cand -and (Test-Path $cand)) {
+        $primaryDesktop = [IO.Path]::GetFullPath($cand).TrimEnd('\')
+        break
+    }
+}
+
+$rawDesktopDirs = @()
+if ($primaryDesktop) { $rawDesktopDirs += $primaryDesktop }
+$rawDesktopDirs += @([Environment]::GetFolderPath("Desktop"), "C:\Users\Public\Desktop")
+if ($env:USERPROFILE) {
+    $rawDesktopDirs += (Join-Path $env:USERPROFILE "Desktop")
+    $rawDesktopDirs += (Join-Path $env:USERPROFILE "OneDrive\Desktop")
 }
 Get-ChildItem "C:\Users" -Directory -ErrorAction SilentlyContinue | ForEach-Object {
-    $desktopDirs += (Join-Path $_.FullName "Desktop")
-    $desktopDirs += (Join-Path $_.FullName "OneDrive\Desktop")
+    $rawDesktopDirs += (Join-Path $_.FullName "Desktop")
+    $rawDesktopDirs += (Join-Path $_.FullName "OneDrive\Desktop")
 }
-$desktopDirs = $desktopDirs | Select-Object -Unique
-
-foreach ($d in $desktopDirs) {
-    if (Test-Path $d) {
-        # Remove legacy shortcuts and any drop-to-print shortcuts
-        Remove-Item (Join-Path $d "Bridge Print Folder.lnk") -ErrorAction SilentlyContinue
-        Get-ChildItem $d -Filter "* - Drop to Print.lnk" -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
-        Get-ChildItem $d -Filter "* - Shared Folder.lnk" -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
-
-        $s1 = $wscript.CreateShortcut((Join-Path $d "Bridge Shared Folder.lnk"))
-        $s1.TargetPath = "C:\Bridge\Shared"
-        $s1.Description = "Bridge Multi-Device Two-Way Shared Folder (Global Mesh)"
-        $s1.Save()
-
-        if ($sumatraBin -and (Test-Path $sumatraBin)) {
-            $s2 = $wscript.CreateShortcut((Join-Path $d "SumatraPDF.lnk"))
-            $s2.TargetPath = $sumatraBin
-            $s2.Description = "Bridge Silent Print Engine (SumatraPDF)"
-            $s2.Save()
+$seenDesktops = @{}
+$desktopDirs = @()
+foreach ($rd in $rawDesktopDirs) {
+    if ($rd -and (Test-Path $rd)) {
+        $norm = [IO.Path]::GetFullPath($rd).TrimEnd('\')
+        $low = $norm.ToLowerInvariant()
+        if (-not $seenDesktops.ContainsKey($low)) {
+            $seenDesktops[$low] = $true
+            $desktopDirs += $norm
         }
     }
+}
+
+foreach ($d in $desktopDirs) {
+    # Remove legacy shortcuts, drop-to-print shortcuts, and unwanted SumatraPDF shortcuts
+    Remove-Item (Join-Path $d "Bridge Print Folder.lnk") -Force -ErrorAction SilentlyContinue
+    Remove-Item (Join-Path $d "SumatraPDF.lnk") -Force -ErrorAction SilentlyContinue
+    Get-ChildItem $d -Filter "* - Drop to Print.lnk" -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+    Get-ChildItem $d -Filter "* - Shared Folder.lnk" -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+    if ($primaryDesktop -and ($d -ine $primaryDesktop)) {
+        Remove-Item (Join-Path $d "Bridge Shared Folder.lnk") -Force -ErrorAction SilentlyContinue
+    }
+}
+
+if ($primaryDesktop) {
+    $s1 = $wscript.CreateShortcut((Join-Path $primaryDesktop "Bridge Shared Folder.lnk"))
+    $s1.TargetPath = "C:\Bridge\Shared"
+    $s1.Description = "Bridge Multi-Device Two-Way Shared Folder (Global Mesh)"
+    $s1.Save()
 }
 
 # Create Windows Explorer "Send To" shortcut

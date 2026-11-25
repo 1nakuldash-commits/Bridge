@@ -7,8 +7,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"syscall"
-	"time"
 	"unicode/utf16"
 	"unsafe"
 
@@ -97,6 +97,7 @@ const (
 
 	MB_OK              = 0x00000000
 	MB_ICONINFORMATION = 0x00000040
+	MB_SETFOREGROUND   = 0x00010000
 )
 
 const (
@@ -318,17 +319,26 @@ func (tm *TrayManager) Stop() {
 	procPostMessageW.Call(tm.hwnd, WM_DESTROY, 0, 0)
 }
 
-// SetState updates the dot color and tooltip.
-func (tm *TrayManager) SetState(state TrayState, tooltip string) {
-	tm.mu.Lock()
-	defer tm.mu.Unlock()
+func (tm *TrayManager) modifyNotifyLocked() {
 	if tm.stopped || tm.hwnd == 0 {
 		return
 	}
-	tm.currentState = state
-	tm.currentTip = tooltip
+	nid := tm.buildNotifyData(tm.currentState, tm.currentTip)
+	procShell_NotifyIconW.Call(NIM_MODIFY, uintptr(unsafe.Pointer(&nid)))
+}
 
-	nid := tm.buildNotifyData(state, tooltip)
+func (tm *TrayManager) showBalloonLocked(title, message string) {
+	if tm.stopped || tm.hwnd == 0 {
+		return
+	}
+	nid := tm.buildNotifyData(tm.currentState, tm.currentTip)
+	nid.UFlags |= NIF_INFO
+	nid.DwInfoFlags = NIIF_INFO
+	nid.UTimeoutOrVersion = 10000
+
+	copyUTF16Z(nid.SzInfoTitle[:], title)
+	copyUTF16Z(nid.SzInfo[:], message)
+
 	procShell_NotifyIconW.Call(NIM_MODIFY, uintptr(unsafe.Pointer(&nid)))
 }
 
@@ -336,21 +346,24 @@ func (tm *TrayManager) SetState(state TrayState, tooltip string) {
 func (tm *TrayManager) ShowBalloon(title, message string) {
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
-	if tm.stopped || tm.hwnd == 0 {
+	tm.showBalloonLocked(title, message)
+}
+
+func copyUTF16Z(dst []uint16, s string) {
+	if len(dst) == 0 {
 		return
 	}
-
-	nid := tm.buildNotifyData(tm.currentState, tm.currentTip)
-	nid.UFlags |= NIF_INFO
-	nid.DwInfoFlags = NIIF_INFO
-
-	title16, _ := syscall.UTF16FromString(title)
-	copy(nid.SzInfoTitle[:], title16)
-
-	msg16, _ := syscall.UTF16FromString(message)
-	copy(nid.SzInfo[:], msg16)
-
-	procShell_NotifyIconW.Call(NIM_MODIFY, uintptr(unsafe.Pointer(&nid)))
+	clear(dst)
+	u16, err := syscall.UTF16FromString(s)
+	if err != nil {
+		u16 = utf16.Encode([]rune(strings.ReplaceAll(s, "\x00", "")))
+	}
+	maxChars := len(dst) - 1
+	n := copy(dst[:maxChars], u16)
+	if len(u16) > maxChars && n == maxChars && n > 0 && dst[n-1] >= 0xD800 && dst[n-1] <= 0xDBFF {
+		dst[n-1] = 0
+	}
+	dst[maxChars] = 0
 }
 
 func (tm *TrayManager) buildNotifyData(state TrayState, tip string) NOTIFYICONDATAW {
@@ -362,67 +375,8 @@ func (tm *TrayManager) buildNotifyData(state TrayState, tip string) NOTIFYICONDA
 	nid.UCallbackMessage = WM_TRAYMESSAGE
 	nid.HIcon = tm.hIcons[state]
 
-	tip16, _ := syscall.UTF16FromString(tip)
-	copy(nid.SzTip[:], tip16)
+	copyUTF16Z(nid.SzTip[:], tip)
 	return nid
-}
-
-// UpdateNames updates the friendly names shown in menu items and tooltips (backward compatibility).
-func (tm *TrayManager) UpdateNames(nodeName, peerName string) {
-	tm.mu.Lock()
-	defer tm.mu.Unlock()
-	tm.nodeName = nodeName
-	tm.peerName = peerName
-}
-
-// UpdateNetworkStatus updates multi-device status, tooltip, and dot color in real-time.
-func (tm *TrayManager) UpdateNetworkStatus(nodeName string, peers []config.PeerDevice) {
-	tm.mu.Lock()
-	defer tm.mu.Unlock()
-
-	tm.nodeName = nodeName
-	tm.peers = make([]config.PeerDevice, len(peers))
-	copy(tm.peers, peers)
-
-	onlineCount := 0
-	for _, p := range peers {
-		if p.Online {
-			onlineCount++
-		}
-	}
-
-	tip := ""
-	state := StateDisconnected
-	total := len(peers)
-
-	// User-specified icon state machine:
-	// 1. If 0 devices connected/online -> Printer icon with red cross line (Disconnected)
-	// 2. If 1 or more devices connected, but not all -> Gray printer icon (cross removed)
-	// 3. If all devices connected -> Green printer icon
-	if total == 0 || onlineCount == 0 {
-		state = StateDisconnected
-		if total == 0 {
-			tip = fmt.Sprintf("Bridge: %s (No other device connected)", nodeName)
-		} else {
-			tip = fmt.Sprintf("Bridge: %s (0/%d devices connected - Disconnected)", nodeName, total)
-		}
-	} else if onlineCount < total {
-		state = StatePartial
-		tip = fmt.Sprintf("Bridge: %s (%d/%d devices connected)", nodeName, onlineCount, total)
-	} else {
-		state = StateConnected
-		tip = fmt.Sprintf("Bridge: %s (All %d devices connected & ready)", nodeName, total)
-	}
-
-	// Avoid Windows taskbar re-render flickering: Only update if state or tip changed!
-	if !tm.stopped && tm.hwnd != 0 {
-		if tm.currentState != state || tm.currentTip != tip {
-			tm.currentState = state
-			tm.currentTip = tip
-			nid := tm.buildNotifyData(state, tip)
-			procShell_NotifyIconW.Call(NIM_MODIFY, uintptr(unsafe.Pointer(&nid)))
-		}
-	}
 }
 
 func trayWndProc(hwnd uintptr, msg uint32, wparam, lparam uintptr) uintptr {
@@ -465,7 +419,9 @@ func trayWndProc(hwnd uintptr, msg uint32, wparam, lparam uintptr) uintptr {
 			peerIdx := cmdID - CmdPrintFilePeerBase
 			tm.mu.Lock()
 			peerName := ""
-			if peerIdx < len(tm.peers) {
+			if peerIdx >= 0 && peerIdx < len(tm.menuPeers) {
+				peerName = tm.menuPeers[peerIdx].Name
+			} else if peerIdx >= 0 && peerIdx < len(tm.peers) {
 				peerName = tm.peers[peerIdx].Name
 			}
 			tm.mu.Unlock()
@@ -512,8 +468,10 @@ func (tm *TrayManager) showContextMenu() {
 
 	tm.mu.Lock()
 	nodeName := tm.nodeName
-	peers := make([]config.PeerDevice, len(tm.peers))
-	copy(peers, tm.peers)
+	tm.menuPeers = make([]config.PeerDevice, len(tm.peers))
+	copy(tm.menuPeers, tm.peers)
+	peers := make([]config.PeerDevice, len(tm.menuPeers))
+	copy(peers, tm.menuPeers)
 	fallbackPeer := tm.peerName
 	tm.mu.Unlock()
 
@@ -613,10 +571,10 @@ func (tm *TrayManager) handlePrintFileDialog(targetPeer string) {
 	}
 
 	if targetPeer != "" && tm.callbacks.OnPrintFileToPeer != nil {
-		tm.SetState(StatePrinting, fmt.Sprintf("Bridge: Printing %s on %s...", filepath.Base(filePath), targetPeer))
+		tm.SetPrintingState(fmt.Sprintf("Bridge: Printing %s on %s...", filepath.Base(filePath), targetPeer))
 		tm.callbacks.OnPrintFileToPeer(targetPeer, filePath)
 	} else if tm.callbacks.OnPrintFile != nil {
-		tm.SetState(StatePrinting, fmt.Sprintf("Bridge: Printing %s...", filepath.Base(filePath)))
+		tm.SetPrintingState(fmt.Sprintf("Bridge: Printing %s...", filepath.Base(filePath)))
 		tm.callbacks.OnPrintFile(filePath)
 	}
 }
@@ -629,7 +587,7 @@ func (tm *TrayManager) handleShowStatus() {
 
 	textPtr, _ := syscall.UTF16PtrFromString(statusMsg)
 	titlePtr, _ := syscall.UTF16PtrFromString("Bridge Multi-Device Network Status")
-	procMessageBoxW.Call(tm.hwnd, uintptr(unsafe.Pointer(textPtr)), uintptr(unsafe.Pointer(titlePtr)), MB_OK|MB_ICONINFORMATION)
+	procMessageBoxW.Call(tm.hwnd, uintptr(unsafe.Pointer(textPtr)), uintptr(unsafe.Pointer(titlePtr)), MB_OK|MB_ICONINFORMATION|MB_SETFOREGROUND)
 }
 
 // OpenFilePicker opens the native Windows Open File Dialog.
@@ -673,53 +631,6 @@ func HideConsole() {
 // HideConsoleIfDedicated hides the console window if this process was spawned in a dedicated console.
 func HideConsoleIfDedicated() {
 	HideConsole()
-}
-
-// SetPrintingState displays the loading printer icon during print spooling/transmission.
-func (tm *TrayManager) SetPrintingState(tooltip string) {
-	tm.SetState(StatePrinting, tooltip)
-}
-
-// SetSyncingState displays the loading cloud icon during file upload/synchronization.
-func (tm *TrayManager) SetSyncingState(tooltip string) {
-	tm.SetState(StateSyncing, tooltip)
-}
-
-// FlashPrintComplete displays the blue printer icon for 4 seconds, then reverts to baseline network status.
-func (tm *TrayManager) FlashPrintComplete(title, message string) {
-	tm.SetState(StatePrintCompleted, message)
-	tm.ShowBalloon(title, message)
-
-	go func() {
-		time.Sleep(4 * time.Second)
-		tm.RestoreNetworkStatus()
-	}()
-}
-
-// FlashSyncComplete displays the blue cloud icon for 4 seconds, then reverts to baseline network status.
-func (tm *TrayManager) FlashSyncComplete(title, message string) {
-	tm.SetState(StateSyncCompleted, message)
-	tm.ShowBalloon(title, message)
-
-	go func() {
-		time.Sleep(4 * time.Second)
-		tm.RestoreNetworkStatus()
-	}()
-}
-
-// RestoreNetworkStatus re-evaluates current peer counts and restores the baseline printer icon.
-func (tm *TrayManager) RestoreNetworkStatus() {
-	tm.mu.Lock()
-	nodeName := tm.nodeName
-	peers := make([]config.PeerDevice, len(tm.peers))
-	copy(peers, tm.peers)
-	tm.mu.Unlock()
-	tm.UpdateNetworkStatus(nodeName, peers)
-}
-
-// FlashComplete backward-compatible alias for print completion.
-func (tm *TrayManager) FlashComplete(title, message string) {
-	tm.FlashPrintComplete(title, message)
 }
 
 // SetClipboardText places plain unicode text onto the Windows system clipboard.

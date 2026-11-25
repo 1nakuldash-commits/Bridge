@@ -1,12 +1,14 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -50,6 +52,8 @@ func main() {
 	trayFlag := flag.Bool("tray", false, "Run in background with taskbar tray icon")
 	installFlag := flag.Bool("install", false, "Install Bridge background service")
 	setupFlag := flag.Bool("setup", false, "Run interactive setup wizard")
+	pairFlag := flag.Bool("pair", false, "Connect / pair a new device (elevated)")
+	syncPrintersFlag := flag.Bool("sync-printers", false, "Sync desktop shortcuts and Windows virtual printers")
 	uninstallFlag := flag.Bool("uninstall", false, "Uninstall Bridge background service")
 	statusFlag := flag.Bool("status", false, "Check status of Bridge background service")
 	versionFlag := flag.Bool("version", false, "Print application version")
@@ -64,6 +68,11 @@ func main() {
 	configPath := flag.String("config", "", "Path to config.json")
 	flag.Parse()
 
+	resolvedConfig := *configPath
+	if resolvedConfig == "" {
+		resolvedConfig = installer.TargetConfig
+	}
+
 	// 1. Version Mode
 	if *versionFlag {
 		fmt.Println("Bridge v2.3.0 (Zero-Defect 1:1 Scale & Instant Mesh Sync Edition)")
@@ -71,7 +80,7 @@ func main() {
 	}
 
 	// 2. Right-Click SendTo Handler ("Print on <PeerName>")
-	if *sendPrintFlag || (len(flag.Args()) > 0 && !*serviceFlag && !*autostartFlag && !*trayFlag && !*installFlag && !*setupFlag && !*uninstallFlag && !*statusFlag && *upgradeFlag == "") {
+	if *sendPrintFlag || (len(flag.Args()) > 0 && !*serviceFlag && !*autostartFlag && !*trayFlag && !*installFlag && !*setupFlag && !*pairFlag && !*syncPrintersFlag && !*uninstallFlag && !*statusFlag && *upgradeFlag == "") {
 		targetFile := ""
 		if len(flag.Args()) > 0 {
 			targetFile = flag.Args()[0]
@@ -96,12 +105,72 @@ func main() {
 		}
 		if err := installer.UninstallService(); err != nil {
 			fmt.Fprintf(os.Stderr, "Uninstall failed: %v\n", err)
+			if fi, statErr := os.Stdin.Stat(); statErr == nil && (fi.Mode()&os.ModeCharDevice) != 0 {
+				fmt.Println("Press Enter to close...")
+				_, _ = bufio.NewReader(os.Stdin).ReadString('\n')
+			}
 			os.Exit(1)
+		}
+		if fi, statErr := os.Stdin.Stat(); statErr == nil && (fi.Mode()&os.ModeCharDevice) != 0 {
+			fmt.Println("Press Enter to close...")
+			_, _ = bufio.NewReader(os.Stdin).ReadString('\n')
 		}
 		return
 	}
 
-	// 4. Upgrade Mode
+	// 4. Sync Printers Mode
+	if *syncPrintersFlag {
+		if !installer.IsElevated() {
+			_ = installer.SelfElevate(os.Args[1:])
+			return
+		}
+		cfg, err := config.LoadConfig(resolvedConfig)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to load configuration from %s: %v\n", resolvedConfig, err)
+			os.Exit(1)
+		}
+		res := installer.SyncBridgeShortcutsForPeers(cfg.GetPeers())
+		for _, name := range res.SucceededPrinters {
+			fmt.Printf("[✓] Windows Virtual Printer ready: 'Print on %s'\n", name)
+		}
+		for name, pErr := range res.PrinterErrors {
+			fmt.Fprintf(os.Stderr, "[!] Windows Virtual Printer 'Print on %s' failed: %v\n", name, pErr)
+		}
+		return
+	}
+
+	// 5. Pair Mode (elevated pairing + printer creation, then enters Dashboard)
+	if *pairFlag {
+		if !installer.IsElevated() {
+			_ = installer.SelfElevate(os.Args[1:])
+			return
+		}
+		if !installer.AcquireInteractiveLock() {
+			return
+		}
+		defer installer.ReleaseInteractiveLock()
+
+		cfg, err := config.LoadConfig(resolvedConfig)
+		if err != nil || !cfg.Configured {
+			installer.SetDashboardConsoleTitle("Bridge Multi-Device Setup")
+			installer.UnregisterInteractiveStartup()
+			if err := installer.RunInteractiveSetup(); err != nil {
+				fmt.Fprintf(os.Stderr, "Setup error: %v\n", err)
+				os.Exit(1)
+			}
+			return
+		}
+		installer.SetDashboardConsoleTitle("Bridge Multi-Device Dashboard")
+		_ = installer.RegisterInteractiveStartup()
+		installer.RunPairNewDevice(cfg)
+		_ = installer.CreateBridgeShortcutsForPeers(cfg.GetPeers())
+		if err := installer.RunDashboard(); err != nil {
+			fmt.Fprintf(os.Stderr, "Dashboard error: %v\n", err)
+		}
+		return
+	}
+
+	// 6. Upgrade Mode
 	if *upgradeFlag != "" {
 		if !installer.IsElevated() {
 			_ = installer.SelfElevate(os.Args[1:])
@@ -146,11 +215,6 @@ func main() {
 		return
 	}
 
-	resolvedConfig := *configPath
-	if resolvedConfig == "" {
-		resolvedConfig = installer.TargetConfig
-	}
-
 	// 7. Background / Autostart Mode (System boot or background daemon)
 	if *autostartFlag || *trayFlag || *serviceFlag {
 		tray.HideConsole()
@@ -171,10 +235,16 @@ func main() {
 		// Ensure clean autostart registration (fast in-process check)
 		_ = installer.RegisterInteractiveStartup()
 
-		// If an un-mutexed legacy process is currently bound to port, kill it to take over
+		// If an un-mutexed legacy process is currently bound to port, kill it and wait briefly for port release
 		if installer.VerifyHealth(existingCfg.ListenPort) == nil {
 			installer.KillOtherBridgeProcesses()
-			time.Sleep(300 * time.Millisecond)
+			deadline := time.Now().Add(2 * time.Second)
+			for time.Now().Before(deadline) {
+				if installer.VerifyHealth(existingCfg.ListenPort) != nil {
+					break
+				}
+				time.Sleep(150 * time.Millisecond)
+			}
 		}
 
 		// Run unified background service (headless=true if -service, false if -autostart/-tray with taskbar tray)
@@ -321,8 +391,9 @@ func runUnifiedService(configPath string, headless bool) {
 	// 2. Multi-Peer Mesh Sync Engine
 	syncEngine := bridgesync.NewSyncEngine(cfg.SharedDir, "", cfg.AuthToken, stateMgr)
 	syncEngine.UpdatePeerURLs(cfg.GetPeerURLs())
-	if localTS := installer.GetTailscaleIP(); localTS != "" {
-		syncEngine.SetLocalURL(fmt.Sprintf("http://%s:%d", localTS, cfg.ListenPort))
+	initialLocalTS := installer.GetTailscaleIP()
+	if initialLocalTS != "" {
+		syncEngine.SetLocalURL(fmt.Sprintf("http://%s:%d", initialLocalTS, cfg.ListenPort))
 	}
 
 	// 3. HTTP API Server & thread-safe TrayManager reference
@@ -373,6 +444,21 @@ func runUnifiedService(configPath string, headless bool) {
 		if targetURL == "" {
 			return fmt.Errorf("peer %s is not connected yet (no reachable URL or IP)", targetPeer.Name)
 		}
+
+		host := config.ExtractIP(targetURL)
+		if parsedIP := net.ParseIP(host); (parsedIP != nil && parsedIP.IsLoopback()) ||
+			strings.EqualFold(host, "127.0.0.1") ||
+			strings.EqualFold(host, "localhost") ||
+			host == "::1" ||
+			config.IsSelfTarget(targetPeer.Name, targetPeer.IP, targetURL, cfg.GetNodeName(), cfg.ListenPort) {
+			return fmt.Errorf("refusing to route virtual print to self/loopback target (%s)", targetURL)
+		}
+
+		spoolPort := targetPeer.SpoolPort
+		if spoolPort <= 0 {
+			spoolPort = peer.SpoolPort
+		}
+		log.Printf("[MultiSpooler] Routing virtual print from port %d to peer %q (%s)", spoolPort, targetPeer.Name, targetURL)
 
 		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 		defer cancel()
@@ -444,6 +530,12 @@ func runUnifiedService(configPath string, headless bool) {
 			tm.FlashPrintComplete("Print Succeeded", fmt.Sprintf("%s was printed successfully!", job.FileName))
 		}
 	}
+	printService.OnJobFailed = func(job printer.PrintJob, reason string) {
+		if tm := getTray(); tm != nil {
+			tm.ShowBalloon("Print Failed", fmt.Sprintf("Failed to print %s: %s", job.FileName, reason))
+			tm.RestoreNetworkStatus()
+		}
+	}
 
 	syncEngine.OnSyncStarted = func(relPath string) {
 		if tm := getTray(); tm != nil {
@@ -468,6 +560,10 @@ func runUnifiedService(configPath string, headless bool) {
 				primaryURL := cfg.GetPeerURL()
 				primaryName := cfg.GetPeerName()
 				if primaryURL == "" {
+					if tm := getTray(); tm != nil {
+						tm.ShowBalloon("No Peer Connected", "Cannot print: no peer device is connected yet.")
+						tm.RestoreNetworkStatus()
+					}
 					return
 				}
 				ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
@@ -490,6 +586,10 @@ func runUnifiedService(configPath string, headless bool) {
 			OnPrintFileToPeer: func(targetPeerName, filePath string) {
 				p := cfg.FindPeer(targetPeerName)
 				if p == nil || p.URL == "" {
+					if tm := getTray(); tm != nil {
+						tm.ShowBalloon("Peer Unavailable", fmt.Sprintf("Cannot print: peer %q is not connected yet.", targetPeerName))
+						tm.RestoreNetworkStatus()
+					}
 					return
 				}
 				ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
@@ -624,10 +724,18 @@ func runUnifiedService(configPath string, headless bool) {
 		}
 	}()
 
-	// Start spooler listeners for all known peers
+	// Start spooler listeners for all known peers (with brief retry for TIME_WAIT after restart)
 	for _, p := range cfg.GetPeers() {
-		if err := multiSpooler.EnsurePeerListener(p); err != nil {
-			log.Printf("[MultiSpooler] Warning starting spooler listener for %s: %v", p.Name, err)
+		var listenErr error
+		for attempt := 0; attempt < 3; attempt++ {
+			listenErr = multiSpooler.EnsurePeerListener(p)
+			if listenErr == nil {
+				break
+			}
+			time.Sleep(250 * time.Millisecond)
+		}
+		if listenErr != nil {
+			log.Printf("[MultiSpooler] Warning starting spooler listener for %s: %v", p.Name, listenErr)
 		}
 	}
 
@@ -635,12 +743,19 @@ func runUnifiedService(configPath string, headless bool) {
 		// Periodic connection watcher to keep tray icon dot updated and maintain transitive mesh discovery
 		go func() {
 			peerFailCounts := make(map[string]int)
+			lastLocalTS := initialLocalTS
 
 			for {
 				select {
 				case <-quitChan:
 					return
 				case <-time.After(3 * time.Second):
+				}
+
+				localTailscale := installer.GetTailscaleIP()
+				if localTailscale != "" && localTailscale != lastLocalTS {
+					lastLocalTS = localTailscale
+					syncEngine.SetLocalURL(fmt.Sprintf("http://%s:%d", localTailscale, cfg.ListenPort))
 				}
 
 				tm := getTray()
@@ -659,7 +774,6 @@ func runUnifiedService(configPath string, headless bool) {
 				statusChanged := false
 				namesChanged := false
 				var newDiscoveredPeers []config.PeerDevice
-				localTailscale := installer.GetTailscaleIP()
 
 				for i := range peers {
 					wg.Add(1)

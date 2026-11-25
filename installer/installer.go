@@ -73,12 +73,13 @@ func InvalidateTailscaleCache() {
 }
 
 const (
-	TaskName     = "BridgeSystemService"
-	FirewallRule = "BridgeSystemService_8765"
-	TargetAppDir = `C:\BridgeApp`
-	TargetExe    = `C:\BridgeApp\bridge.exe`
-	TargetConfig = `C:\BridgeApp\config.json`
-	TargetIcons  = `C:\BridgeApp\icons`
+	TaskName      = "BridgeSystemService"
+	LogonTaskName = "BridgeAppLogon"
+	FirewallRule  = "BridgeSystemService_8765"
+	TargetAppDir  = `C:\BridgeApp`
+	TargetExe     = `C:\BridgeApp\bridge.exe`
+	TargetConfig  = `C:\BridgeApp\config.json`
+	TargetIcons   = `C:\BridgeApp\icons`
 )
 
 // DiscoveredPeer represents an auto-discovered peer on Tailscale.
@@ -144,23 +145,29 @@ func DiscoverTailscalePeers() ([]DiscoveredPeer, error) {
 		wg.Add(1)
 		go func(d DiscoveredPeer) {
 			defer wg.Done()
-			client := http.Client{Timeout: 1500 * time.Millisecond}
-			resp, err := client.Get(fmt.Sprintf("http://%s:8765/api/health", d.IP))
-			if err == nil && resp.StatusCode == http.StatusOK {
-				var hr struct {
-					NodeName string `json:"node_name"`
-					PeerName string `json:"peer_name"`
-				}
-				if json.NewDecoder(resp.Body).Decode(&hr) == nil {
-					if hr.NodeName != "" {
-						d.BridgeName = hr.NodeName
-						d.Online = true
+			client := http.Client{Timeout: 4 * time.Second}
+			req, err := http.NewRequest("GET", fmt.Sprintf("http://%s:8765/api/health", d.IP), nil)
+			if err == nil {
+				req.Header.Set("X-Bridge-Probe", "1")
+				resp, err := client.Do(req)
+				if err == nil {
+					if resp.StatusCode == http.StatusOK {
+						var hr struct {
+							NodeName string `json:"node_name"`
+							PeerName string `json:"peer_name"`
+						}
+						if json.NewDecoder(resp.Body).Decode(&hr) == nil {
+							if hr.NodeName != "" {
+								d.BridgeName = hr.NodeName
+								d.Online = true
+							}
+							if hr.PeerName != "" {
+								d.MyName = hr.PeerName
+							}
+						}
 					}
-					if hr.PeerName != "" {
-						d.MyName = hr.PeerName
-					}
+					resp.Body.Close()
 				}
-				resp.Body.Close()
 			}
 			mu.Lock()
 			peers = append(peers, d)
@@ -301,6 +308,47 @@ func EnsureTailscaleConnected() (string, error) {
 	return "", errors.New("timed out waiting for Tailscale login")
 }
 
+// ShortcutSyncResult reports virtual printer registration outcomes per peer.
+type ShortcutSyncResult struct {
+	SucceededPrinters []string
+	PrinterErrors     map[string]error
+}
+
+func removeSumatraShortcuts() {
+	_ = os.Remove(filepath.Join(TargetAppDir, "SumatraPDF.lnk"))
+	for _, d := range GetAllDesktopDirs() {
+		_ = os.Remove(filepath.Join(d, "SumatraPDF.lnk"))
+	}
+}
+
+func collectSendToDirs() []string {
+	seen := make(map[string]bool)
+	var sendToDirs []string
+	addSendTo := func(st string) {
+		if strings.TrimSpace(st) == "" {
+			return
+		}
+		clean := filepath.Clean(st)
+		low := strings.ToLower(clean)
+		if info, err := os.Stat(clean); err == nil && info.IsDir() && !seen[low] {
+			seen[low] = true
+			sendToDirs = append(sendToDirs, clean)
+		}
+	}
+
+	if appData := os.Getenv("APPDATA"); appData != "" {
+		addSendTo(filepath.Join(appData, "Microsoft", "Windows", "SendTo"))
+	}
+	if entries, err := os.ReadDir(`C:\Users`); err == nil {
+		for _, e := range entries {
+			if e.IsDir() {
+				addSendTo(filepath.Join(`C:\Users`, e.Name(), "AppData", "Roaming", "Microsoft", "Windows", "SendTo"))
+			}
+		}
+	}
+	return sendToDirs
+}
+
 // CreateBridgeShortcuts creates desktop shortcut and virtual printer for a single peer (backward compatibility).
 func CreateBridgeShortcuts(peerName string) error {
 	cleanPeer := SanitizeFileName(peerName)
@@ -312,11 +360,16 @@ func CreateBridgeShortcuts(peerName string) error {
 	})
 }
 
-// CreateBridgeShortcutsForPeers configures Windows Virtual Printers and SendTo shortcuts
-// for all connected peer devices in the multi-device network, plus the single global shared folder.
-func CreateBridgeShortcutsForPeers(peers []config.PeerDevice) error {
+// SyncBridgeShortcutsForPeers configures Windows Virtual Printers and SendTo shortcuts
+// for all connected peer devices plus a single global shared folder shortcut on the primary Desktop,
+// and returns per-peer virtual printer registration results.
+func SyncBridgeShortcutsForPeers(peers []config.PeerDevice) ShortcutSyncResult {
 	shortcutsMu.Lock()
 	defer shortcutsMu.Unlock()
+
+	result := ShortcutSyncResult{
+		PrinterErrors: make(map[string]error),
+	}
 
 	// Prune any obsolete virtual printers and ports from older versions
 	_ = PruneObsoleteVirtualPrinters(peers)
@@ -332,46 +385,40 @@ func CreateBridgeShortcutsForPeers(peers []config.PeerDevice) error {
 		_ = RemoveVirtualPrinter(localNodeName)
 	}
 
-	// 1. Desktop Shortcuts: Global shared folder shortcut and Silent Print Engine shortcut
+	// 1. Desktop Shortcuts: Create Bridge Shared Folder.lnk ONLY ONCE in GetPrimaryDesktopDir(),
+	// delete duplicates from all other Desktop directories, and remove SumatraPDF.lnk everywhere.
 	sharedLnkName := "Bridge Shared Folder.lnk"
+	primaryDesktop := GetPrimaryDesktopDir()
 	desktopDirs := GetAllDesktopDirs()
+
+	_ = os.Remove(filepath.Join(TargetAppDir, "SumatraPDF.lnk"))
+
 	for _, d := range desktopDirs {
-		// Clean up legacy drop-to-print or old shortcuts
+		// Clean up legacy drop-to-print, old shared folder shortcuts, and unwanted SumatraPDF shortcuts
 		_ = os.Remove(filepath.Join(d, "Bridge Print Folder.lnk"))
+		_ = os.Remove(filepath.Join(d, "SumatraPDF.lnk"))
+
+		if primaryDesktop != "" && !strings.EqualFold(filepath.Clean(d), filepath.Clean(primaryDesktop)) {
+			_ = os.Remove(filepath.Join(d, sharedLnkName))
+		}
 
 		files, err := os.ReadDir(d)
 		if err == nil {
 			for _, f := range files {
 				name := f.Name()
-				if strings.HasSuffix(name, " - Drop to Print.lnk") {
+				if strings.HasSuffix(name, " - Drop to Print.lnk") || strings.HasSuffix(name, " - Shared Folder.lnk") {
 					_ = os.Remove(filepath.Join(d, name))
 				}
 			}
 		}
-
-		_ = CreateDesktopShortcut(`C:\Bridge\Shared`, filepath.Join(d, sharedLnkName), "Bridge Multi-Device Two-Way Shared Folder (Global Mesh)", "")
 	}
 
-	// Create desktop shortcut for Silent Print Engine (SumatraPDF) if installed
-	if sumatra := FindSumatraPDF(); sumatra != "" {
-		for _, d := range desktopDirs {
-			_ = CreateDesktopShortcut(sumatra, filepath.Join(d, "SumatraPDF.lnk"), "Bridge Silent Print Engine (SumatraPDF)", "")
-		}
+	if primaryDesktop != "" {
+		_ = CreateDesktopShortcut(`C:\Bridge\Shared`, filepath.Join(primaryDesktop, sharedLnkName), "Bridge Multi-Device Two-Way Shared Folder (Global Mesh)", "")
 	}
 
 	// 2. Windows Explorer "Send To" native right-click shortcuts for EACH peer
-	sendToDirs := []string{
-		filepath.Join(os.Getenv("APPDATA"), "Microsoft", "Windows", "SendTo"),
-	}
-	entries, err := os.ReadDir(`C:\Users`)
-	if err == nil {
-		for _, e := range entries {
-			st := filepath.Join(`C:\Users`, e.Name(), "AppData", "Roaming", "Microsoft", "Windows", "SendTo")
-			if _, err := os.Stat(st); err == nil {
-				sendToDirs = append(sendToDirs, st)
-			}
-		}
-	}
+	sendToDirs := collectSendToDirs()
 
 	// Purge stale SendTo shortcuts that no longer match any peer in peers (and strictly purge self shortcut)
 	validLnkNames := make(map[string]bool)
@@ -419,9 +466,19 @@ func CreateBridgeShortcutsForPeers(peers []config.PeerDevice) error {
 		}
 		if err := InstallVirtualPrinter(cleanPeer, port); err != nil {
 			log.Printf("[Installer] Warning: Virtual printer registration failed for %s on port %d: %v", cleanPeer, port, err)
+			result.PrinterErrors[cleanPeer] = err
+		} else {
+			result.SucceededPrinters = append(result.SucceededPrinters, cleanPeer)
 		}
 	}
 
+	return result
+}
+
+// CreateBridgeShortcutsForPeers configures Windows Virtual Printers and SendTo shortcuts
+// for all connected peer devices in the multi-device network, plus the single global shared folder.
+func CreateBridgeShortcutsForPeers(peers []config.PeerDevice) error {
+	_ = SyncBridgeShortcutsForPeers(peers)
 	return nil
 }
 
@@ -442,8 +499,11 @@ func UpgradeInstallation(sourceExe string) error {
 		return fmt.Errorf("source path is a directory, not an executable file")
 	}
 
-	fmt.Println("[1/5] Stopping active Bridge background services...")
+	fmt.Println("[1/5] Stopping active Bridge background services and print engine...")
 	KillOtherBridgeProcesses()
+	cmdSumatra := exec.Command("taskkill", "/F", "/IM", "SumatraPDF.exe")
+	hideCmd(cmdSumatra)
+	_ = cmdSumatra.Run()
 	time.Sleep(500 * time.Millisecond)
 
 	// Replace TargetExe if source is different
@@ -476,6 +536,7 @@ func UpgradeInstallation(sourceExe string) error {
 
 	fmt.Println("[3/5] Refreshing system tray icons and configuration...")
 	_, _ = tray.EnsureIcons(TargetIcons)
+	removeSumatraShortcuts()
 
 	cfg, _ := config.LoadConfig(TargetConfig)
 	if cfg != nil {
@@ -488,14 +549,23 @@ func UpgradeInstallation(sourceExe string) error {
 				printer.ConfigureSumatraDefaults(sumatraPath)
 			}
 		}
+		removeSumatraShortcuts()
 		_ = config.SaveConfig(TargetConfig, cfg)
 	}
 
 	fmt.Println("[4/5] Updating startup registration (Session 1 taskbar tray)...")
-	_ = RegisterInteractiveStartup()
+	UnregisterInteractiveStartup()
+	if err := RegisterInteractiveStartup(); err != nil {
+		fmt.Printf("[!] Warning updating startup registration: %v\n", err)
+	}
 
 	if cfg != nil {
-		_ = CreateBridgeShortcutsForPeers(cfg.GetPeers())
+		res := SyncBridgeShortcutsForPeers(cfg.GetPeers())
+		for peerName, pErr := range res.PrinterErrors {
+			fmt.Printf("[!] Warning: Virtual printer 'Print on %s' failed: %v\n", peerName, pErr)
+		}
+	} else {
+		_ = SyncBridgeShortcutsForPeers(nil)
 	}
 
 	fmt.Println("[5/5] Restarting Bridge background service...")
@@ -503,6 +573,24 @@ func UpgradeInstallation(sourceExe string) error {
 	hideCmd(cmd)
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("failed to start Bridge background service: %w", err)
+	}
+
+	port := 8765
+	if cfg != nil && cfg.ListenPort > 0 {
+		port = cfg.ListenPort
+	}
+	var healthErr error
+	for i := 0; i < 15; i++ {
+		time.Sleep(350 * time.Millisecond)
+		healthErr = VerifyHealth(port)
+		if healthErr == nil {
+			break
+		}
+	}
+	if healthErr != nil {
+		fmt.Printf("[!] Note: Bridge restarted, but health check on port %d did not respond yet (%v).\n", port, healthErr)
+	} else {
+		fmt.Printf("[✓] Verified Bridge service health on port %d.\n", port)
 	}
 
 	fmt.Println()
@@ -524,14 +612,16 @@ func AutoUpgradeExisting() bool {
 	return UpgradeInstallation(currentExe) == nil
 }
 
-// InstallService deploys the executable, directories, firewall rule, and interactive startup.
-func InstallService(cfg *config.Config) error {
+func installServiceWithReport(cfg *config.Config) (ShortcutSyncResult, error) {
+	var res ShortcutSyncResult
 	fmt.Println("[1/5] Setting up directories and icons...")
 
 	// Kill legacy Session 0 scheduled task and any other old bridge processes
-	cmdTask := exec.Command("schtasks", "/Delete", "/TN", TaskName, "/F")
-	hideCmd(cmdTask)
-	_ = cmdTask.Run()
+	for _, tn := range []string{TaskName, LogonTaskName} {
+		cmdTask := exec.Command("schtasks", "/Delete", "/TN", tn, "/F")
+		hideCmd(cmdTask)
+		_ = cmdTask.Run()
+	}
 	KillOtherBridgeProcesses()
 
 	dirs := []string{
@@ -544,11 +634,12 @@ func InstallService(cfg *config.Config) error {
 	}
 	for _, d := range dirs {
 		if err := os.MkdirAll(d, 0755); err != nil {
-			return fmt.Errorf("failed to create directory %s: %w", d, err)
+			return res, fmt.Errorf("failed to create directory %s: %w", d, err)
 		}
 	}
 
 	_ = os.RemoveAll(`C:\Bridge\Print`)
+	removeSumatraShortcuts()
 	cmdAcl := exec.Command("icacls", TargetAppDir, "/grant", "*S-1-5-32-545:(OI)(CI)M", "/T", "/Q")
 	hideCmd(cmdAcl)
 	_ = cmdAcl.Run()
@@ -576,7 +667,7 @@ func InstallService(cfg *config.Config) error {
 
 	cfg.ConfigPath = TargetConfig
 	if err := config.SaveConfig(TargetConfig, cfg); err != nil {
-		return fmt.Errorf("failed to save config to %s: %w", TargetConfig, err)
+		return res, fmt.Errorf("failed to save config to %s: %w", TargetConfig, err)
 	}
 
 	fmt.Println("[3/5] Configuring Windows Firewall for TCP ports 8765 and 9100-9120...")
@@ -596,12 +687,20 @@ func InstallService(cfg *config.Config) error {
 	_ = cmdFwAdd.Run()
 
 	fmt.Println("[4/5] Registering Interactive Startup (Session 1 Taskbar Tray Dot)...")
-	_ = RegisterInteractiveStartup()
+	if err := RegisterInteractiveStartup(); err != nil {
+		fmt.Printf("[!] Warning registering startup: %v\n", err)
+	}
 
 	fmt.Println("[5/5] Creating Global Desktop Shortcut, SendTo Print, and Virtual Printers...")
-	_ = CreateBridgeShortcutsForPeers(cfg.GetPeers())
+	res = SyncBridgeShortcutsForPeers(cfg.GetPeers())
 
-	return nil
+	return res, nil
+}
+
+// InstallService deploys the executable, directories, firewall rule, and interactive startup.
+func InstallService(cfg *config.Config) error {
+	_, err := installServiceWithReport(cfg)
+	return err
 }
 
 // VerifyHealth checks if the local Bridge service HTTP API responds 200 OK.
@@ -622,9 +721,11 @@ func VerifyHealth(port int) error {
 // UninstallService cleanly removes startup entries, virtual printers, firewall rule, shortcuts, and application binaries.
 func UninstallService() error {
 	fmt.Println("[1/6] Stopping Bridge background processes, print engine, and scheduled tasks...")
-	cmdSch := exec.Command("schtasks", "/Delete", "/TN", TaskName, "/F")
-	hideCmd(cmdSch)
-	_ = cmdSch.Run()
+	for _, tn := range []string{LogonTaskName, TaskName} {
+		cmdSch := exec.Command("schtasks", "/Delete", "/TN", tn, "/F")
+		hideCmd(cmdSch)
+		_ = cmdSch.Run()
+	}
 
 	KillOtherBridgeProcesses()
 	cmdSumatra := exec.Command("taskkill", "/F", "/IM", "SumatraPDF.exe")
@@ -643,6 +744,7 @@ func UninstallService() error {
 	_ = cmdFwDel2.Run()
 
 	fmt.Println("[5/6] Cleaning up Desktop and Send-To shortcuts across all user profiles...")
+	removeSumatraShortcuts()
 	for _, d := range GetAllDesktopDirs() {
 		_ = os.Remove(filepath.Join(d, "Bridge Shared Folder.lnk"))
 		_ = os.Remove(filepath.Join(d, "Bridge Print Folder.lnk"))
@@ -659,17 +761,12 @@ func UninstallService() error {
 		}
 	}
 
-	entries, err := os.ReadDir(`C:\Users`)
-	if err == nil {
-		for _, e := range entries {
-			if e.IsDir() {
-				st := filepath.Join(`C:\Users`, e.Name(), "AppData", "Roaming", "Microsoft", "Windows", "SendTo")
-				if stEntries, err := os.ReadDir(st); err == nil {
-					for _, se := range stEntries {
-						if strings.HasPrefix(se.Name(), "Print on ") && strings.HasSuffix(se.Name(), ".lnk") {
-							_ = os.Remove(filepath.Join(st, se.Name()))
-						}
-					}
+	for _, st := range collectSendToDirs() {
+		if stEntries, err := os.ReadDir(st); err == nil {
+			for _, se := range stEntries {
+				low := strings.ToLower(se.Name())
+				if (strings.HasPrefix(se.Name(), "Print on ") || strings.Contains(low, "bridge")) && strings.HasSuffix(low, ".lnk") {
+					_ = os.Remove(filepath.Join(st, se.Name()))
 				}
 			}
 		}

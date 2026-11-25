@@ -191,6 +191,65 @@ func resolvePeerFromRequest(headerURL string, r *http.Request) (string, string) 
 	return config.ExtractIP(cleanURL), cleanURL
 }
 
+func findMatchingPeerSnapshot(peers []config.PeerDevice, name, ip, peerURL string) (config.PeerDevice, bool) {
+	cleanName := strings.TrimSpace(name)
+	cleanIP := strings.TrimSpace(ip)
+	cleanURL := strings.TrimRight(strings.TrimSpace(peerURL), "/")
+
+	if cleanIP == "" && cleanURL != "" {
+		cleanIP = config.ExtractIP(cleanURL)
+	}
+	if cleanURL == "" && cleanIP != "" {
+		cleanURL = fmt.Sprintf("http://%s:8765", cleanIP)
+	}
+
+	if cleanURL != "" {
+		for _, p := range peers {
+			if strings.EqualFold(p.URL, cleanURL) {
+				return p, true
+			}
+		}
+	}
+	if cleanName != "" {
+		for _, p := range peers {
+			if strings.EqualFold(p.Name, cleanName) {
+				return p, true
+			}
+		}
+	}
+	if cleanIP != "" {
+		for _, p := range peers {
+			if p.IP == cleanIP {
+				if cleanURL != "" && p.URL != "" && !strings.EqualFold(cleanURL, p.URL) {
+					continue
+				}
+				if cleanName != "" && p.Name != "" && !strings.EqualFold(cleanName, p.Name) {
+					continue
+				}
+				return p, true
+			}
+		}
+	}
+	return config.PeerDevice{}, false
+}
+
+func (s *Server) addOrUpdatePeerWithChange(name, ip, peerURL string) (config.PeerDevice, bool, bool) {
+	before := s.cfg.GetPeers()
+	dev, isNew := s.cfg.AddOrUpdatePeer(name, ip, peerURL)
+	if dev.Name == "" && dev.IP == "" && dev.URL == "" {
+		return dev, false, false
+	}
+	if isNew {
+		return dev, true, true
+	}
+	prev, found := findMatchingPeerSnapshot(before, name, ip, peerURL)
+	if !found {
+		return dev, false, false
+	}
+	changed := prev.Name != dev.Name || prev.IP != dev.IP || prev.URL != dev.URL || prev.SpoolPort != dev.SpoolPort
+	return dev, false, changed
+}
+
 func (s *Server) checkAutoPair(r *http.Request) {
 	peerHeader := r.Header.Get("X-Bridge-Peer-URL")
 	nodeHeader := r.Header.Get("X-Bridge-Node-Name")
@@ -206,11 +265,16 @@ func (s *Server) checkAutoPair(r *http.Request) {
 		return // Strictly ignore self
 	}
 
-	dev, isNew := s.cfg.AddOrUpdatePeer(cleanNodeName, cleanIP, cleanPeerURL)
+	dev, isNew, changed := s.addOrUpdatePeerWithChange(cleanNodeName, cleanIP, cleanPeerURL)
 	if isNew && dev.Name != "" {
 		log.Printf("[Server] Discovered new peer: '%s' (%s) -> Assigned SpoolPort %d", dev.Name, dev.URL, dev.SpoolPort)
 		if s.peerUpdater != nil {
-			s.peerUpdater(dev, isNew)
+			s.peerUpdater(dev, true)
+		}
+	} else if changed && dev.Name != "" {
+		log.Printf("[Server] Updated peer metadata: '%s' (%s) -> SpoolPort %d", dev.Name, dev.URL, dev.SpoolPort)
+		if s.peerUpdater != nil {
+			s.peerUpdater(dev, false)
 		}
 	}
 }
@@ -333,11 +397,11 @@ func (s *Server) handlePeers(w http.ResponseWriter, r *http.Request) {
 			_ = json.NewEncoder(w).Encode(dev)
 			return
 		}
-		addedDev, isNew := s.cfg.AddOrUpdatePeer(dev.Name, dev.IP, dev.URL)
-		if s.cfg.ConfigPath != "" {
+		addedDev, isNew, changed := s.addOrUpdatePeerWithChange(dev.Name, dev.IP, dev.URL)
+		if (isNew || changed) && s.cfg.ConfigPath != "" {
 			_ = config.SaveConfig(s.cfg.ConfigPath, s.cfg)
 		}
-		if isNew && s.peerUpdater != nil {
+		if (isNew || changed) && s.peerUpdater != nil && (addedDev.Name != "" || addedDev.URL != "" || addedDev.IP != "") {
 			s.peerUpdater(addedDev, isNew)
 		}
 		w.Header().Set("Content-Type", "application/json")
@@ -583,18 +647,23 @@ func (s *Server) handlePrintLocal(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Resolve target peer (from X-Bridge-Target header or default to primary)
-	target := r.Header.Get("X-Bridge-Target")
+	target := strings.TrimSpace(r.Header.Get("X-Bridge-Target"))
 	peerURL := ""
 	peerName := ""
 
 	if target != "" {
-		if p := s.cfg.FindPeer(target); p != nil {
-			peerURL = p.URL
-			peerName = p.Name
+		p := s.cfg.FindPeer(target)
+		if p == nil {
+			http.Error(w, fmt.Sprintf("target peer not found: %s", target), http.StatusNotFound)
+			return
 		}
-	}
-
-	if peerURL == "" {
+		if p.URL == "" {
+			http.Error(w, fmt.Sprintf("target peer %s has no reachable URL", p.Name), http.StatusServiceUnavailable)
+			return
+		}
+		peerURL = p.URL
+		peerName = p.Name
+	} else {
 		peerURL = s.cfg.GetPeerURL()
 		peerName = s.cfg.GetPeerName()
 	}

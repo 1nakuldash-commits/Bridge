@@ -375,3 +375,295 @@ func TestReceiveSyncFileConcurrentAndStateSave(t *testing.T) {
 		t.Fatalf("leftover state.json.tmp found")
 	}
 }
+
+func TestResyncNowScansLocalChangesAndReconcilesAcrossAllPeers(t *testing.T) {
+	tmp := t.TempDir()
+	sharedDir := filepath.Join(tmp, "shared")
+	if err := os.MkdirAll(sharedDir, 0755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	sm, err := NewStateManager(filepath.Join(tmp, "state.json"))
+	if err != nil {
+		t.Fatalf("NewStateManager: %v", err)
+	}
+
+	// Pre-record a file that was deleted locally on disk before ResyncNow.
+	deletedContent := []byte("deleted locally before resync")
+	if err := sm.Set("deleted_local.txt", FileRecord{
+		RelPath: "deleted_local.txt",
+		Hash:    sha256Hex(deletedContent),
+		Size:    int64(len(deletedContent)),
+		ModTime: time.Now().Add(-1 * time.Minute).UnixNano(),
+	}); err != nil {
+		t.Fatalf("sm.Set deleted_local: %v", err)
+	}
+
+	// Untracked brand-new local file written directly to disk (not in state.json).
+	missedLocal := []byte("brand new untracked local file")
+	if err := os.WriteFile(filepath.Join(sharedDir, "missed_local.txt"), missedLocal, 0644); err != nil {
+		t.Fatalf("WriteFile missed_local: %v", err)
+	}
+
+	remoteFromA := []byte("remote file from peer A")
+	peerAInv := map[string]FileRecord{
+		"from_peer_a.txt": {
+			RelPath: "from_peer_a.txt",
+			Hash:    sha256Hex(remoteFromA),
+			Size:    int64(len(remoteFromA)),
+			ModTime: time.Now().UnixNano(),
+		},
+	}
+	peerBInv := map[string]FileRecord{
+		"deleted_local.txt": {
+			RelPath: "deleted_local.txt",
+			Hash:    sha256Hex(deletedContent),
+			Size:    int64(len(deletedContent)),
+			ModTime: time.Now().Add(-1 * time.Minute).UnixNano(),
+		},
+	}
+
+	var mu sync.Mutex
+	uploadedA := make(map[string][]byte)
+	uploadedB := make(map[string][]byte)
+	deletedB := make(map[string]bool)
+
+	newPeerSrv := func(inv map[string]FileRecord, files map[string][]byte, uploaded map[string][]byte, deleted map[string]bool) *httptest.Server {
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch r.URL.Path {
+			case "/api/sync/inventory":
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(inv)
+			case "/api/sync":
+				switch r.Method {
+				case http.MethodGet:
+					rel := r.URL.Query().Get("path")
+					data, ok := files[rel]
+					if !ok {
+						http.NotFound(w, r)
+						return
+					}
+					w.WriteHeader(http.StatusOK)
+					_, _ = w.Write(data)
+				case http.MethodPost:
+					rel := r.Header.Get("X-Bridge-RelPath")
+					body, _ := io.ReadAll(r.Body)
+					mu.Lock()
+					uploaded[rel] = body
+					mu.Unlock()
+					w.WriteHeader(http.StatusOK)
+				case http.MethodDelete:
+					rel := r.URL.Query().Get("path")
+					if rel == "" {
+						rel = r.Header.Get("X-Bridge-RelPath")
+					}
+					mu.Lock()
+					if deleted != nil {
+						deleted[rel] = true
+					}
+					mu.Unlock()
+					w.WriteHeader(http.StatusOK)
+				}
+			default:
+				http.NotFound(w, r)
+			}
+		}))
+	}
+
+	peerA := newPeerSrv(peerAInv, map[string][]byte{"from_peer_a.txt": remoteFromA}, uploadedA, nil)
+	defer peerA.Close()
+	peerB := newPeerSrv(peerBInv, nil, uploadedB, deletedB)
+	defer peerB.Close()
+
+	se := NewSyncEngine(sharedDir, "", "tok", sm)
+	se.UpdatePeerURLs([]string{peerA.URL, peerB.URL})
+	defer se.Stop()
+
+	// Synchronous ResyncNow across all peers without starting watcher loop.
+	se.ResyncNow()
+
+	mu.Lock()
+	gotA := uploadedA["missed_local.txt"]
+	gotB := uploadedB["missed_local.txt"]
+	delB := deletedB["deleted_local.txt"]
+	mu.Unlock()
+
+	if !bytes.Equal(gotA, missedLocal) {
+		t.Fatalf("peer A did not receive untracked local file: got %q", gotA)
+	}
+	if !bytes.Equal(gotB, missedLocal) {
+		t.Fatalf("peer B did not receive untracked local file: got %q", gotB)
+	}
+	if !delB {
+		t.Fatalf("peer B did not receive deletion for deleted_local.txt")
+	}
+	if !sm.IsDeleted("deleted_local.txt") {
+		t.Fatalf("expected deleted_local.txt to be tombstoned in stateMgr")
+	}
+	pulled, err := os.ReadFile(filepath.Join(sharedDir, "from_peer_a.txt"))
+	if err != nil || !bytes.Equal(pulled, remoteFromA) {
+		t.Fatalf("expected from_peer_a.txt to be pulled locally, got %q (err=%v)", pulled, err)
+	}
+}
+
+func TestDirectoryRenameSyncsWithoutStaleTombstones(t *testing.T) {
+	tmp := t.TempDir()
+	sharedDir := filepath.Join(tmp, "shared")
+	if err := os.MkdirAll(sharedDir, 0755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	sm, err := NewStateManager(filepath.Join(tmp, "state.json"))
+	if err != nil {
+		t.Fatalf("NewStateManager: %v", err)
+	}
+
+	var mu sync.Mutex
+	uploaded := make(map[string][]byte)
+	deleted := make(map[string]int)
+	peerSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/sync" {
+			switch r.Method {
+			case http.MethodPost:
+				rel := r.Header.Get("X-Bridge-RelPath")
+				body, _ := io.ReadAll(r.Body)
+				mu.Lock()
+				uploaded[rel] = body
+				mu.Unlock()
+				w.WriteHeader(http.StatusOK)
+				return
+			case http.MethodDelete:
+				rel := r.URL.Query().Get("path")
+				if rel == "" {
+					rel = r.Header.Get("X-Bridge-RelPath")
+				}
+				mu.Lock()
+				deleted[rel]++
+				mu.Unlock()
+				w.WriteHeader(http.StatusOK)
+				return
+			}
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer peerSrv.Close()
+
+	var started int32
+	var completed int32
+	se := NewSyncEngine(sharedDir, peerSrv.URL, "tok", sm)
+	se.OnSyncStarted = func(relPath string) {
+		atomic.AddInt32(&started, 1)
+	}
+	se.OnSyncCompleted = func(relPath string) {
+		atomic.AddInt32(&completed, 1)
+	}
+	if err := se.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	// Create folder dir_alpha with an older-mtime file and wait for initial sync.
+	dirAlpha := filepath.Join(sharedDir, "dir_alpha")
+	if err := os.MkdirAll(dirAlpha, 0755); err != nil {
+		t.Fatalf("MkdirAll dir_alpha: %v", err)
+	}
+	payload := []byte("important file inside renamed folder")
+	alphaFile := filepath.Join(dirAlpha, "doc.txt")
+	if err := os.WriteFile(alphaFile, payload, 0644); err != nil {
+		t.Fatalf("WriteFile doc.txt: %v", err)
+	}
+	oldTime := time.Now().Add(-1 * time.Hour)
+	_ = os.Chtimes(alphaFile, oldTime, oldTime)
+
+	deadline := time.Now().Add(6 * time.Second)
+	for time.Now().Before(deadline) {
+		mu.Lock()
+		_, ok := uploaded["dir_alpha/doc.txt"]
+		mu.Unlock()
+		if ok && atomic.LoadInt32(&completed) >= 1 {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	mu.Lock()
+	if _, ok := uploaded["dir_alpha/doc.txt"]; !ok {
+		mu.Unlock()
+		t.Fatalf("initial dir_alpha/doc.txt did not sync")
+	}
+	mu.Unlock()
+
+	// Also create and remove an empty directory to verify no stale directory tombstone is saved.
+	emptyDir := filepath.Join(sharedDir, "empty_dir")
+	_ = os.MkdirAll(emptyDir, 0755)
+	time.Sleep(150 * time.Millisecond)
+	_ = os.Remove(emptyDir)
+
+	// Rename dir_alpha -> dir_beta.
+	dirBeta := filepath.Join(sharedDir, "dir_beta")
+	if err := os.Rename(dirAlpha, dirBeta); err != nil {
+		t.Fatalf("Rename dir_alpha -> dir_beta: %v", err)
+	}
+
+	deadline = time.Now().Add(6 * time.Second)
+	for time.Now().Before(deadline) {
+		mu.Lock()
+		_, okBeta := uploaded["dir_beta/doc.txt"]
+		delAlpha := deleted["dir_alpha/doc.txt"]
+		mu.Unlock()
+		if okBeta && delAlpha > 0 {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	mu.Lock()
+	_, okBeta := uploaded["dir_beta/doc.txt"]
+	delAlpha := deleted["dir_alpha/doc.txt"]
+	delete(uploaded, "dir_alpha/doc.txt")
+	mu.Unlock()
+	if !okBeta {
+		t.Fatalf("dir_beta/doc.txt was not uploaded after folder rename")
+	}
+	if delAlpha == 0 {
+		t.Fatalf("dir_alpha/doc.txt deletion was not propagated after folder rename")
+	}
+
+	// Rename dir_beta back -> dir_alpha (even though dir_alpha/doc.txt has a tombstone and old mtime).
+	if err := os.Rename(dirBeta, dirAlpha); err != nil {
+		t.Fatalf("Rename dir_beta -> dir_alpha: %v", err)
+	}
+
+	deadline = time.Now().Add(6 * time.Second)
+	for time.Now().Before(deadline) {
+		mu.Lock()
+		_, okAlphaBack := uploaded["dir_alpha/doc.txt"]
+		mu.Unlock()
+		if okAlphaBack && atomic.LoadInt32(&completed) == atomic.LoadInt32(&started) {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	se.Stop()
+
+	if _, err := os.Stat(alphaFile); err != nil {
+		t.Fatalf("expected renamed-back file dir_alpha/doc.txt to remain on disk, got err=%v", err)
+	}
+	mu.Lock()
+	gotBack := uploaded["dir_alpha/doc.txt"]
+	dirTomb := deleted["dir_alpha"] + deleted["empty_dir"]
+	mu.Unlock()
+	if !bytes.Equal(gotBack, payload) {
+		t.Fatalf("expected dir_alpha/doc.txt to re-upload after rename back, got %q", gotBack)
+	}
+	if dirTomb != 0 {
+		t.Fatalf("expected no stale directory delete broadcasts for dir_alpha/empty_dir, got %d", dirTomb)
+	}
+	if _, exists := sm.Get("empty_dir"); exists {
+		t.Fatalf("expected no stale tombstone in stateMgr for empty_dir")
+	}
+	if _, exists := sm.Get("dir_alpha"); exists {
+		t.Fatalf("expected no stale tombstone in stateMgr for dir_alpha")
+	}
+	if s, c := atomic.LoadInt32(&started), atomic.LoadInt32(&completed); s == 0 || s != c {
+		t.Fatalf("expected balanced OnSyncStarted (%d) == OnSyncCompleted (%d)", s, c)
+	}
+}
