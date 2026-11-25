@@ -568,6 +568,13 @@ func UpgradeInstallation(sourceExe string) error {
 		_ = SyncBridgeShortcutsForPeers(nil)
 	}
 
+	port := 8765
+	if cfg != nil && cfg.ListenPort > 0 {
+		port = cfg.ListenPort
+	}
+	fmt.Printf("Refreshing Windows Firewall rule (%s) for TCP ports %d and 9100-9120...\n", FirewallRule, port)
+	ensureFirewallRule(port)
+
 	fmt.Println("[5/5] Restarting Bridge background service...")
 	cmd := exec.Command(TargetExe, "-autostart")
 	hideCmd(cmd)
@@ -575,10 +582,6 @@ func UpgradeInstallation(sourceExe string) error {
 		return fmt.Errorf("failed to start Bridge background service: %w", err)
 	}
 
-	port := 8765
-	if cfg != nil && cfg.ListenPort > 0 {
-		port = cfg.ListenPort
-	}
 	var healthErr error
 	for i := 0; i < 15; i++ {
 		time.Sleep(350 * time.Millisecond)
@@ -670,21 +673,12 @@ func installServiceWithReport(cfg *config.Config) (ShortcutSyncResult, error) {
 		return res, fmt.Errorf("failed to save config to %s: %w", TargetConfig, err)
 	}
 
-	fmt.Println("[3/5] Configuring Windows Firewall for TCP ports 8765 and 9100-9120...")
-	cmdFwDel := exec.Command("netsh", "advfirewall", "firewall", "delete", "rule", fmt.Sprintf("name=%s", FirewallRule))
-	hideCmd(cmdFwDel)
-	_ = cmdFwDel.Run()
-
-	cmdFwAdd := exec.Command("netsh", "advfirewall", "firewall", "add", "rule",
-		fmt.Sprintf("name=%s", FirewallRule),
-		"dir=in",
-		"action=allow",
-		"protocol=TCP",
-		fmt.Sprintf("localport=%d,9100-9120", cfg.ListenPort),
-		"profile=any",
-		"description=Bridge multi-device file sync and virtual print communication")
-	hideCmd(cmdFwAdd)
-	_ = cmdFwAdd.Run()
+	listenPort := cfg.ListenPort
+	if listenPort <= 0 {
+		listenPort = 8765
+	}
+	fmt.Printf("[3/5] Configuring Windows Firewall for TCP ports %d and 9100-9120...\n", listenPort)
+	ensureFirewallRule(listenPort)
 
 	fmt.Println("[4/5] Registering Interactive Startup (Session 1 Taskbar Tray Dot)...")
 	if err := RegisterInteractiveStartup(); err != nil {
@@ -695,6 +689,36 @@ func installServiceWithReport(cfg *config.Config) (ShortcutSyncResult, error) {
 	res = SyncBridgeShortcutsForPeers(cfg.GetPeers())
 
 	return res, nil
+}
+
+func firewallRuleDeleteArgs() []string {
+	return []string{"advfirewall", "firewall", "delete", "rule", fmt.Sprintf("name=%s", FirewallRule)}
+}
+
+func firewallRuleAddArgs(listenPort int) []string {
+	if listenPort <= 0 {
+		listenPort = 8765
+	}
+	return []string{
+		"advfirewall", "firewall", "add", "rule",
+		fmt.Sprintf("name=%s", FirewallRule),
+		"dir=in",
+		"action=allow",
+		"protocol=TCP",
+		fmt.Sprintf("localport=%d,9100-9120", listenPort),
+		"profile=any",
+		"description=Bridge multi-device file sync and virtual print communication",
+	}
+}
+
+func ensureFirewallRule(listenPort int) {
+	cmdFwDel := exec.Command("netsh", firewallRuleDeleteArgs()...)
+	hideCmd(cmdFwDel)
+	_ = cmdFwDel.Run()
+
+	cmdFwAdd := exec.Command("netsh", firewallRuleAddArgs(listenPort)...)
+	hideCmd(cmdFwAdd)
+	_ = cmdFwAdd.Run()
 }
 
 // InstallService deploys the executable, directories, firewall rule, and interactive startup.

@@ -855,14 +855,8 @@ func ReleaseServiceLock() {
 
 const bridgeRegSubkey = `Software\BridgeApp`
 
-func isBridgeLogonTaskCurrent() bool {
-	sysRoot := os.Getenv("SystemRoot")
-	if sysRoot == "" {
-		sysRoot = `C:\Windows`
-	}
-	taskXMLPath := filepath.Join(sysRoot, "System32", "Tasks", LogonTaskName)
-	raw, err := os.ReadFile(taskXMLPath)
-	if err != nil || len(raw) == 0 {
+func isBridgeLogonTaskXMLCurrent(raw []byte) bool {
+	if len(raw) == 0 {
 		return false
 	}
 	clean := strings.ToLower(string(bytes.ReplaceAll(raw, []byte{0}, nil)))
@@ -870,7 +864,41 @@ func isBridgeLogonTaskCurrent() bool {
 		strings.Contains(clean, "-autostart") &&
 		strings.Contains(clean, "<logontrigger>") &&
 		strings.Contains(clean, "<runlevel>highestavailable</runlevel>") &&
-		strings.Contains(clean, "<logontype>interactivetoken</logontype>")
+		strings.Contains(clean, "<logontype>interactivetoken</logontype>") &&
+		strings.Contains(clean, "<disallowstartifonbatteries>false</disallowstartifonbatteries>") &&
+		strings.Contains(clean, "<stopifgoingonbatteries>false</stopifgoingonbatteries>") &&
+		strings.Contains(clean, "<executiontimelimit>pt0s</executiontimelimit>")
+}
+
+func isBridgeLogonTaskCurrent() bool {
+	sysRoot := os.Getenv("SystemRoot")
+	if sysRoot == "" {
+		sysRoot = `C:\Windows`
+	}
+	taskXMLPath := filepath.Join(sysRoot, "System32", "Tasks", LogonTaskName)
+	raw, err := os.ReadFile(taskXMLPath)
+	if err != nil {
+		return false
+	}
+	return isBridgeLogonTaskXMLCurrent(raw)
+}
+
+func buildRegisterLogonTaskScript(exePath, taskName string) string {
+	escExe := strings.ReplaceAll(exePath, "'", "''")
+	escTask := strings.ReplaceAll(taskName, "'", "''")
+	return fmt.Sprintf(`$ErrorActionPreference = 'Stop'
+$exe = '%s'
+$taskName = '%s'
+$user = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+if ([string]::IsNullOrWhiteSpace($user)) {
+    $user = "$env:USERDOMAIN\$env:USERNAME"
+}
+$action = New-ScheduledTaskAction -Execute $exe -Argument '-autostart'
+$trigger = New-ScheduledTaskTrigger -AtLogOn -User $user
+$principal = New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel Highest
+$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Seconds 0) -MultipleInstances IgnoreNew
+Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force -ErrorAction Stop | Out-Null
+`, escExe, escTask)
 }
 
 func removeHKCURunBridgeEntries() {
@@ -916,10 +944,10 @@ func hasBridgeLogonMarker() bool {
 }
 
 // RegisterInteractiveStartup ensures bridge.exe starts silently in Session 1 at user logon.
-// When elevated, it registers the interactive elevated logon task BridgeAppLogon (so virtual
-// printers auto-register silently on peer changes after reboots) and removes HKCU\Run\BridgeApp
-// to avoid dual-launch races, falling back cleanly to HKCU\Run if schtasks fails.
-// Non-elevated calls stay fast and in-process (<1ms).
+// When elevated, it registers the interactive elevated logon task BridgeAppLogon (configured to
+// start on battery, stay running on battery, and have no execution time limit) and removes
+// HKCU\Run\BridgeApp to avoid dual-launch races, falling back cleanly to HKCU\Run if
+// Register-ScheduledTask fails. Non-elevated calls stay fast and in-process (<1ms).
 func RegisterInteractiveStartup() error {
 	if IsElevated() {
 		if isBridgeLogonTaskCurrent() {
@@ -928,15 +956,15 @@ func RegisterInteractiveStartup() error {
 			return nil
 		}
 
-		trCmd := fmt.Sprintf(`"%s" -autostart`, TargetExe)
-		cmd := exec.Command("schtasks", "/Create", "/TN", LogonTaskName, "/TR", trCmd, "/SC", "ONLOGON", "/RL", "HIGHEST", "/IT", "/F")
+		psScript := buildRegisterLogonTaskScript(TargetExe, LogonTaskName)
+		cmd := exec.Command("powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", psScript)
 		hideCmd(cmd)
 		if err := cmd.Run(); err == nil {
 			removeHKCURunBridgeEntries()
 			setStartupModeMarker(LogonTaskName)
 			return nil
 		}
-		// Fall back to HKCU\Run if schtasks creation is blocked by policy
+		// Fall back to HKCU\Run if Register-ScheduledTask fails or is blocked by policy
 		clearStartupModeMarker()
 	} else if hasBridgeLogonMarker() {
 		// Elevated logon task is already registered; keep HKCU\Run clean so two instances never race

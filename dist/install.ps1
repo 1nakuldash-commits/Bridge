@@ -331,13 +331,20 @@ foreach ($sd in $legacyStartupDirs) {
 # Register Interactive Elevated Logon task (Session 1 + Admin rights for virtual printers), falling back to HKCU Run
 $logonTaskOk = $false
 try {
-    & schtasks.exe /Create /TN "BridgeAppLogon" /TR '"C:\BridgeApp\bridge.exe" -autostart' /SC ONLOGON /RL HIGHEST /IT /F 2>&1 | Out-Null
-    if ($LASTEXITCODE -eq 0) {
-        $logonTaskOk = $true
-        Remove-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" -Name "BridgeApp" -Force -ErrorAction SilentlyContinue | Out-Null
-        if (-not (Test-Path "HKCU:\Software\BridgeApp")) { New-Item -Path "HKCU:\Software\BridgeApp" -Force | Out-Null }
-        Set-ItemProperty -Path "HKCU:\Software\BridgeApp" -Name "StartupMode" -Value "BridgeAppLogon" -Force -ErrorAction SilentlyContinue
+    $exe = "C:\BridgeApp\bridge.exe"
+    $user = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+    if ([string]::IsNullOrWhiteSpace($user)) {
+        $user = "$env:USERDOMAIN\$env:USERNAME"
     }
+    $action = New-ScheduledTaskAction -Execute $exe -Argument '-autostart'
+    $trigger = New-ScheduledTaskTrigger -AtLogOn -User $user
+    $principal = New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel Highest
+    $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Seconds 0) -MultipleInstances IgnoreNew
+    Register-ScheduledTask -TaskName "BridgeAppLogon" -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force -ErrorAction Stop | Out-Null
+    $logonTaskOk = $true
+    Remove-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" -Name "BridgeApp" -Force -ErrorAction SilentlyContinue | Out-Null
+    if (-not (Test-Path "HKCU:\Software\BridgeApp")) { New-Item -Path "HKCU:\Software\BridgeApp" -Force | Out-Null }
+    Set-ItemProperty -Path "HKCU:\Software\BridgeApp" -Name "StartupMode" -Value "BridgeAppLogon" -Force -ErrorAction SilentlyContinue
 } catch {}
 if (-not $logonTaskOk) {
     Remove-ItemProperty -Path "HKCU:\Software\BridgeApp" -Name "StartupMode" -Force -ErrorAction SilentlyContinue | Out-Null

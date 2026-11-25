@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strconv"
 	"strings"
@@ -458,5 +459,39 @@ func TestConfirmPeerNameAndSyncPreservesCustomName(t *testing.T) {
 	}
 	if len(loaded.Peers) != 1 || loaded.Peers[0].Name != "Office-U2" || !loaded.Peers[0].CustomName {
 		t.Fatalf("Expected persisted peer 'Office-U2' with CustomName=true, got %+v", loaded.Peers)
+	}
+}
+
+func TestFirewallRuleArgs(t *testing.T) {
+	wantDel := []string{"advfirewall", "firewall", "delete", "rule", "name=" + FirewallRule}
+	if gotDel := firewallRuleDeleteArgs(); !reflect.DeepEqual(gotDel, wantDel) {
+		t.Fatalf("firewallRuleDeleteArgs() = %v, want %v", gotDel, wantDel)
+	}
+
+	tests := []struct {
+		port     int
+		wantPort string
+	}{
+		{0, "localport=8765,9100-9120"},
+		{-1, "localport=8765,9100-9120"},
+		{8765, "localport=8765,9100-9120"},
+		{9876, "localport=9876,9100-9120"},
+	}
+
+	for _, tt := range tests {
+		got := firewallRuleAddArgs(tt.port)
+		want := []string{
+			"advfirewall", "firewall", "add", "rule",
+			"name=" + FirewallRule,
+			"dir=in",
+			"action=allow",
+			"protocol=TCP",
+			tt.wantPort,
+			"profile=any",
+			"description=Bridge multi-device file sync and virtual print communication",
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("firewallRuleAddArgs(%d) = %v, want %v", tt.port, got, want)
+		}
 	}
 }
