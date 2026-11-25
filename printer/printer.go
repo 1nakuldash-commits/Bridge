@@ -9,13 +9,16 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -92,20 +95,23 @@ type PrintJob struct {
 
 // PrintService manages the print queue and the anti-hang sequential worker.
 type PrintService struct {
-	mu             sync.RWMutex
-	sumatraPath    string
-	targetPrinter  string
-	timeout        time.Duration
-	queueDir       string
-	failedDir      string
-	queue          chan PrintJob
-	activeJobs     int32
-	ctx            context.Context
-	cancel         context.CancelFunc
-	wg             sync.WaitGroup
-	OnJobStarted   func(job PrintJob)
-	OnJobCompleted func(job PrintJob)
-	OnJobFailed    func(job PrintJob, reason string)
+	mu                   sync.RWMutex
+	sumatraPath          string
+	targetPrinter        string
+	timeout              time.Duration
+	queueDir             string
+	failedDir            string
+	queue                chan PrintJob
+	activeJobs           int32
+	ctx                  context.Context
+	cancel               context.CancelFunc
+	wg                   sync.WaitGroup
+	resolveTargetPrinter func() (string, error)
+	findSumatra          func() string
+	ensureSumatra        func() (string, error)
+	OnJobStarted         func(job PrintJob)
+	OnJobCompleted       func(job PrintJob)
+	OnJobFailed          func(job PrintJob, reason string)
 }
 
 // NewPrintService creates a new print service.
@@ -159,11 +165,13 @@ func (ps *PrintService) Start() error {
 	// Proactive auto-heal: On Windows, if SumatraPDF is missing, begin background provisioning
 	// so the engine is fully ready and verified before the first print job arrives.
 	initialSumatra := ps.getSumatraPath()
+	findFn := ps.getFindSumatra()
+	ensureFn := ps.getEnsureSumatra()
 	if runtime.GOOS == "windows" {
 		ConfigureSumatraDefaults(initialSumatra)
-		if !isUsableSumatra(initialSumatra) && FindSumatraPDF() == "" {
+		if !isUsableSumatra(initialSumatra) && findFn() == "" {
 			go func() {
-				if path, err := EnsureSumatraPDF(); err == nil && path != "" {
+				if path, err := ensureFn(); err == nil && path != "" {
 					ps.setSumatraPath(path)
 					ConfigureSumatraDefaults(path)
 				}
@@ -572,12 +580,18 @@ func fileExists(p string) bool {
 }
 
 var directPrintClient = &http.Client{
-	Timeout: 60 * time.Second,
 	Transport: &http.Transport{
-		MaxIdleConns:        100,
-		MaxIdleConnsPerHost: 20,
-		IdleConnTimeout:     90 * time.Second,
-		DisableCompression:  true, // Print streams (XPS/PDF) are pre-compressed; avoids redundant CPU compression latency
+		DialContext: (&net.Dialer{
+			Timeout:   15 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ResponseHeaderTimeout: 120 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+		MaxIdleConns:          100,
+		MaxIdleConnsPerHost:   20,
+		IdleConnTimeout:       90 * time.Second,
+		DisableCompression:    true, // Print streams (XPS/PDF) are pre-compressed; avoids redundant CPU compression latency
 	},
 }
 
@@ -811,7 +825,6 @@ func EnsureSumatraPDF() (string, error) {
 	log.Printf("[Printer] SumatraPDF not detected. Downloading standalone engine to %s...", targetPath)
 	if err := DownloadSumatraPDF(targetPath); err == nil && isValidSumatraExe(targetPath) {
 		log.Printf("[Printer] Successfully provisioned standalone SumatraPDF at %s", targetPath)
-		_ = CreateSumatraShortcut(targetPath)
 		ConfigureSumatraDefaults(targetPath)
 		return targetPath, nil
 	}
@@ -823,7 +836,6 @@ func EnsureSumatraPDF() (string, error) {
 	_ = cmd.Run()
 	for i := 0; i < 15; i++ {
 		if found := FindSumatraPDF(); found != "" {
-			_ = CreateSumatraShortcut(found)
 			ConfigureSumatraDefaults(found)
 			return found, nil
 		}
@@ -912,26 +924,51 @@ func applySumatraSettingsFile(settingsPath string) {
 	}
 }
 
-// CreateSumatraShortcut creates a shortcut to SumatraPDF in C:\BridgeApp\SumatraPDF.lnk and across desktop directories.
+// CreateSumatraShortcut is kept for API compatibility; SumatraPDF runs silently in the background
+// with no shortcuts, so this validates exePath and removes any stale SumatraPDF.lnk files.
 func CreateSumatraShortcut(exePath string) error {
 	if exePath == "" || !isValidSumatraExe(exePath) {
 		return errors.New("invalid SumatraPDF executable path")
 	}
 
-	// 1. Standalone application directory shortcut
-	lnkPath := `C:\BridgeApp\SumatraPDF.lnk`
-	_ = os.MkdirAll(filepath.Dir(lnkPath), 0755)
-	_ = CreateShortcut(exePath, lnkPath, "Bridge Silent Print Engine", "")
-
-	// 2. Desktop shortcuts across user profiles
-	desktopDirs := getDesktopDirsForShortcuts()
-	for _, d := range desktopDirs {
-		_ = os.MkdirAll(d, 0755)
-		desktopLnk := filepath.Join(d, "SumatraPDF.lnk")
-		_ = CreateShortcut(exePath, desktopLnk, "Bridge Silent Print Engine (SumatraPDF)", "")
+	targets := []string{`C:\BridgeApp\SumatraPDF.lnk`}
+	for _, d := range getDesktopDirsForShortcuts() {
+		targets = append(targets, filepath.Join(d, "SumatraPDF.lnk"))
 	}
-
+	removeStaleSumatraShortcuts(targets)
 	return nil
+}
+
+func removeStaleSumatraShortcuts(paths []string) {
+	for _, p := range paths {
+		if p == "" {
+			continue
+		}
+		if err := os.Remove(p); err == nil {
+			log.Printf("[Printer] Removed stale SumatraPDF shortcut: %s", p)
+		}
+	}
+}
+
+func (ps *PrintService) getFindSumatra() func() string {
+	if ps.findSumatra != nil {
+		return ps.findSumatra
+	}
+	return FindSumatraPDF
+}
+
+func (ps *PrintService) getEnsureSumatra() func() (string, error) {
+	if ps.ensureSumatra != nil {
+		return ps.ensureSumatra
+	}
+	return EnsureSumatraPDF
+}
+
+func (ps *PrintService) failJob(job PrintJob, reason string) {
+	ps.moveToFailed(job, reason)
+	if ps.OnJobFailed != nil {
+		ps.OnJobFailed(job, reason)
+	}
 }
 
 func (ps *PrintService) processJob(job PrintJob) {
@@ -940,38 +977,42 @@ func (ps *PrintService) processJob(job PrintJob) {
 		ps.OnJobStarted(job)
 	}
 
-	targetPrinter := ps.getTargetPrinter()
+	targetPrinter := strings.TrimSpace(ps.getTargetPrinter())
 	sumatraBin := ps.getSumatraPath()
 	var err error
 	if targetPrinter == "" {
-		targetPrinter, err = GetTargetPhysicalPrinter()
-		if err != nil {
-			if strings.Contains(strings.ToLower(sumatraBin), "mock") {
+		if ps.resolveTargetPrinter != nil {
+			targetPrinter, err = ps.resolveTargetPrinter()
+		} else {
+			targetPrinter, err = GetTargetPhysicalPrinter()
+			if err != nil && strings.Contains(strings.ToLower(sumatraBin), "mock") {
 				targetPrinter = "MockPrinter"
 				err = nil
 			}
 		}
+		targetPrinter = strings.TrimSpace(targetPrinter)
 	}
 
 	if err != nil || targetPrinter == "" {
-		log.Printf("[Printer] ERROR: Cannot print job %s: no target physical printer found (%v)", job.ID, err)
-		ps.moveToFailed(job, "no physical printer available")
-		if ps.OnJobFailed != nil {
-			ps.OnJobFailed(job, "no physical printer available")
+		reason := "no physical printer available"
+		if err != nil {
+			reason = fmt.Sprintf("no physical printer available: %v", err)
 		}
+		log.Printf("[Printer] ERROR: Job %s (%s) failed — no target physical printer found (%s)", job.ID, job.FileName, reason)
+		ps.failJob(job, reason)
 		return
 	}
 
-	log.Printf("[Printer] Target physical printer for job %s: '%s'", job.ID, targetPrinter)
+	log.Printf("[Printer] Target physical printer selected for job %s (%s): '%s'", job.ID, job.FileName, targetPrinter)
 
 	// Locate effective SumatraPDF executable: check configured path, then auto-discover
 	if !isUsableSumatra(sumatraBin) {
-		if discovered := FindSumatraPDF(); isUsableSumatra(discovered) {
+		if discovered := ps.getFindSumatra()(); isUsableSumatra(discovered) {
 			sumatraBin = discovered
 			ps.setSumatraPath(discovered)
 		} else {
 			// Auto-heal on the fly: attempt standalone engine download if missing
-			if provisioned, provErr := EnsureSumatraPDF(); provErr == nil && isUsableSumatra(provisioned) {
+			if provisioned, provErr := ps.getEnsureSumatra()(); provErr == nil && isUsableSumatra(provisioned) {
 				sumatraBin = provisioned
 				ps.setSumatraPath(provisioned)
 			}
@@ -993,39 +1034,33 @@ func (ps *PrintService) processJob(job PrintJob) {
 	// Always use SumatraPDF for silent, driver-rendered printing (supports PDF, XPS, OXPS, images, etc.)
 	// This renders each page through the printer's native Windows driver, preventing raw bytes / random page gibberish.
 	if isUsableSumatra(sumatraBin) {
-		log.Printf("[Printer] Rendering and printing via SumatraPDF silently to '%s' (settings: %s)...", targetPrinter, printSettings)
+		log.Printf("[Printer] Job %s (%s): printing via SumatraPDF to target printer '%s' (settings: %s)...", job.ID, job.FileName, targetPrinter, printSettings)
 		// Dynamic print settings preserve 100% 1:1 scale, exact page count, exact paper feeding (A4/Letter), and orientation
 		cmd := exec.CommandContext(ctx, sumatraBin, "-print-to", targetPrinter, "-silent", "-print-settings", printSettings, "-exit-when-done", job.FilePath)
 		hideCmd(cmd)
 		out, err = cmd.CombinedOutput()
-		if err != nil && strings.EqualFold(filepath.Ext(job.FilePath), ".xps") {
-			log.Printf("[Printer] SumatraPDF returned warning (%v). Attempting native Windows .NET XPS fallback to '%s'...", err, targetPrinter)
+		if err != nil && ctx.Err() == nil && strings.EqualFold(filepath.Ext(job.FilePath), ".xps") {
+			log.Printf("[Printer] Job %s (%s): SumatraPDF returned error (%v) for target printer '%s'; attempting native Windows .NET XPS fallback...", job.ID, job.FileName, err, targetPrinter)
 			out, err = printNativeXPS(ctx, targetPrinter, job.FilePath, geom)
 		}
 	} else if strings.EqualFold(filepath.Ext(job.FilePath), ".xps") {
-		log.Printf("[Printer] SumatraPDF not found, executing native Windows .NET XPS rendering to '%s' (paper: %s, orientation: %s)...", targetPrinter, geom.PaperName, geom.Orientation)
+		log.Printf("[Printer] Job %s (%s): SumatraPDF not found; printing via native Windows .NET XPS to target printer '%s' (paper: %s, orientation: %s)...", job.ID, job.FileName, targetPrinter, geom.PaperName, geom.Orientation)
 		out, err = printNativeXPS(ctx, targetPrinter, job.FilePath, geom)
 	} else {
 		// Strict safeguard: NEVER execute shell PrintTo with Notepad (which dumps raw binary bytes as text across 20 pages)
-		log.Printf("[Printer] ERROR: Silent print engine (SumatraPDF) not installed on host! Cannot safely render %s.", job.FileName)
+		log.Printf("[Printer] ERROR: Job %s (%s) failed for target printer '%s': silent print engine (SumatraPDF) not installed on host.", job.ID, job.FileName, targetPrinter)
 		err = fmt.Errorf("silent print engine (SumatraPDF) is missing on host; run setup or install to auto-provision")
 	}
 
-	if ctx.Err() == context.DeadlineExceeded {
-		log.Printf("[Printer] ERROR: Job %s timed out after %v! Killing process...", job.ID, ps.timeout)
-		ps.moveToFailed(job, "timeout exceeded")
-		if ps.OnJobFailed != nil {
-			ps.OnJobFailed(job, "timeout exceeded")
-		}
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		log.Printf("[Printer] ERROR: Job %s (%s) timed out after %v on target printer '%s'! Killing process...", job.ID, job.FileName, ps.timeout, targetPrinter)
+		ps.failJob(job, "timeout exceeded")
 		return
 	}
 
 	if err != nil {
-		log.Printf("[Printer] ERROR: Job %s execution failed: %v, out: %s", job.ID, err, string(out))
-		ps.moveToFailed(job, err.Error())
-		if ps.OnJobFailed != nil {
-			ps.OnJobFailed(job, err.Error())
-		}
+		log.Printf("[Printer] ERROR: Job %s (%s) failed on target printer '%s': %v, out: %s", job.ID, job.FileName, targetPrinter, err, strings.TrimSpace(string(out)))
+		ps.failJob(job, err.Error())
 		return
 	}
 
@@ -1037,7 +1072,7 @@ func (ps *PrintService) processJob(job PrintJob) {
 		}
 		time.Sleep(delay)
 	}
-	log.Printf("[Printer] Job %s printed successfully to '%s' and cleaned up.", job.ID, targetPrinter)
+	log.Printf("[Printer] Job %s (%s) printed successfully to target printer '%s' and cleaned up.", job.ID, job.FileName, targetPrinter)
 	if ps.OnJobCompleted != nil {
 		ps.OnJobCompleted(job)
 	}
@@ -1420,12 +1455,51 @@ func (pw *PrintWatcher) moveToSent(fullPath, fileName string) {
 	}
 }
 
+func validatePeerHTTPURL(peerURL string) (string, error) {
+	trimmed := strings.TrimSpace(peerURL)
+	if trimmed == "" {
+		return "", errors.New("invalid peer URL: peer PC is not connected yet (blank URL)")
+	}
+	if strings.ContainsAny(trimmed, " \t\r\n") {
+		return "", fmt.Errorf("invalid peer URL %q: contains whitespace", peerURL)
+	}
+	cleanPeer := strings.TrimRight(trimmed, "/")
+	if cleanPeer == "" {
+		return "", errors.New("invalid peer URL: peer PC is not connected yet (blank URL)")
+	}
+	u, err := url.Parse(cleanPeer)
+	if err != nil {
+		return "", fmt.Errorf("invalid peer URL %q: %w", peerURL, err)
+	}
+	scheme := strings.ToLower(u.Scheme)
+	if scheme != "http" && scheme != "https" {
+		return "", fmt.Errorf("invalid peer URL %q: unsupported scheme %q (expected http or https)", peerURL, u.Scheme)
+	}
+	if u.Hostname() == "" {
+		return "", fmt.Errorf("invalid peer URL %q: missing host", peerURL)
+	}
+	if p := u.Port(); p != "" {
+		portNum, convErr := strconv.Atoi(p)
+		if convErr != nil || portNum < 1 || portNum > 65535 {
+			return "", fmt.Errorf("invalid peer URL %q: invalid port %q", peerURL, p)
+		}
+	}
+	if u.RawQuery != "" || u.Fragment != "" {
+		return "", fmt.Errorf("invalid peer URL %q: query parameters and fragments are not allowed", peerURL)
+	}
+	u.Scheme = scheme
+	return strings.TrimRight(u.String(), "/"), nil
+}
+
 // SendDirectPrint directly uploads a document file to the peer's print endpoint.
 // Optional key-value header pairs (e.g. "X-Bridge-Node-Name", nodeName) can be provided.
 func SendDirectPrint(ctx context.Context, peerURL, authToken, filePath string, extraHeaders ...string) error {
-	cleanPeer := strings.TrimRight(strings.TrimSpace(peerURL), "/")
-	if cleanPeer == "" {
-		return errors.New("peer PC is not connected yet")
+	cleanPeer, err := validatePeerHTTPURL(peerURL)
+	if err != nil {
+		return err
+	}
+	if ctx == nil {
+		ctx = context.Background()
 	}
 
 	f, err := os.Open(filePath)
@@ -1433,6 +1507,10 @@ func SendDirectPrint(ctx context.Context, peerURL, authToken, filePath string, e
 		return fmt.Errorf("failed to open file %s: %w", filePath, err)
 	}
 	defer f.Close()
+
+	if fi, statErr := f.Stat(); statErr == nil && fi.IsDir() {
+		return fmt.Errorf("print target %s is a directory, expected a file", filePath)
+	}
 
 	destURL := fmt.Sprintf("%s/api/print", cleanPeer)
 	req, err := http.NewRequestWithContext(ctx, "POST", destURL, f)

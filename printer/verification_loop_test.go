@@ -4,6 +4,7 @@ import (
 	"archive/zip"
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"image"
 	"image/color"
@@ -492,4 +493,334 @@ func TestConfigureSumatraDefaults_PreservesUserSettings(t *testing.T) {
 	if !strings.Contains(string(freshBytes), "PrintScale = none") || strings.Contains(string(freshBytes), "noscale") {
 		t.Errorf("Expected fresh config to contain 'PrintScale = none', got:\n%s", string(freshBytes))
 	}
+}
+
+func TestSumatraShortcutRemovalAndNoCreation(t *testing.T) {
+	tempDir := t.TempDir()
+
+	// Empty or missing exe must still fail validation
+	if err := CreateSumatraShortcut(""); err == nil {
+		t.Fatalf("Expected CreateSumatraShortcut(\"\") to return an error")
+	}
+
+	// Create valid (> 1MB) dummy executable inside tempDir
+	dummyExe := filepath.Join(tempDir, "BridgeApp", "SumatraPDF.exe")
+	if err := os.MkdirAll(filepath.Dir(dummyExe), 0755); err != nil {
+		t.Fatalf("MkdirAll failed: %v", err)
+	}
+	dummyData := make([]byte, 1024*1024+64)
+	copy(dummyData, "MZ")
+	if err := os.WriteFile(dummyExe, dummyData, 0755); err != nil {
+		t.Fatalf("WriteFile dummyExe failed: %v", err)
+	}
+
+	// Stage stale SumatraPDF.lnk files in USERPROFILE Desktop locations
+	userProfile := filepath.Join(tempDir, "UserProfile")
+	desktopLnk := filepath.Join(userProfile, "Desktop", "SumatraPDF.lnk")
+	oneDriveLnk := filepath.Join(userProfile, "OneDrive", "Desktop", "SumatraPDF.lnk")
+	for _, p := range []string{desktopLnk, oneDriveLnk} {
+		if err := os.MkdirAll(filepath.Dir(p), 0755); err != nil {
+			t.Fatalf("MkdirAll failed: %v", err)
+		}
+		if err := os.WriteFile(p, []byte("stale-shortcut"), 0644); err != nil {
+			t.Fatalf("WriteFile stale shortcut failed: %v", err)
+		}
+	}
+
+	// Also verify removeStaleSumatraShortcuts cleans arbitrary stale app-dir shortcut paths
+	staleAppLnk := filepath.Join(filepath.Dir(dummyExe), "SumatraPDF.lnk")
+	if err := os.WriteFile(staleAppLnk, []byte("stale-app-shortcut"), 0644); err != nil {
+		t.Fatalf("WriteFile staleAppLnk failed: %v", err)
+	}
+	removeStaleSumatraShortcuts([]string{staleAppLnk})
+	if _, err := os.Stat(staleAppLnk); !os.IsNotExist(err) {
+		t.Errorf("Expected stale app shortcut %s to be removed", staleAppLnk)
+	}
+
+	t.Setenv("USERPROFILE", userProfile)
+	if err := CreateSumatraShortcut(dummyExe); err != nil {
+		t.Fatalf("CreateSumatraShortcut failed: %v", err)
+	}
+
+	// Stale desktop shortcuts must be removed and no shortcut created anywhere
+	for _, p := range []string{desktopLnk, oneDriveLnk, staleAppLnk} {
+		if _, err := os.Stat(p); !os.IsNotExist(err) {
+			t.Errorf("Expected no SumatraPDF.lnk at %s, stat err=%v", p, err)
+		}
+	}
+
+	// Fresh profile with no Desktop dir must NOT get a Desktop/SumatraPDF.lnk created
+	freshProfile := filepath.Join(tempDir, "FreshProfile")
+	t.Setenv("USERPROFILE", freshProfile)
+	if err := CreateSumatraShortcut(dummyExe); err != nil {
+		t.Fatalf("CreateSumatraShortcut on fresh profile failed: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(freshProfile, "Desktop", "SumatraPDF.lnk")); !os.IsNotExist(err) {
+		t.Errorf("CreateSumatraShortcut must not create SumatraPDF.lnk")
+	}
+
+	// If SumatraPDF is installed locally, verify EnsureSumatraPDF does not create shortcuts either
+	if existing := FindSumatraPDF(); existing != "" {
+		found, err := EnsureSumatraPDF()
+		if err != nil {
+			t.Fatalf("EnsureSumatraPDF returned unexpected error: %v", err)
+		}
+		if found == "" {
+			t.Fatalf("Expected non-empty SumatraPDF path")
+		}
+		if _, err := os.Stat(filepath.Join(freshProfile, "Desktop", "SumatraPDF.lnk")); !os.IsNotExist(err) {
+			t.Errorf("EnsureSumatraPDF must not create Desktop SumatraPDF.lnk")
+		}
+		if _, err := os.Stat(filepath.Join(filepath.Dir(found), "SumatraPDF.lnk")); !os.IsNotExist(err) {
+			t.Errorf("EnsureSumatraPDF must not create SumatraPDF.lnk alongside %s", found)
+		}
+	}
+}
+
+func TestSendDirectPrint_URLValidationAndTransport(t *testing.T) {
+	tempDir := t.TempDir()
+	pdfPath := filepath.Join(tempDir, "sample.pdf")
+	pdfContent := "%PDF-1.4\n1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595.28 841.89] >>\nendobj\ntrailer\n<< /Root 1 0 R >>\n%%EOF"
+	if err := os.WriteFile(pdfPath, []byte(pdfContent), 0644); err != nil {
+		t.Fatalf("WriteFile failed: %v", err)
+	}
+
+	invalidURLs := []string{
+		"",
+		"   ",
+		"/",
+		"127.0.0.1:8765",
+		"ftp://127.0.0.1:8765",
+		"://missing-scheme",
+		"http://",
+		"https:///",
+		"http://127.0.0.1:99999",
+		"http://127.0.0.1:8765?query=1",
+		"http://127.0.0.1:8765#frag",
+		"http://127.0.0.1:8765/has space",
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	for _, badURL := range invalidURLs {
+		err := SendDirectPrint(ctx, badURL, "tok", pdfPath)
+		if err == nil {
+			t.Errorf("Expected SendDirectPrint to reject invalid peerURL %q, but got nil error", badURL)
+		}
+	}
+
+	// Verify directPrintClient uses Transport timeouts rather than a short whole-request Client.Timeout
+	tr, ok := directPrintClient.Transport.(*http.Transport)
+	if !ok || tr == nil {
+		t.Fatalf("Expected directPrintClient.Transport to be *http.Transport")
+	}
+	if tr.ResponseHeaderTimeout < 120*time.Second {
+		t.Errorf("Expected ResponseHeaderTimeout >= 120s, got %v", tr.ResponseHeaderTimeout)
+	}
+	if directPrintClient.Timeout != 0 {
+		t.Errorf("Expected directPrintClient.Timeout == 0 (relying on Transport timeouts + ctx for huge uploads), got %v", directPrintClient.Timeout)
+	}
+
+	// Verify valid HTTP URL with trailing slash delivers cleanly
+	var gotPath string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	if err := SendDirectPrint(ctx, srv.URL+"/", "tok", pdfPath); err != nil {
+		t.Fatalf("Expected valid peerURL to succeed, got: %v", err)
+	}
+	if gotPath != "/api/print" {
+		t.Errorf("Expected request path /api/print, got %q", gotPath)
+	}
+}
+
+func TestPrintService_OnJobFailedAllPaths(t *testing.T) {
+	tempDir := t.TempDir()
+
+	// Build single controllable mock binary that simulates both exit-code failure and timeout
+	mockSrc := filepath.Join(tempDir, "mock_sumatra_fail.go")
+	mockExe := filepath.Join(tempDir, "mock_sumatra_fail.exe")
+	mockCode := `package main
+import (
+	"fmt"
+	"os"
+	"time"
+)
+func main() {
+	var printerName string
+	for i := 0; i < len(os.Args)-1; i++ {
+		if os.Args[i] == "-print-to" {
+			printerName = os.Args[i+1]
+		}
+	}
+	switch printerName {
+	case "Printer_Fail_Exit1":
+		fmt.Fprintln(os.Stderr, "simulated printer driver error")
+		os.Exit(1)
+	case "Printer_Timeout":
+		time.Sleep(3 * time.Second)
+	}
+}
+`
+	if err := os.WriteFile(mockSrc, []byte(mockCode), 0644); err != nil {
+		t.Fatalf("WriteFile mockSrc failed: %v", err)
+	}
+	if out, err := exec.Command("go", "build", "-o", mockExe, mockSrc).CombinedOutput(); err != nil {
+		t.Fatalf("Failed to compile mock binary: %v\n%s", err, string(out))
+	}
+
+	samplePDF := []byte("%PDF-1.4\n1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595.28 841.89] >>\nendobj\ntrailer\n<< /Root 1 0 R >>\n%%EOF")
+
+	type failedResult struct {
+		job    PrintJob
+		reason string
+	}
+
+	t.Run("MissingPhysicalPrinter", func(t *testing.T) {
+		qDir := filepath.Join(tempDir, "q_noprinter")
+		fDir := filepath.Join(tempDir, "f_noprinter")
+		ps := NewPrintService(mockExe, 5, qDir, fDir)
+		ps.resolveTargetPrinter = func() (string, error) {
+			return "", errors.New("no physical printer connected on this computer")
+		}
+		if err := ps.Start(); err != nil {
+			t.Fatalf("Start failed: %v", err)
+		}
+		defer ps.Stop()
+
+		failed := make(chan failedResult, 1)
+		ps.OnJobFailed = func(j PrintJob, reason string) {
+			failed <- failedResult{job: j, reason: reason}
+		}
+
+		pdfPath := filepath.Join(qDir, "job_noprinter.pdf")
+		_ = os.WriteFile(pdfPath, samplePDF, 0644)
+		job := PrintJob{ID: "job_noprinter", FileName: "job_noprinter.pdf", FilePath: pdfPath, EnqueuedAt: time.Now()}
+		if err := ps.Enqueue(job); err != nil {
+			t.Fatalf("Enqueue failed: %v", err)
+		}
+
+		select {
+		case res := <-failed:
+			if !strings.Contains(strings.ToLower(res.reason), "physical printer") {
+				t.Errorf("Expected physical printer failure reason, got %q", res.reason)
+			}
+			if _, err := os.Stat(filepath.Join(fDir, job.ID)); err != nil {
+				t.Errorf("Expected failed job moved to %s: %v", fDir, err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("Timed out waiting for OnJobFailed on missing physical printer")
+		}
+	})
+
+	t.Run("MissingSumatraPDF", func(t *testing.T) {
+		qDir := filepath.Join(tempDir, "q_nosumatra")
+		fDir := filepath.Join(tempDir, "f_nosumatra")
+		ps := NewPrintService(filepath.Join(tempDir, "nonexistent", "SumatraPDF.exe"), 5, qDir, fDir)
+		ps.SetTargetPrinter("Test_Physical_Printer")
+		ps.findSumatra = func() string { return "" }
+		ps.ensureSumatra = func() (string, error) { return "", errors.New("sumatra unavailable") }
+		if err := ps.Start(); err != nil {
+			t.Fatalf("Start failed: %v", err)
+		}
+		defer ps.Stop()
+
+		failed := make(chan failedResult, 1)
+		ps.OnJobFailed = func(j PrintJob, reason string) {
+			failed <- failedResult{job: j, reason: reason}
+		}
+
+		pdfPath := filepath.Join(qDir, "job_nosumatra.pdf")
+		_ = os.WriteFile(pdfPath, samplePDF, 0644)
+		job := PrintJob{ID: "job_nosumatra", FileName: "job_nosumatra.pdf", FilePath: pdfPath, EnqueuedAt: time.Now()}
+		if err := ps.Enqueue(job); err != nil {
+			t.Fatalf("Enqueue failed: %v", err)
+		}
+
+		select {
+		case res := <-failed:
+			if !strings.Contains(strings.ToLower(res.reason), "sumatrapdf") {
+				t.Errorf("Expected SumatraPDF missing reason, got %q", res.reason)
+			}
+			if _, err := os.Stat(filepath.Join(fDir, job.ID)); err != nil {
+				t.Errorf("Expected failed job moved to %s: %v", fDir, err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("Timed out waiting for OnJobFailed on missing SumatraPDF")
+		}
+	})
+
+	t.Run("ExecutionError", func(t *testing.T) {
+		qDir := filepath.Join(tempDir, "q_execerr")
+		fDir := filepath.Join(tempDir, "f_execerr")
+		ps := NewPrintService(mockExe, 5, qDir, fDir)
+		ps.SetTargetPrinter("Printer_Fail_Exit1")
+		if err := ps.Start(); err != nil {
+			t.Fatalf("Start failed: %v", err)
+		}
+		defer ps.Stop()
+
+		failed := make(chan failedResult, 1)
+		ps.OnJobFailed = func(j PrintJob, reason string) {
+			failed <- failedResult{job: j, reason: reason}
+		}
+
+		pdfPath := filepath.Join(qDir, "job_execerr.pdf")
+		_ = os.WriteFile(pdfPath, samplePDF, 0644)
+		job := PrintJob{ID: "job_execerr", FileName: "job_execerr.pdf", FilePath: pdfPath, EnqueuedAt: time.Now()}
+		if err := ps.Enqueue(job); err != nil {
+			t.Fatalf("Enqueue failed: %v", err)
+		}
+
+		select {
+		case res := <-failed:
+			if res.reason == "" {
+				t.Errorf("Expected non-empty execution error reason")
+			}
+			if _, err := os.Stat(filepath.Join(fDir, job.ID)); err != nil {
+				t.Errorf("Expected failed job moved to %s: %v", fDir, err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("Timed out waiting for OnJobFailed on execution error")
+		}
+	})
+
+	t.Run("Timeout", func(t *testing.T) {
+		qDir := filepath.Join(tempDir, "q_timeout")
+		fDir := filepath.Join(tempDir, "f_timeout")
+		ps := NewPrintService(mockExe, 1, qDir, fDir)
+		ps.SetTargetPrinter("Printer_Timeout")
+		if err := ps.Start(); err != nil {
+			t.Fatalf("Start failed: %v", err)
+		}
+		defer ps.Stop()
+
+		failed := make(chan failedResult, 1)
+		ps.OnJobFailed = func(j PrintJob, reason string) {
+			failed <- failedResult{job: j, reason: reason}
+		}
+
+		pdfPath := filepath.Join(qDir, "job_timeout.pdf")
+		_ = os.WriteFile(pdfPath, samplePDF, 0644)
+		job := PrintJob{ID: "job_timeout", FileName: "job_timeout.pdf", FilePath: pdfPath, EnqueuedAt: time.Now()}
+		if err := ps.Enqueue(job); err != nil {
+			t.Fatalf("Enqueue failed: %v", err)
+		}
+
+		select {
+		case res := <-failed:
+			if !strings.Contains(strings.ToLower(res.reason), "timeout") {
+				t.Errorf("Expected timeout failure reason, got %q", res.reason)
+			}
+			if _, err := os.Stat(filepath.Join(fDir, job.ID)); err != nil {
+				t.Errorf("Expected failed job moved to %s: %v", fDir, err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("Timed out waiting for OnJobFailed on job timeout")
+		}
+	})
 }
