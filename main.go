@@ -316,13 +316,13 @@ func handleSendPrint(filePath, targetPeer string) {
 		if p := cfg.FindPeer(targetPeer); p != nil {
 			peerURL = p.URL
 			peerName = p.Name
+		} else {
+			fmt.Fprintf(os.Stderr, "Target peer %q was not found in Bridge configuration.\n", targetPeer)
+			return
 		}
-	}
-	if peerURL == "" {
+	} else {
 		peerURL = cfg.GetPeerURL()
-		if peerName == "" {
-			peerName = cfg.GetPeerName()
-		}
+		peerName = cfg.GetPeerName()
 	}
 
 	// Try sending via local running bridge instance first
@@ -496,14 +496,14 @@ func runUnifiedService(configPath string, headless bool) {
 		if tm := getTray(); tm != nil {
 			tm.UpdateNetworkStatus(cfg.GetNodeName(), cfg.GetPeers())
 		}
+		_ = config.SaveConfig(configPath, cfg)
+		go func() {
+			_ = installer.CreateBridgeShortcutsForPeers(cfg.GetPeers())
+		}()
+
 		// Catch-up synchronize files immediately ONLY when a brand new peer connects (not on repeated pings)
 		if isNew {
-			_ = config.SaveConfig(configPath, cfg)
 			syncEngine.ReconcileWithPeer(peer.URL)
-
-			go func() {
-				_ = installer.CreateBridgeShortcutsForPeers(cfg.GetPeers())
-			}()
 
 			// Mesh Gossip Propagation: announce newly discovered peer to all other known peers
 			localTailscale := installer.GetTailscaleIP()
@@ -649,16 +649,11 @@ func runUnifiedService(configPath string, headless bool) {
 			OnResync: func() {
 				go func() {
 					if tm := getTray(); tm != nil {
-						tm.SetState(tray.StateSyncing, "Bridge: Syncing shared files across devices...")
+						tm.SetSyncingState("Bridge: Syncing shared files across devices...")
 					}
-					for _, p := range cfg.GetPeers() {
-						if p.URL != "" {
-							syncEngine.ReconcileWithPeer(p.URL)
-						}
-					}
-					time.Sleep(1500 * time.Millisecond)
+					syncEngine.ResyncNow()
 					if tm := getTray(); tm != nil {
-						tm.UpdateNetworkStatus(cfg.GetNodeName(), cfg.GetPeers())
+						tm.FlashSyncComplete("Sync Complete", "Shared folder synchronized across devices!")
 					}
 				}()
 			},
@@ -810,11 +805,12 @@ func runUnifiedService(configPath string, headless bool) {
 
 						if healthy && hr != nil {
 							peers[idx].LastSeen = time.Now()
-							if learnedName != "" && learnedName != p.Name {
+							if learnedName != "" && learnedName != p.Name && !p.CustomName {
 								log.Printf("[HealthWatcher] Learned peer name for %s: %s", p.IP, learnedName)
-								peers[idx].Name = learnedName
-								cfg.SetPeerName(p.URL, learnedName)
-								namesChanged = true
+								if cfg.SetPeerName(p.URL, learnedName) {
+									peers[idx].Name = learnedName
+									namesChanged = true
+								}
 							}
 							// Transitive Mesh Peer Discovery: check peers returned by healthy peer
 							for _, mp := range hr.Peers {

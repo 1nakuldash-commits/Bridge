@@ -296,8 +296,8 @@ func TestConnectManualPeerValidation(t *testing.T) {
 		t.Errorf("Expected X-Bridge-Probe=1 header on manual health probe, got %q", sawProbe)
 	}
 	peers := cfg.GetPeers()
-	if len(peers) != 1 || peers[0].Name != "Office-U2" {
-		t.Fatalf("Expected 1 peer named 'Office-U2', got %+v", peers)
+	if len(peers) != 1 || peers[0].Name != "Office-U2" || !peers[0].CustomName {
+		t.Fatalf("Expected 1 peer named 'Office-U2' with CustomName=true, got %+v", peers)
 	}
 
 	// 5. Device name resolution via discoverPeersFunc
@@ -381,4 +381,82 @@ func TestSyncPeersWithRunningServicePreservesAuthoritativeSpoolPort(t *testing.T
 		t.Fatalf("Expected saved config to have SpoolPort 9105, got %+v", loaded.Peers)
 	}
 	_ = fmt.Sprintf("verified port %d", loaded.Peers[0].SpoolPort)
+}
+
+func TestConfirmPeerNameAndSyncPreservesCustomName(t *testing.T) {
+	// 1. Verify confirmPeerName returns isCustom only for distinct non-self custom names
+	name, isCustom := confirmPeerName(bufio.NewReader(strings.NewReader("\n")), "100.64.0.2", "Detected-PC", "U1")
+	if name != "Detected-PC" || isCustom {
+		t.Fatalf("Enter should keep detected name with isCustom=false, got (%q, %v)", name, isCustom)
+	}
+
+	name, isCustom = confirmPeerName(bufio.NewReader(strings.NewReader("detected-pc\n")), "100.64.0.2", "Detected-PC", "U1")
+	if !strings.EqualFold(name, "Detected-PC") || isCustom {
+		t.Fatalf("Case-insensitive match to detected name should have isCustom=false, got (%q, %v)", name, isCustom)
+	}
+
+	name, isCustom = confirmPeerName(bufio.NewReader(strings.NewReader("u1\n")), "100.64.0.2", "Detected-PC", "U1")
+	if name != "Detected-PC" || isCustom {
+		t.Fatalf("Self node name should fall back to detected name with isCustom=false, got (%q, %v)", name, isCustom)
+	}
+
+	name, isCustom = confirmPeerName(bufio.NewReader(strings.NewReader("Office-U2\n")), "100.64.0.2", "Detected-PC", "U1")
+	if name != "Office-U2" || !isCustom {
+		t.Fatalf("Custom name should return ('Office-U2', true), got (%q, %v)", name, isCustom)
+	}
+
+	// 2. Verify connectDetectedPeer + syncPeersWithRunningService preserve CustomName=true
+	var postedPeer config.PeerDevice
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.Method {
+		case http.MethodPost:
+			if err := json.NewDecoder(r.Body).Decode(&postedPeer); err != nil {
+				t.Fatalf("decode POST /api/peers: %v", err)
+			}
+			postedPeer.SpoolPort = 9103
+			_ = json.NewEncoder(w).Encode(postedPeer)
+		case http.MethodGet:
+			// Simulate GET failing or returning authoritative peer with CustomName preserved
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"node_name": "U1",
+				"peers":     []config.PeerDevice{postedPeer},
+			})
+		}
+	}))
+	defer srv.Close()
+
+	_, portStr, _ := net.SplitHostPort(strings.TrimPrefix(srv.URL, "http://"))
+	port, _ := strconv.Atoi(portStr)
+
+	tmpDir := t.TempDir()
+	cfgPath := filepath.Join(tmpDir, "config.json")
+	cfg := config.DefaultConfig()
+	cfg.ConfigPath = cfgPath
+	cfg.NodeName = "U1"
+	cfg.ListenPort = port
+
+	connectDetectedPeer(cfg, "Office-U2", true, "100.64.0.2", "http://100.64.0.2:8765", nil, "")
+
+	// Re-running connectDetectedPeer with detected name and isCustom=false must NOT overwrite existing custom name
+	connectDetectedPeer(cfg, "Detected-PC", false, "100.64.0.2", "http://100.64.0.2:8765", nil, "")
+
+	syncPeersWithRunningService(cfg)
+
+	if postedPeer.Name != "Office-U2" || !postedPeer.CustomName {
+		t.Fatalf("Expected POST /api/peers payload to carry Name='Office-U2' and CustomName=true, got %+v", postedPeer)
+	}
+
+	gotPeers := cfg.GetPeers()
+	if len(gotPeers) != 1 || gotPeers[0].Name != "Office-U2" || !gotPeers[0].CustomName || gotPeers[0].SpoolPort != 9103 {
+		t.Fatalf("Expected synced peer 'Office-U2' with CustomName=true and SpoolPort=9103, got %+v", gotPeers)
+	}
+
+	loaded, err := config.LoadConfig(cfgPath)
+	if err != nil {
+		t.Fatalf("LoadConfig failed: %v", err)
+	}
+	if len(loaded.Peers) != 1 || loaded.Peers[0].Name != "Office-U2" || !loaded.Peers[0].CustomName {
+		t.Fatalf("Expected persisted peer 'Office-U2' with CustomName=true, got %+v", loaded.Peers)
+	}
 }

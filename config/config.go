@@ -15,12 +15,13 @@ import (
 
 // PeerDevice represents a remote Bridge node in the multi-device network.
 type PeerDevice struct {
-	Name      string    `json:"name"`                 // Friendly name (e.g. "Unit 1", "Unit 2")
-	IP        string    `json:"ip"`                   // Tailscale IPv4 address (e.g. "100.64.1.2")
-	URL       string    `json:"url"`                  // HTTP endpoint (e.g. "http://100.64.1.2:8765")
-	SpoolPort int       `json:"spool_port,omitempty"` // Local TCP port for virtual printer (e.g. 9101, 9102)
-	Online    bool      `json:"online,omitempty"`     // Dynamic connectivity state
-	LastSeen  time.Time `json:"last_seen,omitempty"`  // Timestamp of last successful contact
+	Name       string    `json:"name"`                  // Friendly name (e.g. "Unit 1", "Unit 2")
+	CustomName bool      `json:"custom_name,omitempty"` // True when user explicitly set a custom local name
+	IP         string    `json:"ip"`                    // Tailscale IPv4 address (e.g. "100.64.1.2")
+	URL        string    `json:"url"`                   // HTTP endpoint (e.g. "http://100.64.1.2:8765")
+	SpoolPort  int       `json:"spool_port,omitempty"`  // Local TCP port for virtual printer (e.g. 9101, 9102)
+	Online     bool      `json:"online,omitempty"`      // Dynamic connectivity state
+	LastSeen   time.Time `json:"last_seen,omitempty"`   // Timestamp of last successful contact
 }
 
 // Config represents the multi-device application configuration.
@@ -456,7 +457,7 @@ func (c *Config) SetPeerOnlineStatus(target string, online bool) bool {
 	return false
 }
 
-// SetPeerName updates a peer's friendly name and saves config.
+// SetPeerName updates a peer's friendly name and saves config unless the peer uses a local custom name.
 func (c *Config) SetPeerName(target, newName string) bool {
 	cleanName := strings.TrimSpace(newName)
 	cleanTarget := strings.TrimRight(strings.TrimSpace(target), "/")
@@ -468,11 +469,67 @@ func (c *Config) SetPeerName(target, newName string) bool {
 	changed := false
 	for i := range c.Peers {
 		if strings.EqualFold(c.Peers[i].Name, cleanTarget) || strings.EqualFold(c.Peers[i].URL, cleanTarget) || c.Peers[i].IP == cleanTarget {
+			if c.Peers[i].CustomName {
+				break
+			}
 			if c.Peers[i].Name != cleanName {
 				c.Peers[i].Name = cleanName
 				changed = true
 			}
 			break
+		}
+	}
+	if changed && len(c.Peers) > 0 {
+		c.PeerName = c.Peers[0].Name
+	}
+	configPath := c.ConfigPath
+	c.mu.Unlock()
+
+	if changed && configPath != "" {
+		_ = SaveConfig(configPath, c)
+	}
+	return changed
+}
+
+// SetPeerCustomName sets a peer's friendly name and CustomName flag, saving config if changed.
+func (c *Config) SetPeerCustomName(target, customName string, custom bool) bool {
+	cleanName := strings.TrimSpace(customName)
+	cleanTarget := strings.TrimRight(strings.TrimSpace(target), "/")
+	if cleanName == "" || cleanTarget == "" {
+		return false
+	}
+
+	c.mu.Lock()
+	idx := -1
+	for i := range c.Peers {
+		if strings.EqualFold(c.Peers[i].URL, cleanTarget) {
+			idx = i
+			break
+		}
+	}
+	if idx == -1 {
+		for i := range c.Peers {
+			if c.Peers[i].IP == cleanTarget {
+				idx = i
+				break
+			}
+		}
+	}
+	if idx == -1 {
+		for i := range c.Peers {
+			if strings.EqualFold(c.Peers[i].Name, cleanTarget) {
+				idx = i
+				break
+			}
+		}
+	}
+
+	changed := false
+	if idx != -1 {
+		if c.Peers[idx].Name != cleanName || c.Peers[idx].CustomName != custom {
+			c.Peers[idx].Name = cleanName
+			c.Peers[idx].CustomName = custom
+			changed = true
 		}
 	}
 	if changed && len(c.Peers) > 0 {
@@ -610,7 +667,7 @@ func (c *Config) AddOrUpdatePeer(name, ip, peerURL string) (PeerDevice, bool) {
 		prevURL := dev.URL
 		prevPort := dev.SpoolPort
 
-		if cleanName != "" && dev.Name != cleanName {
+		if !dev.CustomName && cleanName != "" && dev.Name != cleanName {
 			dev.Name = cleanName
 		}
 		if cleanIP != "" {

@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+
+	"bridge/config"
 )
 
 // IsElevated stub.
@@ -17,6 +19,10 @@ func IsElevated() bool {
 }
 
 func hideCmd(cmd *exec.Cmd) {}
+
+func formatElevatedArgs(args []string) string {
+	return strings.Join(args, " ")
+}
 
 // SelfElevate stub.
 func SelfElevate(args []string) error {
@@ -80,6 +86,19 @@ func FindSumatraPDF() string {
 // InstallSumatraPDF stub.
 func InstallSumatraPDF() (string, error) {
 	return "", nil
+}
+
+// GetPrimaryDesktopDir returns the primary desktop directory for non-Windows platforms.
+func GetPrimaryDesktopDir() string {
+	dirs := GetAllDesktopDirs()
+	if len(dirs) > 0 && dirs[0] != "" {
+		return dirs[0]
+	}
+	home, _ := os.UserHomeDir()
+	if home != "" {
+		return filepath.Join(home, "Desktop")
+	}
+	return os.TempDir()
 }
 
 // GetAllDesktopDirs stub.

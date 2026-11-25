@@ -265,8 +265,8 @@ func RunInteractiveSetup() error {
 		ans, _ := reader.ReadString('\n')
 		ans = strings.TrimSpace(ans)
 		if ans == "" || strings.EqualFold(ans, "y") || strings.EqualFold(ans, "yes") {
-			confirmedName := confirmPeerName(reader, p.ip, p.name, cfg.NodeName)
-			connectDetectedPeer(cfg, confirmedName, p.ip, p.url, p.meshPeers, localIP)
+			confirmedName, isCustom := confirmPeerName(reader, p.ip, p.name, cfg.NodeName)
+			connectDetectedPeer(cfg, confirmedName, isCustom, p.ip, p.url, p.meshPeers, localIP)
 		} else if !isNegativeReply(ans) {
 			connectManualPeer(cfg, reader, ans, localIP)
 		}
@@ -294,15 +294,15 @@ func RunInteractiveSetup() error {
 				}
 				linkedMap[normIP] = true
 				linkedMap[normName] = true
-				confirmedName := confirmPeerName(reader, p.ip, p.name, cfg.NodeName)
-				connectDetectedPeer(cfg, confirmedName, p.ip, p.url, p.meshPeers, localIP)
+				confirmedName, isCustom := confirmPeerName(reader, p.ip, p.name, cfg.NodeName)
+				connectDetectedPeer(cfg, confirmedName, isCustom, p.ip, p.url, p.meshPeers, localIP)
 			}
 		} else if !isNegativeReply(ans) {
 			idx := 0
 			if _, scanErr := fmt.Sscanf(ans, "%d", &idx); scanErr == nil && idx >= 1 && idx <= len(detectedPeers) {
 				sel := detectedPeers[idx-1]
-				confirmedName := confirmPeerName(reader, sel.ip, sel.name, cfg.NodeName)
-				connectDetectedPeer(cfg, confirmedName, sel.ip, sel.url, sel.meshPeers, localIP)
+				confirmedName, isCustom := confirmPeerName(reader, sel.ip, sel.name, cfg.NodeName)
+				connectDetectedPeer(cfg, confirmedName, isCustom, sel.ip, sel.url, sel.meshPeers, localIP)
 			} else {
 				connectManualPeer(cfg, reader, ans, localIP)
 			}
@@ -341,7 +341,7 @@ func isNegativeReply(ans string) bool {
 	return low == "n" || low == "no" || low == "skip" || low == "cancel"
 }
 
-func confirmPeerName(reader *bufio.Reader, ip, detectedName, selfNodeName string) string {
+func confirmPeerName(reader *bufio.Reader, ip, detectedName, selfNodeName string) (string, bool) {
 	cleanDetected := strings.TrimSpace(detectedName)
 	if cleanDetected == "" {
 		cleanDetected = fmt.Sprintf("Device (%s)", ip)
@@ -350,18 +350,20 @@ func confirmPeerName(reader *bufio.Reader, ip, detectedName, selfNodeName string
 	custom, _ := reader.ReadString('\n')
 	custom = strings.TrimSpace(custom)
 	confirmed := cleanDetected
+	isCustom := false
 	if custom != "" {
 		if selfNodeName != "" && strings.EqualFold(custom, strings.TrimSpace(selfNodeName)) {
 			fmt.Printf("[!] '%s' matches this device's name; keeping '%s'.\n", custom, cleanDetected)
 		} else {
 			confirmed = custom
+			isCustom = !strings.EqualFold(custom, cleanDetected)
 		}
 	}
 	fmt.Printf("[*] Virtual Printer 'Print on %s' will be created.\n", SanitizeFileName(confirmed))
-	return confirmed
+	return confirmed, isCustom
 }
 
-func connectDetectedPeer(cfg *config.Config, name, ip, targetURL string, meshPeers []config.PeerDevice, localIP string) {
+func connectDetectedPeer(cfg *config.Config, name string, isCustom bool, ip, targetURL string, meshPeers []config.PeerDevice, localIP string) {
 	cleanName := strings.TrimSpace(name)
 	if config.IsSelfTarget(cleanName, ip, targetURL, cfg.NodeName, cfg.ListenPort) {
 		return // Strictly ignore self device
@@ -371,8 +373,20 @@ func connectDetectedPeer(cfg *config.Config, name, ip, targetURL string, meshPee
 	}
 
 	addedDev, isNew := cfg.AddOrUpdatePeer(cleanName, ip, targetURL)
+	target := addedDev.URL
+	if target == "" {
+		target = addedDev.IP
+	}
+	if isCustom {
+		if cfg.SetPeerCustomName(target, cleanName, true) {
+			addedDev.Name = cleanName
+			addedDev.CustomName = true
+		}
+	} else if !addedDev.CustomName {
+		cfg.SetPeerCustomName(target, addedDev.Name, false)
+	}
 	if isNew {
-		fmt.Printf("[*] Linking with '%s' (%s)...\n", cleanName, ip)
+		fmt.Printf("[*] Linking with '%s' (%s)...\n", addedDev.Name, ip)
 		fmt.Printf("[✓] Linked with '%s' (Port %d). Preparing 'Print on %s'...\n", addedDev.Name, addedDev.SpoolPort, SanitizeFileName(addedDev.Name))
 	}
 
@@ -508,8 +522,8 @@ func connectManualPeer(cfg *config.Config, reader *bufio.Reader, input, localIP 
 	}
 
 	fmt.Printf("[✓] Verified active Bridge device '%s' at %s\n", hr.NodeName, cleanIP)
-	confirmedName := confirmPeerName(reader, cleanIP, hr.NodeName, cfg.NodeName)
-	connectDetectedPeer(cfg, confirmedName, cleanIP, targetURL, hr.Peers, localIP)
+	confirmedName, isCustom := confirmPeerName(reader, cleanIP, hr.NodeName, cfg.NodeName)
+	connectDetectedPeer(cfg, confirmedName, isCustom, cleanIP, targetURL, hr.Peers, localIP)
 	return true
 }
 
@@ -964,8 +978,8 @@ func pairNewDevice(cfg *config.Config, reader *bufio.Reader, localIP string) {
 		ans, _ := reader.ReadString('\n')
 		ans = strings.TrimSpace(ans)
 		if ans == "" || strings.EqualFold(ans, "y") || strings.EqualFold(ans, "yes") {
-			confirmedName := confirmPeerName(reader, p.ip, p.name, cfg.NodeName)
-			connectDetectedPeer(cfg, confirmedName, p.ip, p.url, p.meshPeers, localIP)
+			confirmedName, isCustom := confirmPeerName(reader, p.ip, p.name, cfg.NodeName)
+			connectDetectedPeer(cfg, confirmedName, isCustom, p.ip, p.url, p.meshPeers, localIP)
 			pairedAny = true
 		} else if !isNegativeReply(ans) {
 			pairedAny = connectManualPeer(cfg, reader, ans, localIP)
@@ -989,16 +1003,16 @@ func pairNewDevice(cfg *config.Config, reader *bufio.Reader, localIP string) {
 				}
 				linkedMap[normIP] = true
 				linkedMap[normName] = true
-				confirmedName := confirmPeerName(reader, p.ip, p.name, cfg.NodeName)
-				connectDetectedPeer(cfg, confirmedName, p.ip, p.url, p.meshPeers, localIP)
+				confirmedName, isCustom := confirmPeerName(reader, p.ip, p.name, cfg.NodeName)
+				connectDetectedPeer(cfg, confirmedName, isCustom, p.ip, p.url, p.meshPeers, localIP)
 				pairedAny = true
 			}
 		} else if !isNegativeReply(ans) {
 			idx := 0
 			if _, scanErr := fmt.Sscanf(ans, "%d", &idx); scanErr == nil && idx >= 1 && idx <= len(newPeers) {
 				sel := newPeers[idx-1]
-				confirmedName := confirmPeerName(reader, sel.ip, sel.name, cfg.NodeName)
-				connectDetectedPeer(cfg, confirmedName, sel.ip, sel.url, sel.meshPeers, localIP)
+				confirmedName, isCustom := confirmPeerName(reader, sel.ip, sel.name, cfg.NodeName)
+				connectDetectedPeer(cfg, confirmedName, isCustom, sel.ip, sel.url, sel.meshPeers, localIP)
 				pairedAny = true
 			} else {
 				pairedAny = connectManualPeer(cfg, reader, ans, localIP)
@@ -1037,9 +1051,20 @@ func syncPeersWithRunningService(cfg *config.Config) {
 	client := http.Client{Timeout: 3 * time.Second}
 	localURL := fmt.Sprintf("http://127.0.0.1:%d/api/peers", listenPort)
 
+	localPeers := cfg.GetPeers()
+	localCustomByURL := make(map[string]config.PeerDevice)
+	for _, p := range localPeers {
+		if p.CustomName {
+			key := strings.ToLower(strings.TrimRight(p.URL, "/"))
+			if key != "" {
+				localCustomByURL[key] = p
+			}
+		}
+	}
+
 	serviceReachable := false
 	syncedByURL := make(map[string]config.PeerDevice)
-	for _, p := range cfg.GetPeers() {
+	for _, p := range localPeers {
 		devJSON, _ := json.Marshal(p)
 		if req, err := http.NewRequest("POST", localURL, bytes.NewReader(devJSON)); err == nil {
 			req.Header.Set("Content-Type", "application/json")
@@ -1083,12 +1108,19 @@ func syncPeersWithRunningService(cfg *config.Config) {
 					if ad.Name != "" {
 						cur[i].Name = ad.Name
 					}
+					cur[i].CustomName = cur[i].CustomName || ad.CustomName
 				}
 			}
 			authPeers = cur
 		}
 
 		if len(authPeers) > 0 {
+			for i := range authPeers {
+				key := strings.ToLower(strings.TrimRight(authPeers[i].URL, "/"))
+				if prev, ok := localCustomByURL[key]; ok && !authPeers[i].CustomName && strings.EqualFold(authPeers[i].Name, prev.Name) {
+					authPeers[i].CustomName = true
+				}
+			}
 			cfg.ConfigPath = ""
 			_ = cfg.SetPeers(authPeers)
 		}

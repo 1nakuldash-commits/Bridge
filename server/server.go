@@ -398,6 +398,21 @@ func (s *Server) handlePeers(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		addedDev, isNew, changed := s.addOrUpdatePeerWithChange(dev.Name, dev.IP, dev.URL)
+		if dev.CustomName && strings.TrimSpace(dev.Name) != "" {
+			target := addedDev.URL
+			if target == "" {
+				target = addedDev.IP
+			}
+			if s.cfg.SetPeerCustomName(target, dev.Name, true) {
+				changed = true
+				if updated := s.cfg.FindPeer(target); updated != nil {
+					addedDev = *updated
+				} else {
+					addedDev.Name = strings.TrimSpace(dev.Name)
+					addedDev.CustomName = true
+				}
+			}
+		}
 		if (isNew || changed) && s.cfg.ConfigPath != "" {
 			_ = config.SaveConfig(s.cfg.ConfigPath, s.cfg)
 		}

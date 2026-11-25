@@ -177,3 +177,60 @@ func TestLoadConfigPreservesExplicitConfiguredTrue(t *testing.T) {
 		})
 	}
 }
+
+func TestCustomPeerNamePreservedAcrossAutoUpdates(t *testing.T) {
+	tempDir := t.TempDir()
+	cfgPath := filepath.Join(tempDir, "config.json")
+
+	cfg := DefaultConfig()
+	cfg.ConfigPath = cfgPath
+	cfg.NodeName = "U1"
+	cfg.Configured = true
+
+	dev, isNew := cfg.AddOrUpdatePeer("Detected-U2", "100.64.0.2", "http://100.64.0.2:8765")
+	if !isNew || dev.Name != "Detected-U2" || dev.CustomName {
+		t.Fatalf("unexpected initial peer: isNew=%v dev=%+v", isNew, dev)
+	}
+
+	if changed := cfg.SetPeerCustomName("http://100.64.0.2:8765", "Office-U2", true); !changed {
+		t.Fatal("expected SetPeerCustomName to report change")
+	}
+
+	// Repeating identical custom name must be a no-op
+	if changed := cfg.SetPeerCustomName("http://100.64.0.2:8765", "Office-U2", true); changed {
+		t.Fatal("expected duplicate SetPeerCustomName to return false")
+	}
+
+	// Auto-learning via SetPeerName must NOT overwrite a custom peer name
+	if changed := cfg.SetPeerName("http://100.64.0.2:8765", "Detected-U2"); changed {
+		t.Fatal("expected SetPeerName to skip peer with CustomName=true")
+	}
+
+	// AddOrUpdatePeer from remote auto-pair/gossip must NOT overwrite a custom peer name
+	devAfter, isNewAfter := cfg.AddOrUpdatePeer("Detected-U2", "100.64.0.2", "http://100.64.0.2:8765")
+	if isNewAfter {
+		t.Fatal("expected existing peer on AddOrUpdatePeer")
+	}
+	if devAfter.Name != "Office-U2" || !devAfter.CustomName {
+		t.Fatalf("expected custom peer name 'Office-U2' to be preserved, got %+v", devAfter)
+	}
+
+	loaded, err := LoadConfig(cfgPath)
+	if err != nil {
+		t.Fatalf("LoadConfig failed: %v", err)
+	}
+	if loaded.PeerName != "Office-U2" || len(loaded.Peers) != 1 || loaded.Peers[0].Name != "Office-U2" || !loaded.Peers[0].CustomName {
+		t.Fatalf("expected persisted custom peer name 'Office-U2', got PeerName=%q Peers=%+v", loaded.PeerName, loaded.Peers)
+	}
+
+	// Clearing CustomName allows subsequent auto-learning again
+	if changed := cfg.SetPeerCustomName("http://100.64.0.2:8765", "Detected-U2", false); !changed {
+		t.Fatal("expected clearing CustomName to report change")
+	}
+	if changed := cfg.SetPeerName("http://100.64.0.2:8765", "Detected-U2-Renamed"); !changed {
+		t.Fatal("expected SetPeerName to update non-custom peer")
+	}
+	if got := cfg.FindPeer("http://100.64.0.2:8765"); got == nil || got.Name != "Detected-U2-Renamed" || got.CustomName {
+		t.Fatalf("expected updated non-custom peer, got %+v", got)
+	}
+}

@@ -420,3 +420,106 @@ func TestHandlePrintLocalRejectsUnknownTargetWithoutFallback(t *testing.T) {
 	}
 	mu.Unlock()
 }
+
+func TestCustomPeerNamePreservedAcrossCheckAutoPairAndRemotePeersPost(t *testing.T) {
+	tmpDir := t.TempDir()
+	cfgPath := filepath.Join(tmpDir, "config.json")
+
+	cfg := config.DefaultConfig()
+	cfg.ConfigPath = cfgPath
+	cfg.NodeName = "Unit1"
+	cfg.ListenPort = 8765
+	cfg.AuthToken = "test-token"
+	cfg.AddOrUpdatePeer("Detected-U2", "100.64.1.10", "http://100.64.1.10:8765")
+
+	var mu sync.Mutex
+	var events []config.PeerDevice
+
+	srv := NewServer(cfg, nil, nil)
+	srv.SetPeerUpdater(func(peer config.PeerDevice, isNew bool) {
+		mu.Lock()
+		events = append(events, peer)
+		mu.Unlock()
+	})
+
+	// 1. Local Dashboard sync posts CustomName=true -> updates name, persists, and triggers peerUpdater
+	localBody, _ := json.Marshal(config.PeerDevice{
+		Name:       "Office-U2",
+		CustomName: true,
+		IP:         "100.64.1.10",
+		URL:        "http://100.64.1.10:8765",
+	})
+	reqLocal := httptest.NewRequest(http.MethodPost, "/api/peers", bytes.NewReader(localBody))
+	reqLocal.RemoteAddr = "127.0.0.1:50001"
+	reqLocal.Header.Set("X-Bridge-Token", cfg.AuthToken)
+	recLocal := httptest.NewRecorder()
+	srv.authMiddleware(srv.handlePeers)(recLocal, reqLocal)
+	if recLocal.Code != http.StatusOK {
+		t.Fatalf("local POST /api/peers failed: %d %s", recLocal.Code, recLocal.Body.String())
+	}
+
+	var localResp config.PeerDevice
+	if err := json.NewDecoder(recLocal.Body).Decode(&localResp); err != nil {
+		t.Fatalf("decode local POST response: %v", err)
+	}
+	if localResp.Name != "Office-U2" || !localResp.CustomName {
+		t.Fatalf("expected custom peer 'Office-U2' with CustomName=true, got %+v", localResp)
+	}
+
+	// 2. Remote checkAutoPair via /api/health with remote NodeName must NOT revert custom name
+	reqHealth := httptest.NewRequest(http.MethodGet, "/api/health", nil)
+	reqHealth.RemoteAddr = "100.64.1.10:51234"
+	reqHealth.Header.Set("X-Bridge-Token", cfg.AuthToken)
+	reqHealth.Header.Set("X-Bridge-Node-Name", "Detected-U2")
+	reqHealth.Header.Set("X-Bridge-Peer-URL", "http://100.64.1.10:8765")
+	recHealth := httptest.NewRecorder()
+	srv.handleHealth(recHealth, reqHealth)
+	if recHealth.Code != http.StatusOK {
+		t.Fatalf("GET /api/health failed: %d", recHealth.Code)
+	}
+
+	// 3. Remote IntroduceToRemote POST /api/peers (CustomName=false) must NOT revert custom name
+	remoteBody, _ := json.Marshal(config.PeerDevice{
+		Name:       "Detected-U2",
+		CustomName: false,
+		IP:         "100.64.1.10",
+		URL:        "http://100.64.1.10:8765",
+	})
+	reqRemote := httptest.NewRequest(http.MethodPost, "/api/peers", bytes.NewReader(remoteBody))
+	reqRemote.RemoteAddr = "100.64.1.10:51235"
+	reqRemote.Header.Set("X-Bridge-Token", cfg.AuthToken)
+	reqRemote.Header.Set("X-Bridge-Node-Name", "Detected-U2")
+	reqRemote.Header.Set("X-Bridge-Peer-URL", "http://100.64.1.10:8765")
+	recRemote := httptest.NewRecorder()
+	srv.authMiddleware(srv.handlePeers)(recRemote, reqRemote)
+	if recRemote.Code != http.StatusOK {
+		t.Fatalf("remote POST /api/peers failed: %d %s", recRemote.Code, recRemote.Body.String())
+	}
+
+	var remoteResp config.PeerDevice
+	if err := json.NewDecoder(recRemote.Body).Decode(&remoteResp); err != nil {
+		t.Fatalf("decode remote POST response: %v", err)
+	}
+	if remoteResp.Name != "Office-U2" || !remoteResp.CustomName {
+		t.Fatalf("expected remote POST response to preserve 'Office-U2', got %+v", remoteResp)
+	}
+
+	p := cfg.FindPeer("http://100.64.1.10:8765")
+	if p == nil || p.Name != "Office-U2" || !p.CustomName {
+		t.Fatalf("expected config peer to preserve 'Office-U2' (CustomName=true), got %+v", p)
+	}
+
+	loaded, err := config.LoadConfig(cfgPath)
+	if err != nil {
+		t.Fatalf("LoadConfig failed: %v", err)
+	}
+	if len(loaded.Peers) != 1 || loaded.Peers[0].Name != "Office-U2" || !loaded.Peers[0].CustomName {
+		t.Fatalf("expected persisted peer 'Office-U2' (CustomName=true), got %+v", loaded.Peers)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(events) != 1 || events[0].Name != "Office-U2" || !events[0].CustomName {
+		t.Fatalf("expected exactly 1 peerUpdater call for custom rename, got %+v", events)
+	}
+}
