@@ -493,6 +493,29 @@ func TestConfigureSumatraDefaults_PreservesUserSettings(t *testing.T) {
 	if !strings.Contains(string(freshBytes), "PrintScale = none") || strings.Contains(string(freshBytes), "noscale") {
 		t.Errorf("Expected fresh config to contain 'PrintScale = none', got:\n%s", string(freshBytes))
 	}
+
+	// 3. Duplicate PrintScale lines (including CRLF endings & shrink) are deduplicated to a single PrintScale = none
+	dupCfg := filepath.Join(tempDir, "dup", "SumatraPDF-settings.txt")
+	_ = os.MkdirAll(filepath.Dir(dupCfg), 0755)
+	dupInitial := "Theme = Light\r\nPrinterDefaults [\r\n\tPrintScale = none\r\n\tPrintScale = shrink\r\n\tPrintScale = fit\r\n\tPrintMargin = 0 0 0 0\r\n]\r\n"
+	_ = os.WriteFile(dupCfg, []byte(dupInitial), 0644)
+
+	applySumatraSettingsFile(dupCfg)
+
+	dupGotBytes, err := os.ReadFile(dupCfg)
+	if err != nil {
+		t.Fatalf("ReadFile dupCfg failed: %v", err)
+	}
+	dupGot := string(dupGotBytes)
+	if count := strings.Count(dupGot, "PrintScale"); count != 1 {
+		t.Errorf("Expected exactly 1 PrintScale line after deduplication, got %d:\n%s", count, dupGot)
+	}
+	if !strings.Contains(dupGot, "PrintScale = none") || strings.Contains(dupGot, "shrink") || strings.Contains(dupGot, "fit") {
+		t.Errorf("Expected single 'PrintScale = none' without shrink/fit, got:\n%s", dupGot)
+	}
+	if !strings.Contains(dupGot, "PrintMargin = 0 0 0 0") || !strings.Contains(dupGot, "Theme = Light") {
+		t.Errorf("Expected unrelated settings preserved after deduplication, got:\n%s", dupGot)
+	}
 }
 
 func TestSumatraShortcutRemovalAndNoCreation(t *testing.T) {

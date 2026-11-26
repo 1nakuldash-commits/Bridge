@@ -2,7 +2,9 @@ package installer
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -493,5 +495,413 @@ func TestFirewallRuleArgs(t *testing.T) {
 		if !reflect.DeepEqual(got, want) {
 			t.Errorf("firewallRuleAddArgs(%d) = %v, want %v", tt.port, got, want)
 		}
+	}
+}
+
+func TestBridgePortName(t *testing.T) {
+	if got := BridgePortName("Unit 2", 9101); got != "Bridge - Unit 2 (9101)" {
+		t.Fatalf("BridgePortName('Unit 2', 9101) = %q", got)
+	}
+	if got := BridgePortName("Lab/PC:1", 0); got != "Bridge - Lab_PC_1 (9101)" {
+		t.Fatalf("BridgePortName('Lab/PC:1', 0) = %q", got)
+	}
+}
+
+func TestDeregisterFromAllPeersSendsDelete(t *testing.T) {
+	var receivedMethod string
+	var receivedToken string
+	var receivedBody map[string]string
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/peers" {
+			receivedMethod = r.Method
+			receivedToken = r.Header.Get("X-Bridge-Token")
+			_ = json.NewDecoder(r.Body).Decode(&receivedBody)
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"status":"removed","removed":true}`))
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+
+	cfg := config.DefaultConfig()
+	cfg.NodeName = "Device-2"
+	cfg.AuthToken = "test-secret-xyz"
+	cfg.ListenPort = 8765
+	cfg.Peers = []config.PeerDevice{
+		{
+			Name:      "Device-1",
+			IP:        "127.0.0.1",
+			URL:       srv.URL,
+			SpoolPort: 9101,
+		},
+	}
+
+	deregisterFromAllPeers(cfg, "100.64.0.22", srv.Client())
+
+	if receivedMethod != http.MethodDelete {
+		t.Fatalf("expected DELETE /api/peers, got %q", receivedMethod)
+	}
+	if receivedToken != "test-secret-xyz" {
+		t.Fatalf("expected X-Bridge-Token 'test-secret-xyz', got %q", receivedToken)
+	}
+	if receivedBody["name"] != "Device-2" || receivedBody["ip"] != "100.64.0.22" || receivedBody["url"] != "http://100.64.0.22:8765" {
+		t.Fatalf("unexpected DELETE /api/peers body: %+v", receivedBody)
+	}
+}
+
+func TestDiscoverTailscalePeersFiltersNonBridgeAndIgnored(t *testing.T) {
+	// 1. Healthy Bridge node
+	healthySrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(server.HealthResponse{
+			Status:         "healthy",
+			NodeName:       "Real-Bridge-Node",
+			PrinterReady:   true,
+			DefaultPrinter: "HP LaserJet",
+		})
+	}))
+	defer healthySrv.Close()
+
+	// 2. Non-Bridge HTTP 200 server (e.g. generic web app returning 200 OK without Bridge HealthResponse)
+	nonBridgeSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`<html>ok</html>`))
+	}))
+	defer nonBridgeSrv.Close()
+
+	// 3. HTTP 200 JSON missing status=healthy
+	badStatusSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"status":    "degraded",
+			"node_name": "FakeNode",
+		})
+	}))
+	defer badStatusSrv.Close()
+
+	statusJSON := []byte(`{
+		"Peer": {
+			"k1": {"HostName": "real-pc", "TailscaleIPs": ["100.64.0.10"], "Online": false, "OS": "windows"},
+			"k2": {"HostName": "web-pc", "TailscaleIPs": ["100.64.0.20"], "Online": true, "OS": "linux"},
+			"k3": {"HostName": "uninstalled-pc", "TailscaleIPs": ["100.64.0.30"], "Online": true, "OS": "windows"},
+			"k4": {"HostName": "bad-status-pc", "TailscaleIPs": ["100.64.0.40"], "Online": true, "OS": "windows"}
+		}
+	}`)
+
+	peers, err := discoverTailscalePeersFromJSON(statusJSON, func(ip string) probeHealthInfo {
+		switch ip {
+		case "100.64.0.10":
+			return probeBridgeHealthURL(healthySrv.URL + "/api/health")
+		case "100.64.0.20":
+			return probeBridgeHealthURL(nonBridgeSrv.URL + "/api/health")
+		case "100.64.0.40":
+			return probeBridgeHealthURL(badStatusSrv.URL + "/api/health")
+		default:
+			return probeHealthInfo{}
+		}
+	})
+	if err != nil {
+		t.Fatalf("discoverTailscalePeersFromJSON failed: %v", err)
+	}
+	if len(peers) != 4 {
+		t.Fatalf("expected 4 tailscale peer entries, got %d", len(peers))
+	}
+
+	byIP := make(map[string]DiscoveredPeer)
+	for _, p := range peers {
+		byIP[p.IP] = p
+	}
+	if !byIP["100.64.0.10"].BridgeActive || !byIP["100.64.0.10"].Online || byIP["100.64.0.10"].BridgeName != "Real-Bridge-Node" || !byIP["100.64.0.10"].PrinterReady || byIP["100.64.0.10"].PrinterName != "HP LaserJet" {
+		t.Fatalf("expected 100.64.0.10 to be BridgeActive & Online with printer info, got %+v", byIP["100.64.0.10"])
+	}
+	for _, nonBridgeIP := range []string{"100.64.0.20", "100.64.0.30", "100.64.0.40"} {
+		dp := byIP[nonBridgeIP]
+		if dp.BridgeActive || dp.Online {
+			t.Fatalf("expected %s (non-Bridge/uninstalled despite Tailscale Online=true) to have BridgeActive=false and Online=false, got %+v", nonBridgeIP, dp)
+		}
+	}
+
+	// Verify collectUnlinkedDiscoveryCandidates & PromptNewDiscoveries filter out IgnoredPeers and non-Bridge HTTP 200
+	origDiscover := discoverPeersFunc
+	defer func() { discoverPeersFunc = origDiscover }()
+
+	ignoredSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(server.HealthResponse{
+			Status:   "healthy",
+			NodeName: "Ignored-Node",
+		})
+	}))
+	defer ignoredSrv.Close()
+
+	_, igPortStr, _ := net.SplitHostPort(strings.TrimPrefix(ignoredSrv.URL, "http://"))
+	_ = igPortStr
+
+	cfg := config.DefaultConfig()
+	cfg.NodeName = "Unit-1"
+	_ = cfg.AddIgnoredPeer("Ignored-Node", "100.64.0.50", "http://100.64.0.50:8765")
+
+	discoverPeersFunc = func() ([]DiscoveredPeer, error) {
+		return []DiscoveredPeer{
+			{HostName: "ignored", IP: "100.64.0.50", Online: true, BridgeActive: true, BridgeName: "Ignored-Node"},
+			{HostName: "web-pc", IP: "100.64.0.20", Online: false, BridgeActive: false},
+		}, nil
+	}
+
+	cands := collectUnlinkedDiscoveryCandidates(cfg, "100.64.0.1", false)
+	if len(cands) != 0 {
+		t.Fatalf("expected 0 candidates when peers are ignored or non-Bridge, got %+v", cands)
+	}
+}
+
+func TestConfirmPeerNameCollisionCheck(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.NodeName = "U1"
+	cfg.Peers = []config.PeerDevice{
+		{Name: "Office-PC", IP: "100.64.0.2", URL: "http://100.64.0.2:8765", SpoolPort: 9101},
+	}
+
+	// Attempting to name a new peer (100.64.0.3) the same as existing peer 'Office-PC' must be rejected
+	name, isCustom := confirmPeerNameWithConfig(bufio.NewReader(strings.NewReader("Office-PC\n")), cfg, "100.64.0.3", "http://100.64.0.3:8765", "New-PC", "U1")
+	if name != "New-PC" || isCustom {
+		t.Fatalf("expected colliding peer name to be rejected and keep 'New-PC', got (%q, %v)", name, isCustom)
+	}
+}
+
+func TestPromptNewDiscoveriesIgnoreAndSkip(t *testing.T) {
+	// Serve a healthy Bridge node on a loopback httptest server; we test collectUnlinkedDiscoveryCandidates
+	// and PromptNewDiscoveries with IgnoredPeers persistence.
+	origDiscover := discoverPeersFunc
+	defer func() { discoverPeersFunc = origDiscover }()
+
+	// Because collectUnlinkedDiscoveryCandidates probes http://<ip>:8765/api/health, we spin up a listener
+	// or test PromptNewDiscoveries when no new devices exist / verify IgnoredPeers filtering.
+	tmpDir := t.TempDir()
+	cfgPath := filepath.Join(tmpDir, "config.json")
+	cfg := config.DefaultConfig()
+	cfg.ConfigPath = cfgPath
+	cfg.NodeName = "Unit-1"
+	if err := cfg.AddIgnoredPeer("Old-Device", "100.64.0.88", "http://100.64.0.88:8765"); err != nil {
+		t.Fatalf("AddIgnoredPeer failed: %v", err)
+	}
+
+	discoverPeersFunc = func() ([]DiscoveredPeer, error) {
+		return []DiscoveredPeer{
+			{HostName: "old-dev", IP: "100.64.0.88", Online: true, BridgeActive: true, BridgeName: "Old-Device"},
+		}, nil
+	}
+
+	if err := PromptNewDiscoveries(cfg, bufio.NewReader(strings.NewReader("s\n"))); err != nil {
+		t.Fatalf("PromptNewDiscoveries failed: %v", err)
+	}
+	if len(cfg.GetPeers()) != 0 {
+		t.Fatalf("expected ignored peer to not be connected, got %+v", cfg.GetPeers())
+	}
+}
+
+func TestUninstallServicePreDeleteDeregisterWithTempConfig(t *testing.T) {
+	var deleted bool
+	var gotMethod string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/peers" && r.Method == http.MethodDelete {
+			deleted = true
+			gotMethod = r.Method
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+
+	tmpDir := t.TempDir()
+	cfgPath := filepath.Join(tmpDir, "config.json")
+	cfg := config.DefaultConfig()
+	cfg.ConfigPath = cfgPath
+	cfg.NodeName = "Unit-2"
+	cfg.Peers = []config.PeerDevice{
+		{Name: "Unit-1", IP: "127.0.0.1", URL: srv.URL, SpoolPort: 9101},
+	}
+	if err := config.SaveConfig(cfgPath, cfg); err != nil {
+		t.Fatalf("SaveConfig failed: %v", err)
+	}
+
+	loaded, err := config.LoadConfig(cfgPath)
+	if err != nil {
+		t.Fatalf("LoadConfig failed: %v", err)
+	}
+	deregisterFromAllPeers(loaded, "100.64.0.2", srv.Client())
+	if !deleted || gotMethod != http.MethodDelete {
+		t.Fatalf("expected DELETE /api/peers to be sent to configured peer")
+	}
+}
+
+func TestProbeBridgeHealthCapturesPrinterInfo(t *testing.T) {
+	srvWithPrinter := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("X-Bridge-Probe") != "1" {
+			t.Errorf("expected X-Bridge-Probe=1, got %q", r.Header.Get("X-Bridge-Probe"))
+		}
+		_ = json.NewEncoder(w).Encode(server.HealthResponse{
+			Status:         "healthy",
+			NodeName:       "Print-Server-1",
+			PeerName:       "Laptop-1",
+			PrinterReady:   true,
+			DefaultPrinter: "  HP LaserJet Pro M404  ",
+		})
+	}))
+	defer srvWithPrinter.Close()
+
+	srvNoPrinter := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(server.HealthResponse{
+			Status:         "healthy",
+			NodeName:       "Client-Only-PC",
+			PrinterReady:   false,
+			DefaultPrinter: "",
+		})
+	}))
+	defer srvNoPrinter.Close()
+
+	statusJSON := []byte(`{
+		"Peer": {
+			"k1": {"HostName": "print-host", "TailscaleIPs": ["100.64.1.10"], "Online": true, "OS": "windows"},
+			"k2": {"HostName": "client-host", "TailscaleIPs": ["100.64.1.20"], "Online": true, "OS": "windows"}
+		}
+	}`)
+
+	peers, err := discoverTailscalePeersFromJSON(statusJSON, func(ip string) probeHealthInfo {
+		switch ip {
+		case "100.64.1.10":
+			return probeBridgeHealthURL(srvWithPrinter.URL + "/api/health")
+		case "100.64.1.20":
+			return probeBridgeHealthURL(srvNoPrinter.URL + "/api/health")
+		default:
+			return probeHealthInfo{}
+		}
+	})
+	if err != nil {
+		t.Fatalf("discoverTailscalePeersFromJSON failed: %v", err)
+	}
+
+	byIP := make(map[string]DiscoveredPeer)
+	for _, p := range peers {
+		byIP[p.IP] = p
+	}
+
+	p1 := byIP["100.64.1.10"]
+	if !p1.BridgeActive || !p1.Online || p1.BridgeName != "Print-Server-1" || p1.MyName != "Laptop-1" || !p1.PrinterReady || p1.PrinterName != "HP LaserJet Pro M404" {
+		t.Fatalf("unexpected DiscoveredPeer for printer-ready peer: %+v", p1)
+	}
+
+	p2 := byIP["100.64.1.20"]
+	if !p2.BridgeActive || !p2.Online || p2.BridgeName != "Client-Only-PC" || p2.PrinterReady || p2.PrinterName != "" {
+		t.Fatalf("unexpected DiscoveredPeer for printerless peer: %+v", p2)
+	}
+
+	if tag := formatDiscoveredPrinterTag(p1.PrinterReady); tag != "(Printer: Ready)" {
+		t.Fatalf("expected (Printer: Ready), got %q", tag)
+	}
+	if tag := formatDiscoveredPrinterTag(p2.PrinterReady); tag != "(No Printer)" {
+		t.Fatalf("expected (No Printer), got %q", tag)
+	}
+}
+
+func TestDashboardPeerHealthPropagationAndFormatting(t *testing.T) {
+	boolPtr := func(v bool) *bool { return &v }
+
+	cfgPeers := []config.PeerDevice{
+		{Name: "OfflinePC", IP: "100.64.0.1", URL: "http://100.64.0.1:8765", SpoolPort: 9101},
+		{Name: "NoPrinterPC", IP: "100.64.0.2", URL: "http://100.64.0.2:8765", SpoolPort: 9102},
+		{Name: "NamedPrinterPC", IP: "100.64.0.3", URL: "http://100.64.0.3:8765", SpoolPort: 9103},
+		{Name: "ReadyUnnamedPC", IP: "100.64.0.4", URL: "http://100.64.0.4:8765", SpoolPort: 9104},
+		{Name: "LegacyPC", IP: "100.64.0.5", URL: "http://100.64.0.5:8765", SpoolPort: 9105},
+		{Name: "LongPrinterPC", IP: "100.64.0.6", URL: "http://100.64.0.6:8765", SpoolPort: 9106},
+	}
+
+	healthPeers := []config.PeerDevice{
+		{Name: "OfflinePC", IP: "100.64.0.1", URL: "http://100.64.0.1:8765", SpoolPort: 9101, Online: false, PrinterReady: boolPtr(false)},
+		{Name: "NoPrinterPC", IP: "100.64.0.2", URL: "http://100.64.0.2:8765", SpoolPort: 9102, Online: true, PrinterReady: boolPtr(false)},
+		{Name: "NamedPrinterPC", IP: "100.64.0.3", URL: "http://100.64.0.3:8765", SpoolPort: 9103, Online: true, PrinterReady: boolPtr(true), PrinterName: "Canon LBP2900"},
+		{Name: "ReadyUnnamedPC", IP: "100.64.0.4", URL: "http://100.64.0.4:8765", SpoolPort: 9104, Online: true, PrinterReady: boolPtr(true), PrinterName: ""},
+		{Name: "LegacyPC", IP: "100.64.0.5", URL: "http://100.64.0.5:8765", SpoolPort: 9105, Online: true, PrinterReady: nil, PrinterName: ""},
+		{Name: "LongPrinterPC", IP: "100.64.0.6", URL: "http://100.64.0.6:8765", SpoolPort: 9106, Online: true, PrinterReady: boolPtr(true), PrinterName: "HP OfficeJet Pro 9015e All-in-One Series"},
+	}
+
+	merged, onlineCount := applyPeerHealthStatus(append([]config.PeerDevice(nil), cfgPeers...), healthPeers, false)
+	if onlineCount != 5 {
+		t.Fatalf("expected 5 online peers, got %d", onlineCount)
+	}
+
+	wantStatuses := []string{
+		"[OFFLINE]",
+		"[ONLINE | No Printer]",
+		"[ONLINE | Printer: Canon LBP2900]",
+		"[ONLINE | Printer Ready]",
+		"[ONLINE]",
+		"[ONLINE | Printer: HP OfficeJet Pro 9015e Al...]",
+	}
+	for i, want := range wantStatuses {
+		got := formatDashboardPeerStatus(merged[i])
+		if got != want {
+			t.Errorf("peer %d (%s) status = %q, want %q", i, merged[i].Name, got, want)
+		}
+	}
+
+	// Verify stopped service clears Online and printer state
+	stoppedPeers, stoppedOnline := applyPeerHealthStatus(append([]config.PeerDevice(nil), cfgPeers...), healthPeers, true)
+	if stoppedOnline != 0 {
+		t.Fatalf("expected 0 online peers when service stopped, got %d", stoppedOnline)
+	}
+	for _, p := range stoppedPeers {
+		if p.Online || p.PrinterReady != nil || p.PrinterName != "" {
+			t.Fatalf("expected cleared state when service stopped, got %+v", p)
+		}
+		if got := formatDashboardPeerStatus(p); got != "[OFFLINE]" {
+			t.Fatalf("expected [OFFLINE] when service stopped, got %q", got)
+		}
+	}
+}
+
+func TestPrinterlessSetupAndDiscoveryHandling(t *testing.T) {
+	origPrinterFn := getTargetPhysicalPrinterFunc
+	origDiscoverFn := discoverPeersFunc
+	defer func() {
+		getTargetPhysicalPrinterFunc = origPrinterFn
+		discoverPeersFunc = origDiscoverFn
+	}()
+
+	// 1. Local printer error produces friendly note without failing
+	getTargetPhysicalPrinterFunc = func() (string, error) {
+		return "", errors.New("no physical printer connected")
+	}
+	var buf bytes.Buffer
+	reportLocalPrinterStatus(&buf)
+	out := buf.String()
+	if !strings.Contains(out, "None detected") || !strings.Contains(out, "sync files and send prints") {
+		t.Fatalf("expected friendly printerless note, got: %q", out)
+	}
+
+	// 2. Local physical printer present reports Connected & Ready
+	getTargetPhysicalPrinterFunc = func() (string, error) {
+		return "Brother HL-L2350DW", nil
+	}
+	buf.Reset()
+	reportLocalPrinterStatus(&buf)
+	if !strings.Contains(buf.String(), "Brother HL-L2350DW (Connected & Ready)") {
+		t.Fatalf("expected Connected & Ready message, got: %q", buf.String())
+	}
+
+	// 3. PromptNewDiscoveries succeeds cleanly on a printerless machine
+	getTargetPhysicalPrinterFunc = func() (string, error) {
+		return "", errors.New("no physical printer found")
+	}
+	discoverPeersFunc = func() ([]DiscoveredPeer, error) {
+		return nil, nil
+	}
+
+	tmpDir := t.TempDir()
+	cfg := config.DefaultConfig()
+	cfg.ConfigPath = filepath.Join(tmpDir, "config.json")
+	cfg.NodeName = "Client-Laptop"
+
+	if err := PromptNewDiscoveries(cfg, bufio.NewReader(strings.NewReader("s\n"))); err != nil {
+		t.Fatalf("PromptNewDiscoveries failed on printerless device: %v", err)
 	}
 }

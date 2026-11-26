@@ -2,6 +2,7 @@ package installer
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,6 +13,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -82,30 +85,77 @@ const (
 	TargetIcons   = `C:\BridgeApp\icons`
 )
 
+// ErrElevationRequired indicates an operation (such as creating Windows printer ports/printers)
+// requires administrator privileges.
+var ErrElevationRequired = errors.New("administrator privileges required")
+
 // DiscoveredPeer represents an auto-discovered peer on Tailscale.
 type DiscoveredPeer struct {
-	HostName   string `json:"hostname"`
-	IP         string `json:"ip"`
-	Online     bool   `json:"online"`
-	OS         string `json:"os"`
-	BridgeName string `json:"bridge_name,omitempty"`
-	MyName     string `json:"my_name,omitempty"`
+	HostName     string `json:"hostname"`
+	IP           string `json:"ip"`
+	Online       bool   `json:"online"`
+	BridgeActive bool   `json:"bridge_active"`
+	OS           string `json:"os"`
+	BridgeName   string `json:"bridge_name,omitempty"`
+	MyName       string `json:"my_name,omitempty"`
+	PrinterReady bool   `json:"printer_ready"`
+	PrinterName  string `json:"printer_name,omitempty"`
 }
 
-// DiscoverTailscalePeers queries tailscale status and probes online peers for running Bridge instances.
-func DiscoverTailscalePeers() ([]DiscoveredPeer, error) {
-	bin := FindTailscale()
-	if bin == "" {
-		return nil, errors.New("tailscale binary not found")
-	}
+type probeHealthInfo struct {
+	nodeName     string
+	peerName     string
+	active       bool
+	printerReady bool
+	printerName  string
+}
 
-	cmd := exec.Command(bin, "status", "--json")
-	hideCmd(cmd)
-	out, err := cmd.Output()
+func probeBridgeHealth(ip string) probeHealthInfo {
+	if strings.TrimSpace(ip) == "" {
+		return probeHealthInfo{}
+	}
+	return probeBridgeHealthURL(fmt.Sprintf("http://%s:8765/api/health", ip))
+}
+
+func probeBridgeHealthURL(healthURL string) probeHealthInfo {
+	client := http.Client{Timeout: 4 * time.Second}
+	req, err := http.NewRequest("GET", healthURL, nil)
 	if err != nil {
-		return nil, fmt.Errorf("tailscale status failed: %w", err)
+		return probeHealthInfo{}
 	}
+	req.Header.Set("X-Bridge-Probe", "1")
+	resp, err := client.Do(req)
+	if err != nil {
+		return probeHealthInfo{}
+	}
+	defer resp.Body.Close()
 
+	if resp.StatusCode != http.StatusOK {
+		return probeHealthInfo{}
+	}
+	var hr struct {
+		Status         string `json:"status"`
+		NodeName       string `json:"node_name"`
+		PeerName       string `json:"peer_name"`
+		PrinterReady   bool   `json:"printer_ready"`
+		DefaultPrinter string `json:"default_printer"`
+	}
+	if json.NewDecoder(resp.Body).Decode(&hr) != nil {
+		return probeHealthInfo{}
+	}
+	if !strings.EqualFold(strings.TrimSpace(hr.Status), "healthy") || strings.TrimSpace(hr.NodeName) == "" {
+		return probeHealthInfo{}
+	}
+	return probeHealthInfo{
+		nodeName:     strings.TrimSpace(hr.NodeName),
+		peerName:     strings.TrimSpace(hr.PeerName),
+		active:       true,
+		printerReady: hr.PrinterReady,
+		printerName:  strings.TrimSpace(hr.DefaultPrinter),
+	}
+}
+
+func discoverTailscalePeersFromJSON(statusJSON []byte, probeFn func(ip string) probeHealthInfo) ([]DiscoveredPeer, error) {
 	var status struct {
 		Peer map[string]struct {
 			HostName     string   `json:"HostName"`
@@ -115,8 +165,12 @@ func DiscoverTailscalePeers() ([]DiscoveredPeer, error) {
 		} `json:"Peer"`
 	}
 
-	if err := json.Unmarshal(out, &status); err != nil {
+	if err := json.Unmarshal(statusJSON, &status); err != nil {
 		return nil, fmt.Errorf("failed to parse tailscale status json: %w", err)
+	}
+
+	if probeFn == nil {
+		probeFn = probeBridgeHealth
 	}
 
 	var peers []DiscoveredPeer
@@ -135,39 +189,27 @@ func DiscoverTailscalePeers() ([]DiscoveredPeer, error) {
 			continue
 		}
 
+		// Never seed Online from Tailscale's p.Online; require a live Bridge /api/health verification.
 		dp := DiscoveredPeer{
-			HostName: p.HostName,
-			IP:       ip,
-			Online:   p.Online,
-			OS:       p.OS,
+			HostName:     p.HostName,
+			IP:           ip,
+			Online:       false,
+			BridgeActive: false,
+			OS:           p.OS,
 		}
 
 		wg.Add(1)
 		go func(d DiscoveredPeer) {
 			defer wg.Done()
-			client := http.Client{Timeout: 4 * time.Second}
-			req, err := http.NewRequest("GET", fmt.Sprintf("http://%s:8765/api/health", d.IP), nil)
-			if err == nil {
-				req.Header.Set("X-Bridge-Probe", "1")
-				resp, err := client.Do(req)
-				if err == nil {
-					if resp.StatusCode == http.StatusOK {
-						var hr struct {
-							NodeName string `json:"node_name"`
-							PeerName string `json:"peer_name"`
-						}
-						if json.NewDecoder(resp.Body).Decode(&hr) == nil {
-							if hr.NodeName != "" {
-								d.BridgeName = hr.NodeName
-								d.Online = true
-							}
-							if hr.PeerName != "" {
-								d.MyName = hr.PeerName
-							}
-						}
-					}
-					resp.Body.Close()
+			if info := probeFn(d.IP); info.active {
+				d.BridgeActive = true
+				d.Online = true
+				d.BridgeName = info.nodeName
+				if info.peerName != "" {
+					d.MyName = info.peerName
 				}
+				d.PrinterReady = info.printerReady
+				d.PrinterName = info.printerName
 			}
 			mu.Lock()
 			peers = append(peers, d)
@@ -176,7 +218,27 @@ func DiscoverTailscalePeers() ([]DiscoveredPeer, error) {
 	}
 	wg.Wait()
 
+	sort.Slice(peers, func(i, j int) bool {
+		return peers[i].IP < peers[j].IP
+	})
 	return peers, nil
+}
+
+// DiscoverTailscalePeers queries tailscale status and probes peers for live Bridge instances.
+func DiscoverTailscalePeers() ([]DiscoveredPeer, error) {
+	bin := FindTailscale()
+	if bin == "" {
+		return nil, errors.New("tailscale binary not found")
+	}
+
+	cmd := exec.Command(bin, "status", "--json")
+	hideCmd(cmd)
+	out, err := cmd.Output()
+	if err != nil {
+		return nil, fmt.Errorf("tailscale status failed: %w", err)
+	}
+
+	return discoverTailscalePeersFromJSON(out, probeBridgeHealth)
 }
 
 // SanitizeFileName cleans invalid Windows filename characters.
@@ -191,6 +253,15 @@ func SanitizeFileName(name string) string {
 		res = "Remote PC"
 	}
 	return res
+}
+
+// BridgePortName returns the canonical Windows TCP/IP printer port name for a peer.
+func BridgePortName(peerName string, port int) string {
+	clean := SanitizeFileName(peerName)
+	if port <= 0 {
+		port = 9101
+	}
+	return fmt.Sprintf("Bridge - %s (%d)", clean, port)
 }
 
 // EnsureTailscaleConnected automatically verifies Tailscale installation and connectivity.
@@ -312,6 +383,7 @@ func EnsureTailscaleConnected() (string, error) {
 type ShortcutSyncResult struct {
 	SucceededPrinters []string
 	PrinterErrors     map[string]error
+	ElevationRequired bool
 }
 
 func removeSumatraShortcuts() {
@@ -370,9 +442,6 @@ func SyncBridgeShortcutsForPeers(peers []config.PeerDevice) ShortcutSyncResult {
 	result := ShortcutSyncResult{
 		PrinterErrors: make(map[string]error),
 	}
-
-	// Prune any obsolete virtual printers and ports from older versions
-	_ = PruneObsoleteVirtualPrinters(peers)
 
 	// 0. Determine local node name to strictly prevent self virtual printers or shortcuts
 	localNodeName := ""
@@ -445,11 +514,13 @@ func SyncBridgeShortcutsForPeers(peers []config.PeerDevice) ShortcutSyncResult {
 		}
 	}
 
+	var activePeers []config.PeerDevice
 	for _, p := range peers {
 		// Strictly never install a virtual printer or SendTo shortcut for THIS device
 		if config.IsSelfTarget(p.Name, p.IP, p.URL, localNodeName, 0) {
 			continue
 		}
+		activePeers = append(activePeers, p)
 
 		cleanPeer := SanitizeFileName(p.Name)
 		sendToLnkName := fmt.Sprintf("Print on %s.lnk", cleanPeer)
@@ -467,10 +538,16 @@ func SyncBridgeShortcutsForPeers(peers []config.PeerDevice) ShortcutSyncResult {
 		if err := InstallVirtualPrinter(cleanPeer, port); err != nil {
 			log.Printf("[Installer] Warning: Virtual printer registration failed for %s on port %d: %v", cleanPeer, port, err)
 			result.PrinterErrors[cleanPeer] = err
+			if errors.Is(err, ErrElevationRequired) || strings.Contains(strings.ToLower(err.Error()), "administrator") {
+				result.ElevationRequired = true
+			}
 		} else {
 			result.SucceededPrinters = append(result.SucceededPrinters, cleanPeer)
 		}
 	}
+
+	// Prune obsolete virtual printers and legacy/unused Bridge TCP ports after migrating current peers
+	_ = PruneObsoleteVirtualPrinters(activePeers)
 
 	return result
 }
@@ -478,8 +555,18 @@ func SyncBridgeShortcutsForPeers(peers []config.PeerDevice) ShortcutSyncResult {
 // CreateBridgeShortcutsForPeers configures Windows Virtual Printers and SendTo shortcuts
 // for all connected peer devices in the multi-device network, plus the single global shared folder.
 func CreateBridgeShortcutsForPeers(peers []config.PeerDevice) error {
-	_ = SyncBridgeShortcutsForPeers(peers)
-	return nil
+	res := SyncBridgeShortcutsForPeers(peers)
+	if len(res.PrinterErrors) == 0 {
+		return nil
+	}
+	var errs []error
+	for peerName, err := range res.PrinterErrors {
+		errs = append(errs, fmt.Errorf("virtual printer 'Print on %s': %w", peerName, err))
+	}
+	if res.ElevationRequired {
+		errs = append(errs, ErrElevationRequired)
+	}
+	return errors.Join(errs...)
 }
 
 // UpgradeInstallation cleanly upgrades the installed Bridge service to the specified source executable.
@@ -576,9 +663,7 @@ func UpgradeInstallation(sourceExe string) error {
 	ensureFirewallRule(port)
 
 	fmt.Println("[5/5] Restarting Bridge background service...")
-	cmd := exec.Command(TargetExe, "-autostart")
-	hideCmd(cmd)
-	if err := cmd.Start(); err != nil {
+	if err := startBridgeBackgroundService(); err != nil {
 		return fmt.Errorf("failed to start Bridge background service: %w", err)
 	}
 
@@ -742,13 +827,99 @@ func VerifyHealth(port int) error {
 	return nil
 }
 
-// UninstallService cleanly removes startup entries, virtual printers, firewall rule, shortcuts, and application binaries.
+var targetConfigPath = TargetConfig
+
+func deregisterFromPeer(peer config.PeerDevice, selfPayload []byte, token string, client *http.Client) error {
+	targetURL := strings.TrimRight(strings.TrimSpace(peer.URL), "/")
+	if targetURL == "" && strings.TrimSpace(peer.IP) != "" {
+		targetURL = fmt.Sprintf("http://%s:8765", strings.TrimSpace(peer.IP))
+	}
+	if targetURL == "" {
+		return nil
+	}
+	if client == nil {
+		client = &http.Client{Timeout: 2500 * time.Millisecond}
+	}
+	req, err := http.NewRequest(http.MethodDelete, fmt.Sprintf("%s/api/peers", targetURL), bytes.NewReader(selfPayload))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if token != "" {
+		req.Header.Set("X-Bridge-Token", token)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		return fmt.Errorf("peer %s returned HTTP %d", targetURL, resp.StatusCode)
+	}
+	return nil
+}
+
+func buildSelfDeregisterPayload(cfg *config.Config, localIP string) []byte {
+	listenPort := cfg.ListenPort
+	if listenPort <= 0 {
+		listenPort = 8765
+	}
+	selfURL := ""
+	if localIP != "" {
+		selfURL = fmt.Sprintf("http://%s:%d", localIP, listenPort)
+	}
+	payload := struct {
+		URL  string `json:"url,omitempty"`
+		IP   string `json:"ip,omitempty"`
+		Name string `json:"name,omitempty"`
+	}{
+		URL:  selfURL,
+		IP:   localIP,
+		Name: cfg.GetNodeName(),
+	}
+	data, _ := json.Marshal(payload)
+	return data
+}
+
+// deregisterFromAllPeers notifies all configured peers via DELETE /api/peers that this node is disconnecting/uninstalling.
+func deregisterFromAllPeers(cfg *config.Config, localIP string, client *http.Client) {
+	if cfg == nil {
+		return
+	}
+	peers := cfg.GetPeers()
+	if len(peers) == 0 {
+		return
+	}
+	if client == nil {
+		client = &http.Client{Timeout: 2500 * time.Millisecond}
+	}
+	payload := buildSelfDeregisterPayload(cfg, localIP)
+	var wg sync.WaitGroup
+	for _, p := range peers {
+		wg.Add(1)
+		go func(peer config.PeerDevice) {
+			defer wg.Done()
+			_ = deregisterFromPeer(peer, payload, cfg.AuthToken, client)
+		}(p)
+	}
+	wg.Wait()
+}
+
+// UninstallService cleanly removes startup entries, notifies peers, and removes virtual printers,
+// firewall rule, shortcuts, and application binaries.
 func UninstallService() error {
+	// Load config BEFORE deleting files so we can notify paired peers via DELETE /api/peers.
+	if cfg, err := config.LoadConfig(targetConfigPath); err == nil && cfg != nil {
+		peers := cfg.GetPeers()
+		if len(peers) > 0 {
+			fmt.Printf("[0/6] Notifying %d paired peer(s) to remove this device...\n", len(peers))
+			deregisterFromAllPeers(cfg, GetTailscaleIP(), nil)
+		}
+	}
+
 	fmt.Println("[1/6] Stopping Bridge background processes, print engine, and scheduled tasks...")
 	for _, tn := range []string{LogonTaskName, TaskName} {
-		cmdSch := exec.Command("schtasks", "/Delete", "/TN", tn, "/F")
-		hideCmd(cmdSch)
-		_ = cmdSch.Run()
+		endAndDeleteTask(tn)
 	}
 
 	KillOtherBridgeProcesses()
@@ -801,6 +972,7 @@ func UninstallService() error {
 	_ = os.RemoveAll(`C:\Bridge\PrintQueue`)
 	_ = os.RemoveAll(`C:\Bridge\PrintFailed`)
 	_ = os.RemoveAll(`C:\Bridge\Print`)
+	_ = os.RemoveAll(printer.DefaultOutboundQueueDir)
 
 	// 1. Remove non-locked files inside TargetAppDir immediately
 	if entries, err := os.ReadDir(TargetAppDir); err == nil {
@@ -811,40 +983,43 @@ func UninstallService() error {
 		}
 	}
 
-	// 2. Schedule reliable deletion of TargetAppDir with CWD = C:\ and retry loop via PowerShell
-	psClean := fmt.Sprintf(`Start-Sleep -Seconds 1; 1..15 | ForEach-Object { Remove-Item -LiteralPath '%s' -Recurse -Force -ErrorAction SilentlyContinue; if (-not (Test-Path -LiteralPath '%s')) { exit 0 }; Start-Sleep -Seconds 1 }`, TargetAppDir, TargetAppDir)
-	cleanupCmd := exec.Command("powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", psClean)
-	cleanupCmd.Dir = `C:\`
-	hideCmd(cleanupCmd)
-	_ = cleanupCmd.Start()
-
-	// If current process is not running inside TargetAppDir, delete it directly now
+	// 2. Schedule reliable deletion of TargetAppDir waiting on our PID, or delete directly if external
 	currExe, _ := os.Executable()
 	isInsideAppDir := strings.HasPrefix(strings.ToLower(filepath.Clean(currExe)), strings.ToLower(filepath.Clean(TargetAppDir)))
-	if !isInsideAppDir {
-		_ = os.RemoveAll(TargetAppDir)
+	if runtime.GOOS == "windows" {
+		if isInsideAppDir {
+			scheduleSelfDeleteAppDir(TargetAppDir, os.Getpid())
+		} else {
+			_ = os.RemoveAll(TargetAppDir)
+		}
 	}
 
 	fmt.Println()
 	fmt.Println("======================================================================")
 	fmt.Println("[✓] Bridge has been completely and permanently uninstalled.")
+	fmt.Println("    - Paired peers were notified to remove this device.")
 	fmt.Println("    - All Bridge virtual printers and ports were removed.")
 	fmt.Println("    - All autostart entries across all accounts were eradicated.")
-	fmt.Println("    - Application binaries (C:\\BridgeApp) have been deleted.")
+	fmt.Println("    - Application binaries (C:\\BridgeApp) have been scheduled for removal.")
 	fmt.Println("    - Your synchronized files in C:\\Bridge\\Shared were safely preserved.")
 	fmt.Println("======================================================================")
 	return nil
 }
 
-// RestartService restarts Bridge in the current interactive session with taskbar tray icon.
+// StartService launches Bridge in the current interactive session (preferring BridgeAppLogon).
+func StartService() error {
+	return startBridgeBackgroundService()
+}
+
+// RestartService restarts Bridge in the current interactive session with taskbar tray icon,
+// preferring schtasks /Run /TN BridgeAppLogon when that task exists so it runs elevated.
 func RestartService() error {
-	cmdSch := exec.Command("schtasks", "/Delete", "/TN", TaskName, "/F")
-	hideCmd(cmdSch)
-	_ = cmdSch.Run()
+	endAndDeleteTask(TaskName)
+	cmdEnd := exec.Command("schtasks", "/End", "/TN", LogonTaskName)
+	hideCmd(cmdEnd)
+	_ = cmdEnd.Run()
 
 	KillOtherBridgeProcesses()
 	time.Sleep(500 * time.Millisecond)
-	cmd := exec.Command(TargetExe, "-autostart")
-	hideCmd(cmd)
-	return cmd.Start()
+	return startBridgeBackgroundService()
 }

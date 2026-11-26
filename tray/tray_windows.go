@@ -72,7 +72,10 @@ const (
 	NIF_TIP     = 0x00000004
 	NIF_INFO    = 0x00000010
 
-	NIIF_INFO = 0x00000001
+	NIIF_NONE    = 0x00000000
+	NIIF_INFO    = 0x00000001
+	NIIF_WARNING = 0x00000002
+	NIIF_ERROR   = 0x00000003
 
 	WM_DESTROY     = 0x0002
 	WM_USER        = 0x0400
@@ -96,21 +99,18 @@ const (
 	LR_DEFAULTSIZE  = 0x00000040
 
 	MB_OK              = 0x00000000
+	MB_YESNO           = 0x00000004
+	MB_ICONWARNING     = 0x00000030
 	MB_ICONINFORMATION = 0x00000040
 	MB_SETFOREGROUND   = 0x00010000
+	IDYES              = 6
 )
 
-const (
-	CmdHeader = 1000 + iota
-	CmdOpenShared
-	CmdPrintFileDefault
-	CmdStatus
-	CmdResync
-	CmdCopyIP
-	CmdOpenLogs
-	CmdExit
-	CmdPrintFilePeerBase = 2000
-)
+const printFileFilter = "PDF, XPS & Images (*.pdf;*.xps;*.oxps;*.png;*.jpg;*.jpeg;*.bmp;*.tif;*.tiff)\x00*.pdf;*.xps;*.oxps;*.png;*.jpg;*.jpeg;*.bmp;*.tif;*.tiff\x00" +
+	"PDF Documents (*.pdf)\x00*.pdf\x00" +
+	"XPS Documents (*.xps;*.oxps)\x00*.xps;*.oxps\x00" +
+	"Images (*.png;*.jpg;*.jpeg;*.bmp;*.tif;*.tiff)\x00*.png;*.jpg;*.jpeg;*.bmp;*.tif;*.tiff\x00" +
+	"All Files (*.*)\x00*.*\x00\x00"
 
 type POINT struct {
 	X int32
@@ -301,22 +301,36 @@ func (tm *TrayManager) Start() error {
 	return <-readyChan
 }
 
-// Stop removes the icon from the system tray and destroys the window.
+// Stop removes the icon from the system tray, cancels timers, and destroys the window.
 func (tm *TrayManager) Stop() {
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
-	if tm.stopped || tm.hwnd == 0 {
+	if tm.stopped {
 		return
 	}
 	tm.stopped = true
+	if tm.syncDebounceTimer != nil {
+		tm.syncDebounceTimer.Stop()
+		tm.syncDebounceTimer = nil
+	}
+	tm.syncDebounceCount = 0
+	tm.syncDebounceToken++
 
-	var nid NOTIFYICONDATAW
-	nid.CbSize = uint32(unsafe.Sizeof(nid))
-	nid.HWnd = tm.hwnd
-	nid.UID = 1
-	procShell_NotifyIconW.Call(NIM_DELETE, uintptr(unsafe.Pointer(&nid)))
+	if tm.hwnd != 0 {
+		var nid NOTIFYICONDATAW
+		nid.CbSize = uint32(unsafe.Sizeof(nid))
+		nid.HWnd = tm.hwnd
+		nid.UID = 1
+		procShell_NotifyIconW.Call(NIM_DELETE, uintptr(unsafe.Pointer(&nid)))
+		procPostMessageW.Call(tm.hwnd, WM_DESTROY, 0, 0)
+	}
 
-	procPostMessageW.Call(tm.hwnd, WM_DESTROY, 0, 0)
+	for st, h := range tm.hIcons {
+		if h != 0 {
+			procDestroyIcon.Call(h)
+		}
+		delete(tm.hIcons, st)
+	}
 }
 
 func (tm *TrayManager) modifyNotifyLocked() {
@@ -327,13 +341,24 @@ func (tm *TrayManager) modifyNotifyLocked() {
 	procShell_NotifyIconW.Call(NIM_MODIFY, uintptr(unsafe.Pointer(&nid)))
 }
 
-func (tm *TrayManager) showBalloonLocked(title, message string) {
+func notifyInfoFlag(level NotifyLevel) uint32 {
+	switch level {
+	case NotifyError:
+		return NIIF_ERROR
+	case NotifyWarning:
+		return NIIF_WARNING
+	default:
+		return NIIF_INFO
+	}
+}
+
+func (tm *TrayManager) showBalloonLocked(title, message string, level NotifyLevel) {
 	if tm.stopped || tm.hwnd == 0 {
 		return
 	}
 	nid := tm.buildNotifyData(tm.currentState, tm.currentTip)
 	nid.UFlags |= NIF_INFO
-	nid.DwInfoFlags = NIIF_INFO
+	nid.DwInfoFlags = notifyInfoFlag(level)
 	nid.UTimeoutOrVersion = 10000
 
 	copyUTF16Z(nid.SzInfoTitle[:], title)
@@ -342,11 +367,9 @@ func (tm *TrayManager) showBalloonLocked(title, message string) {
 	procShell_NotifyIconW.Call(NIM_MODIFY, uintptr(unsafe.Pointer(&nid)))
 }
 
-// ShowBalloon displays a native Windows taskbar notification bubble.
+// ShowBalloon displays a native Windows taskbar notification bubble, inferring severity from title.
 func (tm *TrayManager) ShowBalloon(title, message string) {
-	tm.mu.Lock()
-	defer tm.mu.Unlock()
-	tm.showBalloonLocked(title, message)
+	tm.ShowNotification(title, message)
 }
 
 func copyUTF16Z(dst []uint16, s string) {
@@ -408,41 +431,7 @@ func trayWndProc(hwnd uintptr, msg uint32, wparam, lparam uintptr) uintptr {
 
 	case WM_COMMAND:
 		cmdID := int(wparam & 0xFFFF)
-		switch {
-		case cmdID == CmdOpenShared:
-			if tm.callbacks.OnOpenShared != nil {
-				go tm.callbacks.OnOpenShared()
-			}
-		case cmdID == CmdPrintFileDefault:
-			go tm.handlePrintFileDialog("")
-		case cmdID >= CmdPrintFilePeerBase && cmdID < CmdPrintFilePeerBase+100:
-			peerIdx := cmdID - CmdPrintFilePeerBase
-			tm.mu.Lock()
-			peerName := ""
-			if peerIdx >= 0 && peerIdx < len(tm.menuPeers) {
-				peerName = tm.menuPeers[peerIdx].Name
-			} else if peerIdx >= 0 && peerIdx < len(tm.peers) {
-				peerName = tm.peers[peerIdx].Name
-			}
-			tm.mu.Unlock()
-			if peerName != "" {
-				go tm.handlePrintFileDialog(peerName)
-			}
-		case cmdID == CmdStatus:
-			go tm.handleShowStatus()
-		case cmdID == CmdResync:
-			if tm.callbacks.OnResync != nil {
-				go tm.callbacks.OnResync()
-			}
-		case cmdID == CmdCopyIP:
-			go tm.handleCopyIP()
-		case cmdID == CmdOpenLogs:
-			go tm.handleOpenLogs()
-		case cmdID == CmdExit:
-			if tm.callbacks.OnExit != nil {
-				go tm.callbacks.OnExit()
-			}
-		}
+		tm.dispatchMenuCommand(cmdID)
 		return 0
 
 	case WM_DESTROY:
@@ -452,6 +441,72 @@ func trayWndProc(hwnd uintptr, msg uint32, wparam, lparam uintptr) uintptr {
 
 	r, _, _ := procDefWindowProcW.Call(hwnd, uintptr(msg), wparam, lparam)
 	return r
+}
+
+func (tm *TrayManager) dispatchMenuCommand(cmdID int) {
+	switch {
+	case cmdID == CmdOpenShared:
+		if tm.callbacks.OnOpenShared != nil {
+			go tm.callbacks.OnOpenShared()
+		}
+	case cmdID == CmdOpenDashboard:
+		if tm.callbacks.OnOpenDashboard != nil {
+			go tm.callbacks.OnOpenDashboard()
+		}
+	case cmdID == CmdPairDevice:
+		if tm.callbacks.OnPairDevice != nil {
+			go tm.callbacks.OnPairDevice()
+		}
+	case cmdID >= CmdConnectDiscoveredBase && cmdID < CmdConnectDiscoveredBase+100:
+		idx := cmdID - CmdConnectDiscoveredBase
+		tm.mu.Lock()
+		var dev DiscoveredDevice
+		found := false
+		if idx >= 0 && idx < len(tm.menuDiscovered) {
+			dev = tm.menuDiscovered[idx]
+			found = true
+		} else if idx >= 0 && idx < len(tm.discoveredPeers) {
+			dev = tm.discoveredPeers[idx]
+			found = true
+		}
+		tm.mu.Unlock()
+		if found {
+			if tm.callbacks.OnConnectDiscovered != nil {
+				go tm.callbacks.OnConnectDiscovered(dev)
+			} else if tm.callbacks.OnPairDevice != nil {
+				go tm.callbacks.OnPairDevice()
+			}
+		}
+	case cmdID == CmdPrintFileDefault:
+		go tm.handlePrintFileDialog("")
+	case cmdID >= CmdPrintFilePeerBase && cmdID < CmdPrintFilePeerBase+100:
+		peerIdx := cmdID - CmdPrintFilePeerBase
+		tm.mu.Lock()
+		peerName := ""
+		if peerIdx >= 0 && peerIdx < len(tm.menuPeers) {
+			peerName = tm.menuPeers[peerIdx].Name
+		} else if peerIdx >= 0 && peerIdx < len(tm.peers) {
+			peerName = tm.peers[peerIdx].Name
+		}
+		tm.mu.Unlock()
+		if peerName != "" {
+			go tm.handlePrintFileDialog(peerName)
+		}
+	case cmdID == CmdStatus:
+		go tm.handleShowStatus()
+	case cmdID == CmdResync:
+		if tm.callbacks.OnResync != nil {
+			go tm.callbacks.OnResync()
+		}
+	case cmdID == CmdCopyIP:
+		go tm.handleCopyIP()
+	case cmdID == CmdOpenLogs:
+		go tm.handleOpenLogs()
+	case cmdID == CmdExit:
+		if tm.callbacks.OnExit != nil {
+			go tm.callbacks.OnExit()
+		}
+	}
 }
 
 func (tm *TrayManager) showContextMenu() {
@@ -466,68 +521,18 @@ func (tm *TrayManager) showContextMenu() {
 		procAppendMenuW.Call(menu, uintptr(flags), uintptr(id), uintptr(unsafe.Pointer(t)))
 	}
 
-	tm.mu.Lock()
-	nodeName := tm.nodeName
-	tm.menuPeers = make([]config.PeerDevice, len(tm.peers))
-	copy(tm.menuPeers, tm.peers)
-	peers := make([]config.PeerDevice, len(tm.menuPeers))
-	copy(peers, tm.menuPeers)
-	fallbackPeer := tm.peerName
-	tm.mu.Unlock()
-
-	onlineCount := 0
-	for _, p := range peers {
-		if p.Online {
-			onlineCount++
+	items := tm.snapshotAndBuildMenuItems()
+	for _, item := range items {
+		if item.separator {
+			procAppendMenuW.Call(menu, MF_SEPARATOR, 0, 0)
+			continue
 		}
+		flags := uint32(MF_STRING)
+		if item.disabled {
+			flags |= MF_GRAYED
+		}
+		appendMenuItem(item.id, item.text, flags)
 	}
-
-	// 1. Header with dynamic online count
-	headerText := fmt.Sprintf("Bridge: %s (%d/%d Online)", nodeName, onlineCount, len(peers))
-	if len(peers) == 0 {
-		headerText = fmt.Sprintf("Bridge: %s (Standby)", nodeName)
-	}
-	appendMenuItem(CmdHeader, headerText, MF_STRING|MF_GRAYED)
-	procAppendMenuW.Call(menu, MF_SEPARATOR, 0, 0)
-
-	// 2. Open Shared Folder
-	appendMenuItem(CmdOpenShared, "📁  Open Shared Folder", MF_STRING)
-
-	// 3. Print Actions: Dynamic list of peers
-	if len(peers) == 0 {
-		target := fallbackPeer
-		if target == "" {
-			target = "Remote PC"
-		}
-		appendMenuItem(CmdPrintFileDefault, fmt.Sprintf("🖨️  Print on %s...", target), MF_STRING)
-	} else if len(peers) == 1 {
-		p := peers[0]
-		statusTag := "Online"
-		if !p.Online {
-			statusTag = "Offline"
-		}
-		appendMenuItem(CmdPrintFilePeerBase, fmt.Sprintf("🖨️  Print on %s (%s)...", p.Name, statusTag), MF_STRING)
-	} else {
-		for i, p := range peers {
-			if i >= 50 {
-				break
-			}
-			statusTag := "🟢 Online"
-			if !p.Online {
-				statusTag = "⚪ Offline"
-			}
-			itemText := fmt.Sprintf("🖨️  Print on %s (%s)...", p.Name, statusTag)
-			appendMenuItem(CmdPrintFilePeerBase+i, itemText, MF_STRING)
-		}
-	}
-
-	// 4. Multi-Function Quick Actions
-	appendMenuItem(CmdCopyIP, "📋  Copy My Tailscale IP", MF_STRING)
-	appendMenuItem(CmdStatus, "📊  Device Network Status", MF_STRING)
-	appendMenuItem(CmdResync, "🔄  Sync Now", MF_STRING)
-	appendMenuItem(CmdOpenLogs, "📂  Open Service Logs", MF_STRING)
-	procAppendMenuW.Call(menu, MF_SEPARATOR, 0, 0)
-	appendMenuItem(CmdExit, "❌  Exit Bridge", MF_STRING)
 
 	var pt POINT
 	procGetCursorPos.Call(uintptr(unsafe.Pointer(&pt)))
@@ -541,13 +546,13 @@ func (tm *TrayManager) handleCopyIP() {
 		ip = tm.callbacks.OnCopyIP()
 	}
 	if ip == "" {
-		tm.ShowBalloon("Tailscale IP", "Tailscale IP is not yet connected or available.")
+		tm.ShowNotificationLevel("Tailscale IP", "Tailscale IP is not yet connected or available.", NotifyWarning)
 		return
 	}
 	if err := SetClipboardText(ip); err == nil {
-		tm.ShowBalloon("IP Copied", fmt.Sprintf("Copied %s to clipboard!", ip))
+		tm.ShowNotificationLevel("IP Copied", fmt.Sprintf("Copied %s to clipboard!", ip), NotifyInfo)
 	} else {
-		tm.ShowBalloon("Tailscale IP", fmt.Sprintf("Local IP: %s", ip))
+		tm.ShowNotificationLevel("Tailscale IP", fmt.Sprintf("Local IP: %s", ip), NotifyInfo)
 	}
 }
 
@@ -559,14 +564,80 @@ func (tm *TrayManager) handleOpenLogs() {
 	}
 }
 
+func (tm *TrayManager) alertWarning(title, message string) {
+	if tm.alertFn != nil {
+		tm.alertFn(title, message)
+		return
+	}
+	textPtr, _ := syscall.UTF16PtrFromString(message)
+	titlePtr, _ := syscall.UTF16PtrFromString(title)
+	procMessageBoxW.Call(
+		tm.hwnd,
+		uintptr(unsafe.Pointer(textPtr)),
+		uintptr(unsafe.Pointer(titlePtr)),
+		MB_OK|MB_ICONWARNING|MB_SETFOREGROUND,
+	)
+}
+
+func (tm *TrayManager) confirmAction(title, message string) bool {
+	if tm.confirmFn != nil {
+		return tm.confirmFn(title, message)
+	}
+	textPtr, _ := syscall.UTF16PtrFromString(message)
+	titlePtr, _ := syscall.UTF16PtrFromString(title)
+	r, _, _ := procMessageBoxW.Call(
+		tm.hwnd,
+		uintptr(unsafe.Pointer(textPtr)),
+		uintptr(unsafe.Pointer(titlePtr)),
+		MB_YESNO|MB_ICONWARNING|MB_SETFOREGROUND,
+	)
+	return r == IDYES
+}
+
+func (tm *TrayManager) pickFile(title string) (string, error) {
+	if tm.filePickerFn != nil {
+		return tm.filePickerFn(title)
+	}
+	return OpenFilePicker(title)
+}
+
 func (tm *TrayManager) handlePrintFileDialog(targetPeer string) {
+	if targetPeer != "" {
+		if peer, ok := tm.lookupPeer(targetPeer); ok {
+			if peer.Online && peer.IsPrinterKnownMissing() {
+				msg := fmt.Sprintf(
+					"No physical printer is connected on %s.\n\n%s is currently online, so file sharing works, but you cannot print to it until a printer is connected on %s.",
+					peer.Name, peer.Name, peer.Name,
+				)
+				tm.alertWarning("Printer Not Connected", msg)
+				return
+			}
+			if !peer.Online {
+				var prompt string
+				if tm.callbacks.OnQueueOfflinePrint != nil {
+					prompt = fmt.Sprintf("%s is currently offline.\n\nQueue the document to print automatically when it comes online?", targetPeer)
+				} else {
+					prompt = fmt.Sprintf("%s is currently offline.\n\nAttempts to print now may fail unless it comes back online. Select a document anyway?", targetPeer)
+				}
+				if !tm.confirmAction("Device Offline", prompt) {
+					return
+				}
+			}
+		}
+	}
+
 	title := "Select a Document to Print"
 	if targetPeer != "" {
 		title = fmt.Sprintf("Select a Document to Print on %s", targetPeer)
 	}
 
-	filePath, err := OpenFilePicker(title)
+	filePath, err := tm.pickFile(title)
 	if err != nil || filePath == "" {
+		return
+	}
+
+	if targetPeer != "" && tm.isPeerOffline(targetPeer) && tm.callbacks.OnQueueOfflinePrint != nil {
+		tm.callbacks.OnQueueOfflinePrint(targetPeer, filePath)
 		return
 	}
 
@@ -580,28 +651,34 @@ func (tm *TrayManager) handlePrintFileDialog(targetPeer string) {
 }
 
 func (tm *TrayManager) handleShowStatus() {
-	statusMsg := "Bridge Multi-Device Mesh is active."
+	var statusMsg string
 	if tm.callbacks.OnShowStatus != nil {
 		statusMsg = tm.callbacks.OnShowStatus()
+	} else {
+		statusMsg = tm.buildDefaultStatusText()
+	}
+	formatted := FormatStatusText(statusMsg)
+
+	tm.mu.Lock()
+	queued := tm.queuedPrints
+	tm.mu.Unlock()
+	if queued > 0 && !strings.Contains(strings.ToLower(formatted), "queued") {
+		formatted = fmt.Sprintf("%s\n\nQueued Prints: %d (waiting for offline peer)", formatted, queued)
 	}
 
-	textPtr, _ := syscall.UTF16PtrFromString(statusMsg)
+	textPtr, _ := syscall.UTF16PtrFromString(formatted)
 	titlePtr, _ := syscall.UTF16PtrFromString("Bridge Multi-Device Network Status")
 	procMessageBoxW.Call(tm.hwnd, uintptr(unsafe.Pointer(textPtr)), uintptr(unsafe.Pointer(titlePtr)), MB_OK|MB_ICONINFORMATION|MB_SETFOREGROUND)
 }
 
-// OpenFilePicker opens the native Windows Open File Dialog.
+// OpenFilePicker opens the native Windows Open File Dialog filtered for supported direct-print formats.
 func OpenFilePicker(title string) (string, error) {
 	var ofn OPENFILENAMEW
 	ofn.LStructSize = uint32(unsafe.Sizeof(ofn))
 
-	const printFileFilter = "All Supported Files\x00*.pdf;*.xps;*.oxps;*.png;*.jpg;*.jpeg;*.tif;*.tiff;*.bmp;*.gif\x00" +
-		"PDF Documents (*.pdf)\x00*.pdf\x00" +
-		"XPS Documents (*.xps;*.oxps)\x00*.xps;*.oxps\x00" +
-		"Images (*.png;*.jpg;*.jpeg;*.tif;*.tiff;*.bmp;*.gif)\x00*.png;*.jpg;*.jpeg;*.tif;*.tiff;*.bmp;*.gif\x00" +
-		"All Files (*.*)\x00*.*\x00\x00"
 	filter := utf16.Encode([]rune(printFileFilter))
 	ofn.LpstrFilter = &filter[0]
+	ofn.NFilterIndex = 1
 
 	fileBuf := make([]uint16, 1024)
 	ofn.LpstrFile = &fileBuf[0]

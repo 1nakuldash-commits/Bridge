@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -29,9 +30,13 @@ type Server struct {
 	printService      *printer.PrintService
 	server            *http.Server
 	startTime         time.Time
+	callbackMu        sync.RWMutex
 	peerUpdater       func(peer config.PeerDevice, isNew bool)
+	peerRemover       func(peer config.PeerDevice)
 	onPrintDispatched func(fileName, peerName string)
+	onPrintRejected   func(sourceNode, reason string)
 	onSyncReceived    func(relPath string)
+	checkPrinterReady func() (string, error) // optional test hook; nil uses printService.CheckPrinterReady
 }
 
 // HealthResponse represents the payload returned by GET /api/health.
@@ -69,10 +74,10 @@ func NewServer(cfg *config.Config, stateMgr *bridgesync.StateManager, printServi
 	mux.HandleFunc("/api/print-local", s.authMiddleware(s.handlePrintLocal))
 
 	s.server = &http.Server{
-		Addr:         fmt.Sprintf(":%d", cfg.ListenPort),
-		Handler:      mux,
-		ReadTimeout:  120 * time.Second,
-		WriteTimeout: 120 * time.Second,
+		Addr:              fmt.Sprintf(":%d", cfg.ListenPort),
+		Handler:           mux,
+		ReadHeaderTimeout: 30 * time.Second,
+		IdleTimeout:       120 * time.Second,
 	}
 
 	return s
@@ -80,22 +85,86 @@ func NewServer(cfg *config.Config, stateMgr *bridgesync.StateManager, printServi
 
 // SetPeerUpdater sets a callback invoked when a peer device is added or updated.
 func (s *Server) SetPeerUpdater(fn func(peer config.PeerDevice, isNew bool)) {
+	s.callbackMu.Lock()
 	s.peerUpdater = fn
+	s.callbackMu.Unlock()
+}
+
+func (s *Server) getPeerUpdater() func(peer config.PeerDevice, isNew bool) {
+	s.callbackMu.RLock()
+	fn := s.peerUpdater
+	s.callbackMu.RUnlock()
+	return fn
+}
+
+// SetPeerRemover sets a callback invoked when a peer device is removed via DELETE /api/peers.
+func (s *Server) SetPeerRemover(fn func(peer config.PeerDevice)) {
+	s.callbackMu.Lock()
+	s.peerRemover = fn
+	s.callbackMu.Unlock()
+}
+
+func (s *Server) getPeerRemover() func(peer config.PeerDevice) {
+	s.callbackMu.RLock()
+	fn := s.peerRemover
+	s.callbackMu.RUnlock()
+	return fn
 }
 
 // SetSyncEngine attaches a SyncEngine reference to handle mesh file routing and deletion relay.
 func (s *Server) SetSyncEngine(se *bridgesync.SyncEngine) {
+	s.callbackMu.Lock()
 	s.syncEngine = se
+	s.callbackMu.Unlock()
+}
+
+func (s *Server) getSyncEngine() *bridgesync.SyncEngine {
+	s.callbackMu.RLock()
+	se := s.syncEngine
+	s.callbackMu.RUnlock()
+	return se
 }
 
 // SetOnPrintDispatched sets a callback invoked when a local file is dispatched for printing.
 func (s *Server) SetOnPrintDispatched(fn func(fileName, peerName string)) {
+	s.callbackMu.Lock()
 	s.onPrintDispatched = fn
+	s.callbackMu.Unlock()
+}
+
+func (s *Server) getOnPrintDispatched() func(fileName, peerName string) {
+	s.callbackMu.RLock()
+	fn := s.onPrintDispatched
+	s.callbackMu.RUnlock()
+	return fn
+}
+
+// SetOnPrintRejected sets a callback invoked when an incoming print job is rejected because no physical printer is connected.
+func (s *Server) SetOnPrintRejected(fn func(sourceNode, reason string)) {
+	s.callbackMu.Lock()
+	s.onPrintRejected = fn
+	s.callbackMu.Unlock()
+}
+
+func (s *Server) getOnPrintRejected() func(sourceNode, reason string) {
+	s.callbackMu.RLock()
+	fn := s.onPrintRejected
+	s.callbackMu.RUnlock()
+	return fn
 }
 
 // SetOnSyncReceived sets a callback invoked when a file is received via sync upload.
 func (s *Server) SetOnSyncReceived(fn func(relPath string)) {
+	s.callbackMu.Lock()
 	s.onSyncReceived = fn
+	s.callbackMu.Unlock()
+}
+
+func (s *Server) getOnSyncReceived() func(relPath string) {
+	s.callbackMu.RLock()
+	fn := s.onSyncReceived
+	s.callbackMu.RUnlock()
+	return fn
 }
 
 // Start runs the HTTP listener.
@@ -112,18 +181,42 @@ func (s *Server) Stop() error {
 	return s.server.Close()
 }
 
-// authMiddleware enforces the mandatory X-Bridge-Token header and checks for peer auto-discovery.
+// authMiddleware enforces the mandatory X-Bridge-Token header.
 func (s *Server) authMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		token := r.Header.Get("X-Bridge-Token")
-		if token == "" || token != s.cfg.AuthToken {
+		if s.cfg.AuthToken == "" || token == "" || token != s.cfg.AuthToken {
 			http.Error(w, "Unauthorized: missing or invalid X-Bridge-Token", http.StatusUnauthorized)
 			return
 		}
 
-		s.checkAutoPair(r)
 		next(w, r)
 	}
+}
+
+func extractClientIP(remoteAddr string) string {
+	addr := strings.TrimSpace(remoteAddr)
+	if addr == "" {
+		return ""
+	}
+	if host, _, err := net.SplitHostPort(addr); err == nil {
+		addr = host
+	}
+	addr = strings.TrimPrefix(addr, "[")
+	addr = strings.TrimSuffix(addr, "]")
+	return addr
+}
+
+func isLoopbackClient(remoteAddr string) bool {
+	ipStr := extractClientIP(remoteAddr)
+	if ipStr == "" {
+		return false
+	}
+	if strings.EqualFold(ipStr, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(ipStr)
+	return ip != nil && ip.IsLoopback()
 }
 
 func extractRemoteIP(remoteAddr string) string {
@@ -233,9 +326,48 @@ func findMatchingPeerSnapshot(peers []config.PeerDevice, name, ip, peerURL strin
 	return config.PeerDevice{}, false
 }
 
+func hasMatchingPeerByURLOrIP(peers []config.PeerDevice, ip, peerURL string) bool {
+	cleanIP := strings.TrimSpace(ip)
+	cleanURL := strings.TrimRight(strings.TrimSpace(peerURL), "/")
+	if cleanIP == "" && cleanURL != "" {
+		cleanIP = config.ExtractIP(cleanURL)
+	}
+	if cleanURL == "" && cleanIP != "" {
+		cleanURL = fmt.Sprintf("http://%s:8765", cleanIP)
+	}
+	if cleanURL != "" {
+		for _, p := range peers {
+			if p.URL != "" && strings.EqualFold(p.URL, cleanURL) {
+				return true
+			}
+		}
+	}
+	if cleanIP != "" {
+		for _, p := range peers {
+			if p.IP == cleanIP {
+				if cleanURL != "" && p.URL != "" && !strings.EqualFold(cleanURL, p.URL) {
+					continue
+				}
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func (s *Server) addOrUpdatePeerWithChange(name, ip, peerURL string) (config.PeerDevice, bool, bool) {
+	return s.upsertPeerWithChange(name, ip, peerURL, false)
+}
+
+func (s *Server) upsertPeerWithChange(name, ip, peerURL string, allowNameMigrate bool) (config.PeerDevice, bool, bool) {
 	before := s.cfg.GetPeers()
-	dev, isNew := s.cfg.AddOrUpdatePeer(name, ip, peerURL)
+	var dev config.PeerDevice
+	var isNew bool
+	if allowNameMigrate {
+		dev, isNew = s.cfg.UpdatePeerAddressByName(name, ip, peerURL)
+	} else {
+		dev, isNew = s.cfg.AddOrUpdatePeer(name, ip, peerURL)
+	}
 	if dev.Name == "" && dev.IP == "" && dev.URL == "" {
 		return dev, false, false
 	}
@@ -251,12 +383,26 @@ func (s *Server) addOrUpdatePeerWithChange(name, ip, peerURL string) (config.Pee
 }
 
 func (s *Server) checkAutoPair(r *http.Request) {
+	token := r.Header.Get("X-Bridge-Token")
+	if s.cfg.AuthToken == "" || token != s.cfg.AuthToken {
+		return
+	}
+	if r.Header.Get("X-Bridge-Probe") != "" {
+		return
+	}
+
 	peerHeader := r.Header.Get("X-Bridge-Peer-URL")
 	nodeHeader := r.Header.Get("X-Bridge-Node-Name")
+	if nodeHeader == "" {
+		nodeHeader = r.Header.Get("X-Bridge-Peer-Name")
+	}
 
 	cleanNodeName := strings.TrimSpace(nodeHeader)
-	cleanIP, cleanPeerURL := resolvePeerFromRequest(peerHeader, r)
+	if cleanNodeName == "" && strings.TrimSpace(peerHeader) == "" {
+		return
+	}
 
+	cleanIP, cleanPeerURL := resolvePeerFromRequest(peerHeader, r)
 	if cleanIP == "" && cleanPeerURL == "" {
 		return
 	}
@@ -264,17 +410,21 @@ func (s *Server) checkAutoPair(r *http.Request) {
 	if config.IsSelfTarget(cleanNodeName, cleanIP, cleanPeerURL, s.cfg.GetNodeName(), s.cfg.ListenPort) {
 		return // Strictly ignore self
 	}
+	if s.cfg.IsPeerIgnored(cleanNodeName, cleanIP, cleanPeerURL) {
+		return
+	}
 
 	dev, isNew, changed := s.addOrUpdatePeerWithChange(cleanNodeName, cleanIP, cleanPeerURL)
+	updater := s.getPeerUpdater()
 	if isNew && dev.Name != "" {
 		log.Printf("[Server] Discovered new peer: '%s' (%s) -> Assigned SpoolPort %d", dev.Name, dev.URL, dev.SpoolPort)
-		if s.peerUpdater != nil {
-			s.peerUpdater(dev, true)
+		if updater != nil {
+			updater(dev, true)
 		}
 	} else if changed && dev.Name != "" {
 		log.Printf("[Server] Updated peer metadata: '%s' (%s) -> SpoolPort %d", dev.Name, dev.URL, dev.SpoolPort)
-		if s.peerUpdater != nil {
-			s.peerUpdater(dev, false)
+		if updater != nil {
+			updater(dev, false)
 		}
 	}
 }
@@ -287,7 +437,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	}
 
 	token := r.Header.Get("X-Bridge-Token")
-	if token == s.cfg.AuthToken && r.Header.Get("X-Bridge-Probe") == "" {
+	if s.cfg.AuthToken != "" && token == s.cfg.AuthToken && r.Header.Get("X-Bridge-Probe") == "" {
 		s.checkAutoPair(r)
 	}
 
@@ -305,6 +455,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		for i := range peers {
 			p := &peers[i]
 			if p.URL == "" {
+				p.Online = false
 				continue
 			}
 			wg.Add(1)
@@ -313,6 +464,10 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 				client := http.Client{Timeout: 500 * time.Millisecond}
 				req, err := http.NewRequest("GET", fmt.Sprintf("%s/api/health", dev.URL), nil)
 				if err != nil {
+					mu.Lock()
+					dev.Online = false
+					mu.Unlock()
+					s.cfg.SetPeerOnlineStatus(dev.URL, false)
 					return
 				}
 				req.Header.Set("X-Bridge-Token", s.cfg.AuthToken)
@@ -320,17 +475,37 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 				req.Header.Set("X-Bridge-Probe", "1")
 
 				resp, err := client.Do(req)
+				isHealthyBridge := false
+				var hr HealthResponse
 				if err == nil {
-					resp.Body.Close()
 					if resp.StatusCode == http.StatusOK {
-						mu.Lock()
-						dev.Online = true
-						dev.LastSeen = time.Now()
-						onlineCount++
-						anyReachable = true
-						mu.Unlock()
-						s.cfg.SetPeerOnlineStatus(dev.URL, true)
+						if decErr := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&hr); decErr == nil {
+							if hr.Status == "healthy" && strings.TrimSpace(hr.NodeName) != "" {
+								isHealthyBridge = true
+							}
+						}
 					}
+					resp.Body.Close()
+				}
+
+				if isHealthyBridge {
+					ready := hr.PrinterReady
+					printerName := strings.TrimSpace(hr.DefaultPrinter)
+					mu.Lock()
+					dev.Online = true
+					dev.LastSeen = time.Now()
+					dev.PrinterReady = &ready
+					dev.PrinterName = printerName
+					onlineCount++
+					anyReachable = true
+					mu.Unlock()
+					s.cfg.SetPeerOnlineStatus(dev.URL, true)
+					s.cfg.SetPeerPrinterStatus(dev.URL, hr.PrinterReady, hr.DefaultPrinter)
+				} else {
+					mu.Lock()
+					dev.Online = false
+					mu.Unlock()
+					s.cfg.SetPeerOnlineStatus(dev.URL, false)
 				}
 			}(p)
 		}
@@ -349,11 +524,13 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		queueDepth = s.printService.QueueDepth()
 	}
 
-	targetPrinter, _ := printer.GetTargetPhysicalPrinter()
-	if targetPrinter == "" {
-		targetPrinter, _ = printer.GetDefaultWindowsPrinter()
+	targetPrinter, pErr := printer.GetTargetPhysicalPrinter()
+	targetPrinter = strings.TrimSpace(targetPrinter)
+	printerReady := pErr == nil && targetPrinter != ""
+	defaultPrinter := ""
+	if printerReady {
+		defaultPrinter = targetPrinter
 	}
-	printerReady := targetPrinter != "" && !printer.IsVirtualPrinterName(targetPrinter, "")
 
 	resp := HealthResponse{
 		Status:          "healthy",
@@ -366,7 +543,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		TotalPeers:      len(peers),
 		PeerReachable:   anyReachable,
 		PrinterReady:    printerReady,
-		DefaultPrinter:  targetPrinter,
+		DefaultPrinter:  defaultPrinter,
 		PrintQueueDepth: queueDepth,
 		UptimeSeconds:   int64(time.Since(s.startTime).Seconds()),
 	}
@@ -376,7 +553,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(resp)
 }
 
-// handlePeers returns or registers known mesh peer devices.
+// handlePeers returns, registers, or deregisters known mesh peer devices.
 func (s *Server) handlePeers(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
@@ -387,9 +564,31 @@ func (s *Server) handlePeers(w http.ResponseWriter, r *http.Request) {
 			"peers":     peers,
 		})
 	case http.MethodPost:
-		var dev config.PeerDevice
-		if err := json.NewDecoder(r.Body).Decode(&dev); err != nil {
+		r.Body = http.MaxBytesReader(w, r.Body, 64<<10)
+		var payload struct {
+			config.PeerDevice
+			Migrate bool `json:"migrate,omitempty"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			var maxBytesErr *http.MaxBytesError
+			if errors.As(err, &maxBytesErr) {
+				http.Error(w, "Request body too large", http.StatusRequestEntityTooLarge)
+				return
+			}
 			http.Error(w, "Invalid peer JSON", http.StatusBadRequest)
+			return
+		}
+		dev := payload.PeerDevice
+		dev.Name = strings.TrimSpace(dev.Name)
+		dev.IP = strings.TrimSpace(dev.IP)
+		dev.URL = strings.TrimRight(strings.TrimSpace(dev.URL), "/")
+
+		if dev.URL != "" && !isValidPeerURL(dev.URL) {
+			http.Error(w, "Invalid peer URL", http.StatusBadRequest)
+			return
+		}
+		if dev.Name == "" && dev.IP == "" && dev.URL == "" {
+			http.Error(w, "Missing peer identifier", http.StatusBadRequest)
 			return
 		}
 		if config.IsSelfTarget(dev.Name, dev.IP, dev.URL, s.cfg.GetNodeName(), s.cfg.ListenPort) {
@@ -397,8 +596,10 @@ func (s *Server) handlePeers(w http.ResponseWriter, r *http.Request) {
 			_ = json.NewEncoder(w).Encode(dev)
 			return
 		}
-		addedDev, isNew, changed := s.addOrUpdatePeerWithChange(dev.Name, dev.IP, dev.URL)
-		if dev.CustomName && strings.TrimSpace(dev.Name) != "" {
+
+		allowNameMigrate := payload.Migrate || (isLoopbackClient(r.RemoteAddr) && !hasMatchingPeerByURLOrIP(s.cfg.GetPeers(), dev.IP, dev.URL))
+		addedDev, isNew, changed := s.upsertPeerWithChange(dev.Name, dev.IP, dev.URL, allowNameMigrate)
+		if dev.CustomName && dev.Name != "" {
 			target := addedDev.URL
 			if target == "" {
 				target = addedDev.IP
@@ -408,22 +609,134 @@ func (s *Server) handlePeers(w http.ResponseWriter, r *http.Request) {
 				if updated := s.cfg.FindPeer(target); updated != nil {
 					addedDev = *updated
 				} else {
-					addedDev.Name = strings.TrimSpace(dev.Name)
+					addedDev.Name = dev.Name
 					addedDev.CustomName = true
 				}
 			}
 		}
 		if (isNew || changed) && s.cfg.ConfigPath != "" {
-			_ = config.SaveConfig(s.cfg.ConfigPath, s.cfg)
+			if err := config.SaveConfig(s.cfg.ConfigPath, s.cfg); err != nil {
+				log.Printf("[Server] Warning: failed to save config after POST /api/peers: %v", err)
+			}
 		}
-		if (isNew || changed) && s.peerUpdater != nil && (addedDev.Name != "" || addedDev.URL != "" || addedDev.IP != "") {
-			s.peerUpdater(addedDev, isNew)
+		if updater := s.getPeerUpdater(); (isNew || changed) && updater != nil && (addedDev.Name != "" || addedDev.URL != "" || addedDev.IP != "") {
+			updater(addedDev, isNew)
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(addedDev)
+	case http.MethodDelete:
+		var reqBody struct {
+			Target string `json:"target"`
+			URL    string `json:"url"`
+			IP     string `json:"ip"`
+			Name   string `json:"name"`
+		}
+		if r.Body != nil {
+			r.Body = http.MaxBytesReader(w, r.Body, 64<<10)
+			if err := json.NewDecoder(r.Body).Decode(&reqBody); err != nil && !errors.Is(err, io.EOF) {
+				var maxBytesErr *http.MaxBytesError
+				if errors.As(err, &maxBytesErr) {
+					http.Error(w, "Request body too large", http.StatusRequestEntityTooLarge)
+					return
+				}
+				http.Error(w, "Invalid peer JSON", http.StatusBadRequest)
+				return
+			}
+		}
+
+		q := r.URL.Query()
+		targetURL := strings.TrimRight(strings.TrimSpace(reqBody.URL), "/")
+		if targetURL == "" {
+			targetURL = strings.TrimRight(strings.TrimSpace(q.Get("url")), "/")
+		}
+		targetIP := strings.TrimSpace(reqBody.IP)
+		if targetIP == "" {
+			targetIP = strings.TrimSpace(q.Get("ip"))
+		}
+		targetName := strings.TrimSpace(reqBody.Name)
+		if targetName == "" {
+			targetName = strings.TrimSpace(q.Get("name"))
+		}
+		explicitTarget := strings.TrimSpace(reqBody.Target)
+		if explicitTarget == "" {
+			explicitTarget = strings.TrimSpace(q.Get("target"))
+		}
+
+		if targetURL == "" && targetIP == "" && targetName == "" && explicitTarget == "" {
+			http.Error(w, "Missing peer identifier (url, ip, or name)", http.StatusBadRequest)
+			return
+		}
+
+		target, matchedPeer, found := resolvePeerRemovalTarget(s.cfg.GetPeers(), targetURL, targetIP, targetName, explicitTarget)
+		removed := false
+		if found && target != "" {
+			removed = s.cfg.RemovePeer(target)
+		}
+		if removed && s.cfg.ConfigPath != "" {
+			if err := config.SaveConfig(s.cfg.ConfigPath, s.cfg); err != nil {
+				log.Printf("[Server] Warning: failed to save config after DELETE /api/peers: %v", err)
+			}
+		}
+		if remover := s.getPeerRemover(); removed && remover != nil {
+			remover(matchedPeer)
+		}
+
+		status := "removed"
+		if !removed {
+			status = "not_found"
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"status":  status,
+			"removed": removed,
+			"peers":   s.cfg.GetPeers(),
+		})
 	default:
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 	}
+}
+
+func resolvePeerRemovalTarget(peers []config.PeerDevice, targetURL, targetIP, targetName, explicitTarget string) (string, config.PeerDevice, bool) {
+	if targetURL != "" {
+		for _, p := range peers {
+			if p.URL != "" && strings.EqualFold(p.URL, targetURL) {
+				return p.URL, p, true
+			}
+		}
+	}
+	if targetIP != "" {
+		for _, p := range peers {
+			if p.IP != "" && p.IP == targetIP {
+				return p.IP, p, true
+			}
+		}
+	}
+	if targetName != "" {
+		for _, p := range peers {
+			if p.Name != "" && strings.EqualFold(p.Name, targetName) {
+				return p.Name, p, true
+			}
+		}
+	}
+	if explicitTarget != "" {
+		clean := strings.TrimRight(strings.TrimSpace(explicitTarget), "/")
+		for _, p := range peers {
+			if p.URL != "" && strings.EqualFold(p.URL, clean) {
+				return p.URL, p, true
+			}
+		}
+		for _, p := range peers {
+			if p.IP != "" && p.IP == clean {
+				return p.IP, p, true
+			}
+		}
+		for _, p := range peers {
+			if p.Name != "" && strings.EqualFold(p.Name, clean) {
+				return p.Name, p, true
+			}
+		}
+	}
+	return "", config.PeerDevice{}, false
 }
 
 // handleSyncInventory returns a list of local files and SHA256 hashes to resolve mesh discrepancies.
@@ -447,6 +760,11 @@ func (s *Server) handleSyncInventory(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodPost:
+		if s.stateMgr == nil {
+			http.Error(w, "State manager unavailable", http.StatusServiceUnavailable)
+			return
+		}
+
 		relPath := r.Header.Get("X-Bridge-RelPath")
 		checksum := r.Header.Get("X-Bridge-Checksum")
 		sizeStr := r.Header.Get("X-Bridge-Size")
@@ -467,20 +785,37 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 			modTime, _ = strconv.ParseInt(modTimeStr, 10, 64)
 		}
 
-		err := bridgesync.ReceiveSyncFile(s.cfg.SharedDir, s.stateMgr, relPath, checksum, size, modTime, r.Body)
+		rawSender := r.Header.Get("X-Bridge-Peer-URL")
+		if rawSender == "" {
+			rawSender = r.Header.Get("X-Bridge-Sender")
+		}
+		_, senderURL := resolvePeerFromRequest(rawSender, r)
+		if senderURL == "" {
+			senderURL = strings.TrimRight(strings.TrimSpace(rawSender), "/")
+		}
+
+		var err error
+		if se := s.getSyncEngine(); se != nil {
+			err = se.ReceiveSyncFile(senderURL, relPath, checksum, size, modTime, r.Body)
+		} else {
+			err = bridgesync.ReceiveSyncFile(s.cfg.SharedDir, s.stateMgr, relPath, checksum, size, modTime, r.Body)
+		}
 		if err != nil {
 			log.Printf("[Server] Error receiving sync file %s: %v", relPath, err)
 			http.Error(w, fmt.Sprintf("Sync failed: %v", err), http.StatusInternalServerError)
 			return
 		}
 
-		if s.onSyncReceived != nil {
-			s.onSyncReceived(relPath)
+		if onSync := s.getOnSyncReceived(); onSync != nil {
+			onSync(relPath)
 		}
 
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		_, _ = io.WriteString(w, `{"status":"synced","path":"`+relPath+`"}`)
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"status": "synced",
+			"path":   relPath,
+		})
 
 	case http.MethodGet:
 		relPath := r.URL.Query().Get("path")
@@ -527,6 +862,11 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.Copy(w, f)
 
 	case http.MethodDelete:
+		if s.stateMgr == nil {
+			http.Error(w, "State manager unavailable", http.StatusServiceUnavailable)
+			return
+		}
+
 		relPath := r.URL.Query().Get("path")
 		if relPath == "" {
 			relPath = r.Header.Get("X-Bridge-RelPath")
@@ -560,8 +900,8 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 		}
 
 		var err error
-		if s.syncEngine != nil {
-			err = s.syncEngine.ReceiveSyncDelete(senderURL, cleanRel, modTime)
+		if se := s.getSyncEngine(); se != nil {
+			err = se.ReceiveSyncDelete(senderURL, cleanRel, modTime)
 		} else {
 			err = bridgesync.ReceiveSyncDelete(s.cfg.SharedDir, s.stateMgr, cleanRel, modTime)
 		}
@@ -573,7 +913,10 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		_, _ = io.WriteString(w, `{"status":"deleted","path":"`+cleanRel+`"}`)
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"status": "deleted",
+			"path":   cleanRel,
+		})
 
 	default:
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -593,13 +936,28 @@ func (s *Server) handlePrint(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Echo loopback prevention check: reject if origin matches this node
-	origin := r.Header.Get("X-Bridge-Origin")
+	origin := strings.TrimSpace(r.Header.Get("X-Bridge-Origin"))
 	if origin == "" {
-		origin = r.Header.Get("X-Bridge-Node-Name")
+		origin = strings.TrimSpace(r.Header.Get("X-Bridge-Node-Name"))
 	}
 	if origin != "" && strings.EqualFold(origin, s.cfg.GetNodeName()) {
 		log.Printf("[Server] REJECTED loopback print job: origin '%s' matches local node name '%s'", origin, s.cfg.GetNodeName())
 		http.Error(w, fmt.Sprintf("Loopback print rejected: origin '%s' matches local node name", origin), http.StatusBadRequest)
+		return
+	}
+
+	var pErr error
+	if s.checkPrinterReady != nil {
+		_, pErr = s.checkPrinterReady()
+	} else {
+		_, pErr = s.printService.CheckPrinterReady()
+	}
+	if pErr != nil {
+		if fn := s.getOnPrintRejected(); fn != nil {
+			fn(origin, pErr.Error())
+		}
+		log.Printf("[Server] REJECTED incoming print job from %q: %v", origin, pErr)
+		http.Error(w, fmt.Sprintf("Printer not connected on %s: %v", s.cfg.GetNodeName(), pErr), http.StatusPreconditionFailed)
 		return
 	}
 
@@ -611,17 +969,42 @@ func (s *Server) handlePrint(w http.ResponseWriter, r *http.Request) {
 	paperSize := strings.TrimSpace(r.Header.Get("X-Bridge-Paper-Size"))
 	orientation := strings.TrimSpace(r.Header.Get("X-Bridge-Orientation"))
 	pageCountStr := strings.TrimSpace(r.Header.Get("X-Bridge-Page-Count"))
+	copiesStr := strings.TrimSpace(r.Header.Get("X-Bridge-Copies"))
 	var pageCount int
 	if pageCountStr != "" {
 		if n, err := strconv.Atoi(pageCountStr); err == nil && n >= 0 {
 			pageCount = n
 		}
 	}
-	if paperSize != "" || orientation != "" || pageCount > 0 {
-		log.Printf("[Server] Incoming print job %q metadata: paper=%q orientation=%q pages=%d", fileName, paperSize, orientation, pageCount)
+	var copies int
+	if copiesStr != "" {
+		if n, err := strconv.Atoi(copiesStr); err == nil && n > 0 {
+			copies = n
+		}
+	}
+	var colorPtr *bool
+	switch strings.ToLower(strings.TrimSpace(r.Header.Get("X-Bridge-Color"))) {
+	case "color", "true", "1":
+		v := true
+		colorPtr = &v
+	case "monochrome", "mono", "grayscale", "false", "0":
+		v := false
+		colorPtr = &v
+	}
+	if paperSize != "" || orientation != "" || pageCount > 0 || copies > 0 {
+		log.Printf("[Server] Incoming print job %q metadata: paper=%q orientation=%q pages=%d copies=%d", fileName, paperSize, orientation, pageCount, copies)
 	}
 
-	job, err := s.printService.SaveIncomingJob(fileName, r.Body)
+	opts := printer.PrintOptions{
+		PaperSize:   paperSize,
+		Orientation: orientation,
+		Copies:      copies,
+		Color:       colorPtr,
+		PageCount:   pageCount,
+		SourceNode:  origin,
+		JobName:     strings.TrimSpace(r.Header.Get("X-Bridge-Job-Name")),
+	}
+	job, err := s.printService.SaveIncomingJobWithOptions(fileName, r.Body, opts)
 	if err != nil {
 		if strings.Contains(err.Error(), "full") {
 			http.Error(w, err.Error(), http.StatusServiceUnavailable)
@@ -646,6 +1029,11 @@ func (s *Server) handlePrintLocal(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if !isLoopbackClient(r.RemoteAddr) {
+		http.Error(w, "Forbidden: /api/print-local is restricted to loopback clients", http.StatusForbidden)
+		return
+	}
+
 	filePath := r.Header.Get("X-Bridge-FilePath")
 	if filePath == "" {
 		data, err := io.ReadAll(io.LimitReader(r.Body, 1024))
@@ -656,8 +1044,13 @@ func (s *Server) handlePrintLocal(w http.ResponseWriter, r *http.Request) {
 		filePath = strings.TrimSpace(string(data))
 	}
 
-	if _, err := os.Stat(filePath); err != nil {
+	info, err := os.Stat(filePath)
+	if err != nil {
 		http.Error(w, fmt.Sprintf("File not found: %s", filePath), http.StatusBadRequest)
+		return
+	}
+	if !info.Mode().IsRegular() {
+		http.Error(w, fmt.Sprintf("Path is not a regular file: %s", filePath), http.StatusBadRequest)
 		return
 	}
 
@@ -691,17 +1084,25 @@ func (s *Server) handlePrintLocal(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
 	defer cancel()
 
-	err := printer.SendDirectPrint(ctx, peerURL, s.cfg.AuthToken, filePath,
+	err = printer.SendDirectPrintWithOptions(ctx, peerURL, s.cfg.AuthToken, filePath, printer.PrintOptions{},
 		"X-Bridge-Node-Name", s.cfg.GetNodeName(),
 		"X-Bridge-Origin", s.cfg.GetNodeName(),
+		"X-Bridge-Job-Name", filepath.Base(filePath),
 	)
 	if err != nil {
+		lowerErr := strings.ToLower(err.Error())
+		if strings.Contains(lowerErr, "http 412") ||
+			strings.Contains(lowerErr, "printer not connected") ||
+			strings.Contains(lowerErr, "no physical printer") {
+			http.Error(w, fmt.Sprintf("Failed to send print job: %v", err), http.StatusPreconditionFailed)
+			return
+		}
 		http.Error(w, fmt.Sprintf("Failed to send print job: %v", err), http.StatusInternalServerError)
 		return
 	}
 
-	if s.onPrintDispatched != nil {
-		s.onPrintDispatched(filepath.Base(filePath), peerName)
+	if fn := s.getOnPrintDispatched(); fn != nil {
+		fn(filepath.Base(filePath), peerName)
 	}
 
 	w.Header().Set("Content-Type", "application/json")

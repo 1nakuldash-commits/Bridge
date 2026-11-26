@@ -10,6 +10,9 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -665,5 +668,512 @@ func TestDirectoryRenameSyncsWithoutStaleTombstones(t *testing.T) {
 	}
 	if s, c := atomic.LoadInt32(&started), atomic.LoadInt32(&completed); s == 0 || s != c {
 		t.Fatalf("expected balanced OnSyncStarted (%d) == OnSyncCompleted (%d)", s, c)
+	}
+}
+
+func TestMultiPeerUploadRelayExcludesSender(t *testing.T) {
+	tmp := t.TempDir()
+	bShared := filepath.Join(tmp, "b_shared")
+	smB, err := NewStateManager(filepath.Join(tmp, "b_state.json"))
+	if err != nil {
+		t.Fatalf("NewStateManager: %v", err)
+	}
+
+	var mu sync.Mutex
+	var aHits int
+	uploadedToC := make(map[string][]byte)
+	var cGotSenderHeader string
+
+	peerA := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		aHits++
+		mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer peerA.Close()
+
+	peerC := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/sync" && r.Method == http.MethodPost {
+			rel := r.Header.Get("X-Bridge-RelPath")
+			body, _ := io.ReadAll(r.Body)
+			mu.Lock()
+			uploadedToC[rel] = body
+			cGotSenderHeader = r.Header.Get("X-Bridge-Peer-URL")
+			mu.Unlock()
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer peerC.Close()
+
+	seB := NewSyncEngine(bShared, "", "tok", smB)
+	seB.SetLocalURL("http://127.0.0.1:19872")
+	seB.UpdatePeerURLs([]string{peerA.URL, peerC.URL})
+	if err := seB.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer seB.Stop()
+
+	payload := []byte("hello from A relayed via B to C")
+	hash := sha256Hex(payload)
+	now := time.Now().UnixNano()
+	if err := seB.ReceiveSyncFile(peerA.URL, "docs/relay.txt", hash, int64(len(payload)), now, bytes.NewReader(payload)); err != nil {
+		t.Fatalf("ReceiveSyncFile: %v", err)
+	}
+
+	deadline := time.Now().Add(4 * time.Second)
+	for time.Now().Before(deadline) {
+		mu.Lock()
+		gotC, okC := uploadedToC["docs/relay.txt"]
+		mu.Unlock()
+		if okC && bytes.Equal(gotC, payload) {
+			break
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+
+	// Duplicate delivery of identical hash must NOT re-relay
+	if err := seB.ReceiveSyncFile(peerA.URL, "docs/relay.txt", hash, int64(len(payload)), now, bytes.NewReader(payload)); err != nil {
+		t.Fatalf("duplicate ReceiveSyncFile: %v", err)
+	}
+	time.Sleep(150 * time.Millisecond)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if !bytes.Equal(uploadedToC["docs/relay.txt"], payload) {
+		t.Fatalf("expected C to receive relayed file, got %q", uploadedToC["docs/relay.txt"])
+	}
+	if cGotSenderHeader != "http://127.0.0.1:19872" {
+		t.Fatalf("expected relay to carry B's X-Bridge-Peer-URL, got %q", cGotSenderHeader)
+	}
+	if aHits != 0 {
+		t.Fatalf("expected sender peer A to be excluded from relay, got %d hits", aHits)
+	}
+}
+
+func TestSafeSaveDebouncePreventsSpuriousDeleteBroadcast(t *testing.T) {
+	tmp := t.TempDir()
+	sharedDir := filepath.Join(tmp, "shared")
+	if err := os.MkdirAll(sharedDir, 0755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	sm, err := NewStateManager(filepath.Join(tmp, "state.json"))
+	if err != nil {
+		t.Fatalf("NewStateManager: %v", err)
+	}
+
+	var mu sync.Mutex
+	uploaded := make(map[string][]byte)
+	var deleteCount int32
+
+	peerSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/sync" {
+			switch r.Method {
+			case http.MethodPost:
+				rel := r.Header.Get("X-Bridge-RelPath")
+				body, _ := io.ReadAll(r.Body)
+				mu.Lock()
+				uploaded[rel] = body
+				mu.Unlock()
+			case http.MethodDelete:
+				atomic.AddInt32(&deleteCount, 1)
+			}
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer peerSrv.Close()
+
+	se := NewSyncEngine(sharedDir, peerSrv.URL, "tok", sm)
+	se.deleteDebounce = 300 * time.Millisecond
+	if err := se.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer se.Stop()
+
+	target := filepath.Join(sharedDir, "report.txt")
+	v1 := []byte("version 1 content")
+	if err := os.WriteFile(target, v1, 0644); err != nil {
+		t.Fatalf("WriteFile v1: %v", err)
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		mu.Lock()
+		got := uploaded["report.txt"]
+		mu.Unlock()
+		if bytes.Equal(got, v1) {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	// Simulate editor safe-save: write temp, remove/backup original, rename temp -> target within ~30ms
+	v2 := []byte("version 2 safe-saved content")
+	tempSwap := filepath.Join(sharedDir, "report.txt.tmp")
+	if err := os.WriteFile(tempSwap, v2, 0644); err != nil {
+		t.Fatalf("WriteFile temp: %v", err)
+	}
+	if err := os.Remove(target); err != nil {
+		t.Fatalf("Remove target: %v", err)
+	}
+	time.Sleep(40 * time.Millisecond)
+	if err := os.Rename(tempSwap, target); err != nil {
+		t.Fatalf("Rename temp -> target: %v", err)
+	}
+
+	deadline = time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		mu.Lock()
+		got := uploaded["report.txt"]
+		mu.Unlock()
+		if bytes.Equal(got, v2) {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	// Wait past debounce delay to ensure no delayed delete fires
+	time.Sleep(450 * time.Millisecond)
+	if got := atomic.LoadInt32(&deleteCount); got != 0 {
+		t.Fatalf("expected 0 DELETE broadcasts during atomic safe-save, got %d", got)
+	}
+	mu.Lock()
+	gotV2 := uploaded["report.txt"]
+	mu.Unlock()
+	if !bytes.Equal(gotV2, v2) {
+		t.Fatalf("expected v2 upload after safe-save, got %q", gotV2)
+	}
+}
+
+func TestPathTraversalAndVolumeNameRejection(t *testing.T) {
+	tmp := t.TempDir()
+	sharedDir := filepath.Join(tmp, "shared")
+	outsideDir := filepath.Join(tmp, "outside")
+	_ = os.MkdirAll(sharedDir, 0755)
+	_ = os.MkdirAll(outsideDir, 0755)
+
+	sm, err := NewStateManager(filepath.Join(tmp, "state.json"))
+	if err != nil {
+		t.Fatalf("NewStateManager: %v", err)
+	}
+
+	payload := []byte("malicious")
+	hash := sha256Hex(payload)
+	badPaths := []string{
+		"",
+		"   ",
+		".",
+		"./",
+		"..",
+		"../evil.txt",
+		`..\evil.txt`,
+		"sub/../../evil.txt",
+		"/etc/passwd",
+		`\Windows\win.ini`,
+		"C:evil.txt",
+		`C:\evil.txt`,
+	}
+
+	for _, p := range badPaths {
+		if err := ReceiveSyncFile(sharedDir, sm, p, hash, int64(len(payload)), time.Now().UnixNano(), bytes.NewReader(payload)); err == nil {
+			t.Errorf("ReceiveSyncFile(%q) unexpectedly succeeded; want path rejection", p)
+		}
+		if err := ReceiveSyncDelete(sharedDir, sm, p, time.Now().UnixNano()); err == nil {
+			t.Errorf("ReceiveSyncDelete(%q) unexpectedly succeeded; want path rejection", p)
+		}
+	}
+
+	// Verify sharedDir itself was not deleted by "."
+	if _, err := os.Stat(sharedDir); err != nil {
+		t.Fatalf("sharedDir should still exist: %v", err)
+	}
+
+	// Verify symlink escape rejection if symlinks are permitted on this OS/user
+	symPath := filepath.Join(sharedDir, "escape_link")
+	if err := os.Symlink(outsideDir, symPath); err == nil {
+		if err := ReceiveSyncFile(sharedDir, sm, "escape_link/pwn.txt", hash, int64(len(payload)), time.Now().UnixNano(), bytes.NewReader(payload)); err == nil {
+			t.Fatalf("expected symlink escape to be rejected")
+		}
+	}
+}
+
+func TestReconcilePreservesConflictCopyOnCloseDivergingEdits(t *testing.T) {
+	tmp := t.TempDir()
+	sharedDir := filepath.Join(tmp, "shared")
+	_ = os.MkdirAll(sharedDir, 0755)
+	sm, err := NewStateManager(filepath.Join(tmp, "state.json"))
+	if err != nil {
+		t.Fatalf("NewStateManager: %v", err)
+	}
+
+	now := time.Now()
+	localTime := now.Add(-5 * time.Second).UnixNano()
+	remoteTime := now.Add(-2 * time.Second).UnixNano() // Only 3s apart -> close conflict!
+
+	localContent := []byte("local user edits that must not be lost")
+	remoteContent := []byte("remote user edits from another device")
+	docPath := filepath.Join(sharedDir, "notes.txt")
+	if err := os.WriteFile(docPath, localContent, 0644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	_ = os.Chtimes(docPath, time.Unix(0, localTime), time.Unix(0, localTime))
+	if err := sm.Set("notes.txt", FileRecord{
+		RelPath: "notes.txt",
+		Hash:    sha256Hex(localContent),
+		Size:    int64(len(localContent)),
+		ModTime: localTime,
+	}); err != nil {
+		t.Fatalf("sm.Set: %v", err)
+	}
+
+	inv := map[string]FileRecord{
+		"notes.txt": {
+			RelPath: "notes.txt",
+			Hash:    sha256Hex(remoteContent),
+			Size:    int64(len(remoteContent)),
+			ModTime: remoteTime,
+		},
+	}
+
+	peerSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/sync/inventory":
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(inv)
+		case "/api/sync":
+			w.Header().Set("X-Bridge-Checksum", sha256Hex(remoteContent))
+			w.Header().Set("X-Bridge-ModTime", strconv.FormatInt(remoteTime, 10))
+			w.Header().Set("X-Bridge-Size", strconv.Itoa(len(remoteContent)))
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(remoteContent)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer peerSrv.Close()
+
+	se := NewSyncEngine(sharedDir, peerSrv.URL, "tok", sm)
+	se.SetNodeName("Unit-A")
+	se.executeReconcilePeer(peerSrv.URL, false)
+	se.Stop()
+
+	// Primary file should have remote content
+	gotMain, err := os.ReadFile(docPath)
+	if err != nil || !bytes.Equal(gotMain, remoteContent) {
+		t.Fatalf("expected notes.txt to have remote content %q, got %q (err=%v)", remoteContent, gotMain, err)
+	}
+
+	// Conflict copy must exist with local content
+	entries, err := os.ReadDir(sharedDir)
+	if err != nil {
+		t.Fatalf("ReadDir: %v", err)
+	}
+	var conflictFound bool
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), "notes (conflict Unit-A ") && strings.HasSuffix(e.Name(), ").txt") {
+			data, err := os.ReadFile(filepath.Join(sharedDir, e.Name()))
+			if err == nil && bytes.Equal(data, localContent) {
+				conflictFound = true
+			}
+		}
+	}
+	if !conflictFound {
+		t.Fatalf("expected conflict copy preserving local content in %s, entries=%v", sharedDir, entries)
+	}
+}
+
+func TestDirtyPeerRecoveryReconciliationAndCallbacks(t *testing.T) {
+	tmp := t.TempDir()
+	sharedDir := filepath.Join(tmp, "shared")
+	_ = os.MkdirAll(sharedDir, 0755)
+	sm, err := NewStateManager(filepath.Join(tmp, "state.json"))
+	if err != nil {
+		t.Fatalf("NewStateManager: %v", err)
+	}
+
+	// Speed up retry backoff for unit test
+	origBackoff := backoffSteps
+	backoffSteps = []time.Duration{10 * time.Millisecond, 10 * time.Millisecond, 10 * time.Millisecond, 10 * time.Millisecond}
+	defer func() { backoffSteps = origBackoff }()
+
+	var failUploads atomic.Bool
+	failUploads.Store(true)
+
+	var mu sync.Mutex
+	uploaded := make(map[string][]byte)
+	var inventoryCalls int32
+	remoteMissed := []byte("file created on peer during blip")
+	remoteInv := map[string]FileRecord{
+		"peer_missed.txt": {
+			RelPath: "peer_missed.txt",
+			Hash:    sha256Hex(remoteMissed),
+			Size:    int64(len(remoteMissed)),
+			ModTime: time.Now().UnixNano(),
+		},
+	}
+
+	peerSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/sync/inventory":
+			atomic.AddInt32(&inventoryCalls, 1)
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(remoteInv)
+		case "/api/sync":
+			if r.Method == http.MethodGet {
+				w.Header().Set("X-Bridge-Checksum", sha256Hex(remoteMissed))
+				w.Header().Set("X-Bridge-ModTime", strconv.FormatInt(remoteInv["peer_missed.txt"].ModTime, 10))
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write(remoteMissed)
+				return
+			}
+			if failUploads.Load() {
+				http.Error(w, "temporary blip", http.StatusServiceUnavailable)
+				return
+			}
+			rel := r.Header.Get("X-Bridge-RelPath")
+			body, _ := io.ReadAll(r.Body)
+			mu.Lock()
+			uploaded[rel] = body
+			mu.Unlock()
+			w.WriteHeader(http.StatusOK)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer peerSrv.Close()
+
+	var failedCalled atomic.Int32
+	var completedCalled atomic.Int32
+	se := NewSyncEngine(sharedDir, peerSrv.URL, "tok", sm)
+	se.SetOnSyncFailed(func(relPath string, err error) {
+		failedCalled.Add(1)
+	})
+	se.SetOnSyncCompleted(func(relPath string) {
+		completedCalled.Add(1)
+	})
+	defer se.Stop()
+
+	// 1. Failing upload marks peer dirty and fires OnSyncFailed
+	f1 := filepath.Join(sharedDir, "first.txt")
+	c1 := []byte("first content")
+	_ = os.WriteFile(f1, c1, 0644)
+	se.broadcastToPeers("first.txt", f1, sha256Hex(c1), int64(len(c1)), time.Now().UnixNano(), time.Now().UnixNano())
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if failedCalled.Load() > 0 && se.IsPeerDirty(peerSrv.URL) {
+			break
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+	if failedCalled.Load() == 0 || !se.IsPeerDirty(peerSrv.URL) {
+		t.Fatalf("expected OnSyncFailed and dirty peer after blip; failed=%d dirty=%v", failedCalled.Load(), se.IsPeerDirty(peerSrv.URL))
+	}
+
+	// 2. Peer recovers; next upload succeeds -> automatically triggers ReconcileWithPeer!
+	failUploads.Store(false)
+	f2 := filepath.Join(sharedDir, "second.txt")
+	c2 := []byte("second content")
+	_ = os.WriteFile(f2, c2, 0644)
+	se.broadcastToPeers("second.txt", f2, sha256Hex(c2), int64(len(c2)), time.Now().UnixNano(), time.Now().UnixNano())
+
+	deadline = time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		_, statErr := os.Stat(filepath.Join(sharedDir, "peer_missed.txt"))
+		mu.Lock()
+		_, hasFirst := uploaded["first.txt"]
+		_, hasSecond := uploaded["second.txt"]
+		mu.Unlock()
+		if statErr == nil && hasFirst && hasSecond && completedCalled.Load() > 0 {
+			break
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+
+	if gotInv := atomic.LoadInt32(&inventoryCalls); gotInv == 0 {
+		t.Fatalf("expected recovery reconciliation to run after dirty peer recovered")
+	}
+	gotMissed, err := os.ReadFile(filepath.Join(sharedDir, "peer_missed.txt"))
+	if err != nil || !bytes.Equal(gotMissed, remoteMissed) {
+		t.Fatalf("expected peer_missed.txt to be pulled on recovery reconciliation, got %q (err=%v)", gotMissed, err)
+	}
+	mu.Lock()
+	hasFirst := bytes.Equal(uploaded["first.txt"], c1)
+	mu.Unlock()
+	if !hasFirst {
+		t.Fatalf("expected missed first.txt to be pushed during recovery reconciliation")
+	}
+}
+
+func TestStateManagerNormalizationTombstoneGCAndStartupCleanup(t *testing.T) {
+	tmp := t.TempDir()
+	sharedDir := filepath.Join(tmp, "shared")
+	_ = os.MkdirAll(sharedDir, 0755)
+	statePath := filepath.Join(tmp, "state.json")
+
+	// Create orphaned .part and .tmp files on disk
+	orphanPart := filepath.Join(sharedDir, "orphan.txt.123.part")
+	orphanTmp := filepath.Join(sharedDir, "orphan.tmp")
+	_ = os.WriteFile(orphanPart, []byte("incomplete"), 0644)
+	_ = os.WriteFile(orphanTmp, []byte("temp"), 0644)
+
+	// Create a local file with an older mtime over an existing tombstone
+	pastedFile := filepath.Join(sharedDir, "pasted_old.txt")
+	pastedContent := []byte("user pasted old archive file")
+	_ = os.WriteFile(pastedFile, pastedContent, 0644)
+	oldDiskTime := time.Now().Add(-48 * time.Hour).Truncate(time.Second)
+	_ = os.Chtimes(pastedFile, oldDiskTime, oldDiskTime)
+
+	sm, err := NewStateManager(statePath)
+	if err != nil {
+		t.Fatalf("NewStateManager: %v", err)
+	}
+
+	// Normalization with ToSlash & Windows case-aware lookup
+	_ = sm.Set(`nested\File.TXT`, FileRecord{
+		RelPath: `nested\File.TXT`,
+		Hash:    "abc",
+		Size:    3,
+		ModTime: time.Now().UnixNano(),
+	})
+	if _, ok := sm.Get("nested/File.TXT"); !ok {
+		t.Fatal("expected Get with forward slash to find normalized key")
+	}
+	if runtime.GOOS == "windows" {
+		if _, ok := sm.Get("nested/file.txt"); !ok {
+			t.Fatal("expected case-insensitive Get on Windows")
+		}
+	}
+
+	// Tombstone newer than pasted_old.txt disk mtime
+	_ = sm.MarkAsDeleted("pasted_old.txt", time.Now().Add(-1*time.Minute).UnixNano())
+	// Old tombstone eligible for GC
+	_ = sm.MarkAsDeleted("ancient.txt", time.Now().Add(-40*24*time.Hour).UnixNano())
+
+	se := NewSyncEngine(sharedDir, "", "tok", sm)
+	if err := se.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer se.Stop()
+
+	if _, err := os.Stat(orphanPart); !os.IsNotExist(err) {
+		t.Fatalf("expected orphan .part file to be cleaned up on Start")
+	}
+	if _, err := os.Stat(orphanTmp); !os.IsNotExist(err) {
+		t.Fatalf("expected orphan .tmp file to be cleaned up on Start")
+	}
+
+	// scanDirectorySync must NOT delete pasted_old.txt and must NOT mutate its disk mtime
+	se.scanDirectorySync()
+	infoAfter, err := os.Stat(pastedFile)
+	if err != nil {
+		t.Fatalf("pasted_old.txt was destructively deleted: %v", err)
+	}
+	if !infoAfter.ModTime().Equal(oldDiskTime) {
+		t.Fatalf("expected pasted_old.txt disk mtime %v not to be mutated, got %v", oldDiskTime, infoAfter.ModTime())
+	}
+
+	// Verify ancient tombstone was pruned on Start
+	if _, exists := sm.Get("ancient.txt"); exists {
+		t.Fatalf("expected ancient tombstone to be pruned on startup")
 	}
 }

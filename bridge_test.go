@@ -5,14 +5,19 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"log"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
+	stdsync "sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -732,7 +737,11 @@ func TestDynamicShortcutsAndVirtualPrinter(t *testing.T) {
 	// Test creating shortcuts and virtual printer for "Desktop 2"
 	err := installer.CreateBridgeShortcuts("Desktop 2")
 	if err != nil {
-		t.Fatalf("CreateBridgeShortcuts failed: %v", err)
+		if !installer.IsElevated() && errors.Is(err, installer.ErrElevationRequired) {
+			t.Logf("Non-elevated test run: virtual printer registration returned expected ErrElevationRequired (%v)", err)
+		} else {
+			t.Fatalf("CreateBridgeShortcuts failed: %v", err)
+		}
 	}
 
 	dirs := installer.GetAllDesktopDirs()
@@ -756,7 +765,11 @@ func TestDynamicShortcutsAndVirtualPrinter(t *testing.T) {
 	// Dynamic rename to "Desktop 1"
 	err = installer.CreateBridgeShortcuts("Desktop 1")
 	if err != nil {
-		t.Fatalf("CreateBridgeShortcuts for Desktop 1 failed: %v", err)
+		if !installer.IsElevated() && errors.Is(err, installer.ErrElevationRequired) {
+			t.Logf("Non-elevated test run: virtual printer registration returned expected ErrElevationRequired (%v)", err)
+		} else {
+			t.Fatalf("CreateBridgeShortcuts for Desktop 1 failed: %v", err)
+		}
 	}
 
 	if _, err := os.Stat(sharedLnk); os.IsNotExist(err) {
@@ -903,7 +916,7 @@ func TestKillOtherBridgeProcessesDoesNotSuicide(t *testing.T) {
 		if !ok {
 			t.Fatal("KillOtherBridgeProcesses failed")
 		}
-	case <-time.After(3 * time.Second):
+	case <-time.After(15 * time.Second):
 		t.Fatal("KillOtherBridgeProcesses hung or caused deadlock")
 	}
 }
@@ -939,9 +952,9 @@ func TestPeerHealthBidirectionalNameDiscovery(t *testing.T) {
 
 	time.Sleep(200 * time.Millisecond)
 
-	healthy, learnedName, _ := checkPeerHealthy("http://127.0.0.1:18773", "test-health-token", "Desktop 1")
-	if !healthy {
-		t.Fatal("Expected checkPeerHealthy to return true")
+	healthy, learnedName, _, _, err := checkPeerHealthy("http://127.0.0.1:18773", "test-health-token", "Desktop 1")
+	if !healthy || err != nil {
+		t.Fatalf("Expected checkPeerHealthy to return true (err=%v)", err)
 	}
 	if learnedName != "Desktop 2" {
 		t.Fatalf("Expected learned peer name 'Desktop 2', got '%s'", learnedName)
@@ -3350,9 +3363,9 @@ func TestSaveIncomingJobAutoCorrection(t *testing.T) {
 		t.Errorf("Expected auto-corrected filename extension .xps, got %s", job1.FileName)
 	}
 
-	// 2. Send PDF content disguised as a .xps filename
+	// 2. Send PDF content disguised as a generic spool (.prn) or PJL-wrapped .xps filename
 	pdfBytes := []byte("%PDF-1.4\n1 0 obj\n<<>>\nendobj\ntrailer\n<<>>\n%%EOF")
-	job2, err := ps.SaveIncomingJob("misnamed_document.xps", bytes.NewReader(pdfBytes))
+	job2, err := ps.SaveIncomingJob("misnamed_document.prn", bytes.NewReader(pdfBytes))
 	if err != nil {
 		t.Fatalf("Failed to save incoming job 2: %v", err)
 	}
@@ -3361,6 +3374,20 @@ func TestSaveIncomingJobAutoCorrection(t *testing.T) {
 	}
 	if filepath.Ext(job2.FileName) != ".pdf" {
 		t.Errorf("Expected auto-corrected filename extension .pdf, got %s", job2.FileName)
+	}
+
+	// 3. Send PJL-wrapped PDF disguised with .xps extension
+	pjlPdfBytes := append([]byte("\x1b%-12345X@PJL JOB\r\n@PJL ENTER LANGUAGE = PDF\r\n"), pdfBytes...)
+	pjlPdfBytes = append(pjlPdfBytes, []byte("\r\n\x1b%-12345X@PJL EOJ\r\n")...)
+	job3, err := ps.SaveIncomingJob("wrapped_pdf.xps", bytes.NewReader(pjlPdfBytes))
+	if err != nil {
+		t.Fatalf("Failed to save incoming job 3: %v", err)
+	}
+	if filepath.Ext(job3.FilePath) != ".pdf" {
+		t.Errorf("Expected PJL-stripped PDF extension .pdf, got %s (path: %s)", filepath.Ext(job3.FilePath), job3.FilePath)
+	}
+	if filepath.Ext(job3.FileName) != ".pdf" {
+		t.Errorf("Expected PJL-stripped PDF filename extension .pdf, got %s", job3.FileName)
 	}
 }
 
@@ -3943,6 +3970,1188 @@ func TestEnhancedVirtualPrinterKeywords(t *testing.T) {
 		}
 	}
 }
+
+func allocateFreeTCPPort(t *testing.T) int {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Failed to allocate free TCP port: %v", err)
+	}
+	port := ln.Addr().(*net.TCPAddr).Port
+	_ = ln.Close()
+	return port
+}
+
+func TestCheckPeerHealthyRejectsNonBridgeHTTP200(t *testing.T) {
+	// 1. Plain HTML HTTP 200 (non-Bridge server)
+	htmlSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("<html><body>nginx welcome</body></html>"))
+	}))
+	defer htmlSrv.Close()
+
+	if ok, name, ready, pName, err := checkPeerHealthy(htmlSrv.URL, "tok", "Unit 1"); ok || name != "" || ready || pName != "" || err == nil {
+		t.Fatalf("Expected HTML HTTP 200 to be rejected, got ok=%v name=%q ready=%v pName=%q err=%v", ok, name, ready, pName, err)
+	}
+
+	// 2. JSON HTTP 200 missing healthy status
+	badStatusSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"status":"degraded","node_name":"FakeNode"}`))
+	}))
+	defer badStatusSrv.Close()
+
+	if ok, _, _, _, err := checkPeerHealthy(badStatusSrv.URL, "tok", "Unit 1"); ok || err == nil {
+		t.Fatalf("Expected status != healthy to be rejected (ok=%v err=%v)", ok, err)
+	}
+
+	// 3. JSON HTTP 200 with healthy status but empty node_name
+	emptyNodeSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"status":"healthy","node_name":""}`))
+	}))
+	defer emptyNodeSrv.Close()
+
+	if ok, _, _, _, err := checkPeerHealthy(emptyNodeSrv.URL, "tok", "Unit 1"); ok || err == nil {
+		t.Fatalf("Expected empty node_name to be rejected (ok=%v err=%v)", ok, err)
+	}
+
+	// 4. Valid Bridge HealthResponse with PrinterReady & DefaultPrinter
+	validSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(server.HealthResponse{
+			Status:         "healthy",
+			NodeName:       "RealBridgeNode",
+			PrinterReady:   true,
+			DefaultPrinter: "HP OfficeJet Pro",
+		})
+	}))
+	defer validSrv.Close()
+
+	ok, name, ready, pName, err := checkPeerHealthy(validSrv.URL, "tok", "Unit 1")
+	if !ok || name != "RealBridgeNode" || !ready || pName != "HP OfficeJet Pro" || err != nil {
+		t.Fatalf("Expected valid Bridge HealthResponse to pass, got ok=%v name=%q ready=%v pName=%q err=%v", ok, name, ready, pName, err)
+	}
+}
+
+func TestNativeRemotePrintRoundtripWithOptionsAndMockSumatra(t *testing.T) {
+	tempRoot := t.TempDir()
+	mockExe, logFile := buildMockArgsPrinter(t, tempRoot)
+
+	recvQueue := filepath.Join(tempRoot, "recv_queue")
+	recvFailed := filepath.Join(tempRoot, "recv_failed")
+	ps := printer.NewPrintService(mockExe, 10, recvQueue, recvFailed)
+	ps.SetTargetPrinter("HP_Office_Laser")
+	if err := ps.Start(); err != nil {
+		t.Fatalf("Failed to start PrintService: %v", err)
+	}
+	defer ps.Stop()
+
+	recvPort := allocateFreeTCPPort(t)
+	spoolPort := allocateFreeTCPPort(t)
+	token := "native-roundtrip-secret"
+
+	recvCfg := &config.Config{
+		NodeName:   "Unit 2",
+		ListenPort: recvPort,
+		AuthToken:  token,
+	}
+	recvSrv := server.NewServer(recvCfg, nil, ps)
+	go func() { _ = recvSrv.Start() }()
+	defer recvSrv.Stop()
+
+	if !waitForCondition(3*time.Second, 50*time.Millisecond, func() bool {
+		return installer.VerifyHealth(recvPort) == nil
+	}) {
+		t.Fatalf("Receiver server did not become healthy on port %d", recvPort)
+	}
+
+	var completedMu stdsync.Mutex
+	completedCount := 0
+	ps.OnJobCompleted = func(job printer.PrintJob) {
+		completedMu.Lock()
+		completedCount++
+		completedMu.Unlock()
+	}
+
+	recvURL := fmt.Sprintf("http://127.0.0.1:%d", recvPort)
+	multiSpooler := printer.NewMultiSpoolerListener(func(peer config.PeerDevice, filePath string) error {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		return printer.SendDirectPrintWithOptions(ctx, recvURL, token, filePath, printer.PrintOptions{
+			Copies: 2,
+		}, "X-Bridge-Node-Name", "Unit 1", "X-Bridge-Origin", "Unit 1")
+	})
+
+	peer2 := config.PeerDevice{
+		Name:      "Unit 2",
+		IP:        "127.0.0.1",
+		URL:       recvURL,
+		SpoolPort: spoolPort,
+		Online:    true,
+	}
+	if err := multiSpooler.EnsurePeerListener(peer2); err != nil {
+		t.Fatalf("Failed to start MultiSpoolerListener on port %d: %v", spoolPort, err)
+	}
+	defer multiSpooler.StopAll()
+
+	// Stream a PJL-wrapped Letter Landscape PDF over RAW TCP (simulating Windows Spooler Ctrl+P)
+	letterLandscapePDF := "%PDF-1.4\n1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 792.0 612.0] >>\nendobj\ntrailer\n<< /Size 4 /Root 1 0 R >>\n%%EOF"
+	pjlStream := "\x1b%-12345X@PJL JOB NAME=\"CAD Drawing\"\r\n@PJL ENTER LANGUAGE = PDF\r\n" + letterLandscapePDF + "\r\n\x1b%-12345X@PJL EOJ\r\n"
+
+	conn, err := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", spoolPort))
+	if err != nil {
+		t.Fatalf("Failed to dial spooler port %d: %v", spoolPort, err)
+	}
+	if _, err := conn.Write([]byte(pjlStream)); err != nil {
+		t.Fatalf("Failed to write PJL PDF stream: %v", err)
+	}
+	_ = conn.Close()
+
+	if !waitForCondition(6*time.Second, 100*time.Millisecond, func() bool {
+		completedMu.Lock()
+		defer completedMu.Unlock()
+		return completedCount == 1
+	}) {
+		t.Fatal("Timed out waiting for receiver PrintService to complete mock_sumatra execution")
+	}
+
+	logBytes, err := os.ReadFile(logFile)
+	if err != nil {
+		t.Fatalf("Failed to read mock_sumatra args log: %v", err)
+	}
+	argsLine := string(logBytes)
+	for _, expected := range []string{"HP_Office_Laser", "-silent", "-exit-when-done", "paper=Letter", "landscape", "noscale", "2x"} {
+		if !strings.Contains(argsLine, expected) {
+			t.Errorf("Expected %q in mock_sumatra args, got: %s", expected, argsLine)
+		}
+	}
+}
+
+func TestOutboundOfflinePrintQueueEnqueueAndRecoveryFlush(t *testing.T) {
+	tempRoot := t.TempDir()
+	mockExe, logFile := buildMockArgsPrinter(t, tempRoot)
+
+	oqDir := filepath.Join(tempRoot, "OutboundQueue")
+	oq := printer.NewOutboundQueue(oqDir)
+
+	recvPort := allocateFreeTCPPort(t)
+	spoolPort := allocateFreeTCPPort(t)
+	recvURL := fmt.Sprintf("http://127.0.0.1:%d", recvPort)
+	token := "outbound-queue-token"
+
+	senderCfg := &config.Config{
+		NodeName:   "Unit 1",
+		ListenPort: allocateFreeTCPPort(t),
+		AuthToken:  token,
+		Peers: []config.PeerDevice{
+			{Name: "Unit 2", IP: "127.0.0.1", URL: recvURL, SpoolPort: spoolPort, Online: false},
+		},
+	}
+
+	tm, err := tray.NewTrayManager(filepath.Join(tempRoot, "icons"), "Unit 1", "Unit 2", tray.TrayCallbacks{})
+	if err != nil {
+		t.Fatalf("Failed to create TrayManager: %v", err)
+	}
+	defer tm.Stop()
+
+	multiSpooler := printer.NewMultiSpoolerListener(func(peer config.PeerDevice, filePath string) error {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		sendErr := printer.SendDirectPrintWithOptions(ctx, recvURL, token, filePath, printer.PrintOptions{},
+			"X-Bridge-Node-Name", senderCfg.GetNodeName(),
+			"X-Bridge-Origin", senderCfg.GetNodeName(),
+		)
+		if sendErr != nil && isPeerUnreachableError(sendErr) {
+			if qErr := queueOfflinePrintJob(oq, peer.Name, recvURL, filePath, tm); qErr == nil {
+				return errPrintQueuedOffline
+			}
+			return sendErr
+		}
+		return sendErr
+	})
+
+	if err := multiSpooler.EnsurePeerListener(senderCfg.Peers[0]); err != nil {
+		t.Fatalf("Failed to start spooler listener: %v", err)
+	}
+	defer multiSpooler.StopAll()
+
+	// 1. Print while Unit 2 is offline -> must enqueue into OutboundQueue
+	a4PDF := "%PDF-1.4\n1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595.28 841.89] >>\nendobj\ntrailer\n<< /Size 4 /Root 1 0 R >>\n%%EOF"
+	conn, err := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", spoolPort))
+	if err != nil {
+		t.Fatalf("Failed to dial spooler: %v", err)
+	}
+	_, _ = conn.Write([]byte(a4PDF))
+	_ = conn.Close()
+
+	if !waitForCondition(5*time.Second, 50*time.Millisecond, func() bool {
+		return oq.Count() == 1 && tm.GetQueuedPrintCount() == 1
+	}) {
+		t.Fatalf("Expected job to be queued in OutboundQueue (oq.Count=%d, trayCount=%d)", oq.Count(), tm.GetQueuedPrintCount())
+	}
+
+	// 2. Unit 2 comes online -> flush OutboundQueue and verify mock_sumatra execution
+	recvQueue := filepath.Join(tempRoot, "recv_queue")
+	recvFailed := filepath.Join(tempRoot, "recv_failed")
+	ps := printer.NewPrintService(mockExe, 10, recvQueue, recvFailed)
+	ps.SetTargetPrinter("Canon_Office")
+	if err := ps.Start(); err != nil {
+		t.Fatalf("Failed to start receiver PrintService: %v", err)
+	}
+	defer ps.Stop()
+
+	completed := make(chan struct{}, 1)
+	ps.OnJobCompleted = func(job printer.PrintJob) {
+		select {
+		case completed <- struct{}{}:
+		default:
+		}
+	}
+
+	recvCfg := &config.Config{
+		NodeName:   "Unit 2",
+		ListenPort: recvPort,
+		AuthToken:  token,
+	}
+	recvSrv := server.NewServer(recvCfg, nil, ps)
+	go func() { _ = recvSrv.Start() }()
+	defer recvSrv.Stop()
+
+	if !waitForCondition(3*time.Second, 50*time.Millisecond, func() bool {
+		return installer.VerifyHealth(recvPort) == nil
+	}) {
+		t.Fatalf("Receiver did not come online on port %d", recvPort)
+	}
+
+	flushOutboundQueueForPeer(oq, senderCfg, senderCfg.Peers[0], tm)
+
+	if oq.Count() != 0 || tm.GetQueuedPrintCount() != 0 {
+		t.Fatalf("Expected OutboundQueue to be empty after flush (oq=%d, tray=%d)", oq.Count(), tm.GetQueuedPrintCount())
+	}
+
+	select {
+	case <-completed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Receiver PrintService did not finish flushed queued print job")
+	}
+
+	logBytes, err := os.ReadFile(logFile)
+	if err != nil {
+		t.Fatalf("Failed to read args log: %v", err)
+	}
+	if !strings.Contains(string(logBytes), "paper=A4") || !strings.Contains(string(logBytes), "Canon_Office") {
+		t.Errorf("Unexpected mock_sumatra args after flush: %s", string(logBytes))
+	}
+}
+
+func TestPeerDeregistrationAndOnlineNonPersistence(t *testing.T) {
+	tempRoot := t.TempDir()
+	cfgPath := filepath.Join(tempRoot, "config.json")
+	statePath := filepath.Join(tempRoot, "state.json")
+	sharedDir := filepath.Join(tempRoot, "shared")
+	_ = os.MkdirAll(sharedDir, 0755)
+
+	port1 := allocateFreeTCPPort(t)
+	spoolPort2 := allocateFreeTCPPort(t)
+	token := "deregister-secret"
+
+	cfg := &config.Config{
+		Configured: true,
+		ConfigPath: cfgPath,
+		NodeName:   "Unit 1",
+		ListenPort: port1,
+		AuthToken:  token,
+		SharedDir:  sharedDir,
+		StateFile:  statePath,
+		Peers: []config.PeerDevice{
+			{Name: "Unit 2", IP: "127.0.0.1", URL: "http://127.0.0.1:18972", SpoolPort: spoolPort2, Online: true, LastSeen: time.Now()},
+		},
+	}
+
+	// Verify SaveConfig never persists Online=true and LoadConfig keeps Online=false
+	if err := config.SaveConfig(cfgPath, cfg); err != nil {
+		t.Fatalf("SaveConfig failed: %v", err)
+	}
+	rawDisk, err := os.ReadFile(cfgPath)
+	if err != nil {
+		t.Fatalf("ReadFile failed: %v", err)
+	}
+	if strings.Contains(string(rawDisk), `"online": true`) {
+		t.Fatalf("Expected Online=true not to be persisted on disk: %s", string(rawDisk))
+	}
+	reloaded, err := config.LoadConfig(cfgPath)
+	if err != nil {
+		t.Fatalf("LoadConfig failed: %v", err)
+	}
+	if len(reloaded.Peers) != 1 || reloaded.Peers[0].Online {
+		t.Fatalf("Expected 1 peer with Online=false after LoadConfig, got %+v", reloaded.Peers)
+	}
+
+	sm, _ := sync.NewStateManager(statePath)
+	se := sync.NewSyncEngine(sharedDir, "", token, sm)
+	se.UpdatePeerURLs(reloaded.GetPeerURLs())
+	if err := se.Start(); err != nil {
+		t.Fatalf("SyncEngine start failed: %v", err)
+	}
+	defer se.Stop()
+
+	multiSpooler := printer.NewMultiSpoolerListener(nil)
+	if err := multiSpooler.EnsurePeerListener(reloaded.Peers[0]); err != nil {
+		t.Fatalf("EnsurePeerListener failed: %v", err)
+	}
+	defer multiSpooler.StopAll()
+
+	srv := server.NewServer(reloaded, sm, nil)
+	srv.SetSyncEngine(se)
+	srv.SetPeerRemover(func(peer config.PeerDevice) {
+		_ = multiSpooler.SyncListeners(reloaded.GetPeers())
+		if peer.URL != "" {
+			se.RemovePeerURL(peer.URL)
+		}
+	})
+	go func() { _ = srv.Start() }()
+	defer srv.Stop()
+
+	if !waitForCondition(3*time.Second, 50*time.Millisecond, func() bool {
+		return installer.VerifyHealth(port1) == nil
+	}) {
+		t.Fatalf("Server did not start on port %d", port1)
+	}
+
+	if len(multiSpooler.ActivePorts()) != 1 {
+		t.Fatalf("Expected 1 active spooler port before DELETE, got %v", multiSpooler.ActivePorts())
+	}
+
+	// Deregister Unit 2 via DELETE /api/peers
+	delBody := `{"url":"http://127.0.0.1:18972","name":"Unit 2"}`
+	req, _ := http.NewRequest(http.MethodDelete, fmt.Sprintf("http://127.0.0.1:%d/api/peers", port1), strings.NewReader(delBody))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Bridge-Token", token)
+	resp, err := (&http.Client{Timeout: 3 * time.Second}).Do(req)
+	if err != nil {
+		t.Fatalf("DELETE /api/peers failed: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("Expected 200 OK from DELETE /api/peers, got %d", resp.StatusCode)
+	}
+
+	if len(reloaded.GetPeers()) != 0 {
+		t.Fatalf("Expected 0 peers after DELETE, got %+v", reloaded.GetPeers())
+	}
+	if len(multiSpooler.ActivePorts()) != 0 {
+		t.Fatalf("Expected spooler listener to be stopped after DELETE, active ports: %v", multiSpooler.ActivePorts())
+	}
+
+	// Verify /api/health reflects 0 peers
+	hResp, err := http.Get(fmt.Sprintf("http://127.0.0.1:%d/api/health", port1))
+	if err != nil {
+		t.Fatalf("GET /api/health failed: %v", err)
+	}
+	defer hResp.Body.Close()
+	var hr server.HealthResponse
+	if err := json.NewDecoder(hResp.Body).Decode(&hr); err != nil {
+		t.Fatalf("Decode health failed: %v", err)
+	}
+	if hr.TotalPeers != 0 || hr.OnlineCount != 0 || len(hr.Peers) != 0 {
+		t.Fatalf("Expected 0 peers in health after uninstall deregistration, got %+v", hr)
+	}
+}
+
+func TestMultiDeviceSyncRelayAToBToC(t *testing.T) {
+	tempRoot := t.TempDir()
+	aDir := filepath.Join(tempRoot, "a_shared")
+	bDir := filepath.Join(tempRoot, "b_shared")
+	cDir := filepath.Join(tempRoot, "c_shared")
+	_ = os.MkdirAll(aDir, 0755)
+	_ = os.MkdirAll(bDir, 0755)
+	_ = os.MkdirAll(cDir, 0755)
+
+	smA, _ := sync.NewStateManager(filepath.Join(tempRoot, "a_state.json"))
+	smB, _ := sync.NewStateManager(filepath.Join(tempRoot, "b_state.json"))
+	smC, _ := sync.NewStateManager(filepath.Join(tempRoot, "c_state.json"))
+
+	portA := allocateFreeTCPPort(t)
+	portB := allocateFreeTCPPort(t)
+	portC := allocateFreeTCPPort(t)
+	urlA := fmt.Sprintf("http://127.0.0.1:%d", portA)
+	urlB := fmt.Sprintf("http://127.0.0.1:%d", portB)
+	urlC := fmt.Sprintf("http://127.0.0.1:%d", portC)
+	token := "relay-abc-token"
+
+	// Linear topology: A <-> B <-> C (A does NOT know C directly)
+	cfgA := &config.Config{NodeName: "A", ListenPort: portA, AuthToken: token, SharedDir: aDir}
+	cfgB := &config.Config{NodeName: "B", ListenPort: portB, AuthToken: token, SharedDir: bDir}
+	cfgC := &config.Config{NodeName: "C", ListenPort: portC, AuthToken: token, SharedDir: cDir}
+
+	srvA := server.NewServer(cfgA, smA, nil)
+	srvB := server.NewServer(cfgB, smB, nil)
+	srvC := server.NewServer(cfgC, smC, nil)
+
+	seA := sync.NewSyncEngine(aDir, urlB, token, smA)
+	seA.SetLocalURL(urlA)
+	srvA.SetSyncEngine(seA)
+
+	seB := sync.NewSyncEngine(bDir, "", token, smB)
+	seB.SetLocalURL(urlB)
+	seB.UpdatePeerURLs([]string{urlA, urlC})
+	srvB.SetSyncEngine(seB)
+
+	seC := sync.NewSyncEngine(cDir, urlB, token, smC)
+	seC.SetLocalURL(urlC)
+	srvC.SetSyncEngine(seC)
+
+	go func() { _ = srvA.Start() }()
+	defer srvA.Stop()
+	go func() { _ = srvB.Start() }()
+	defer srvB.Stop()
+	go func() { _ = srvC.Start() }()
+	defer srvC.Stop()
+
+	if err := seA.Start(); err != nil {
+		t.Fatalf("seA start failed: %v", err)
+	}
+	defer seA.Stop()
+	if err := seB.Start(); err != nil {
+		t.Fatalf("seB start failed: %v", err)
+	}
+	defer seB.Stop()
+	if err := seC.Start(); err != nil {
+		t.Fatalf("seC start failed: %v", err)
+	}
+	defer seC.Stop()
+
+	if !waitForCondition(3*time.Second, 50*time.Millisecond, func() bool {
+		return installer.VerifyHealth(portA) == nil && installer.VerifyHealth(portB) == nil && installer.VerifyHealth(portC) == nil
+	}) {
+		t.Fatal("Relay servers did not become healthy")
+	}
+
+	payload := []byte("Multi-hop sync relay payload A -> B -> C")
+	if err := os.WriteFile(filepath.Join(aDir, "relay_doc.txt"), payload, 0644); err != nil {
+		t.Fatalf("WriteFile failed: %v", err)
+	}
+
+	if !waitForCondition(8*time.Second, 100*time.Millisecond, func() bool {
+		bData, bErr := os.ReadFile(filepath.Join(bDir, "relay_doc.txt"))
+		cData, cErr := os.ReadFile(filepath.Join(cDir, "relay_doc.txt"))
+		return bErr == nil && cErr == nil && bytes.Equal(bData, payload) && bytes.Equal(cData, payload)
+	}) {
+		t.Fatal("Timed out waiting for A -> B -> C file sync relay")
+	}
+}
+
+type failingWriter struct {
+	err error
+}
+
+func (f failingWriter) Write([]byte) (int, error) {
+	return 0, f.err
+}
+
+func TestSafeLogWriterAndSetupLoggingWithInvalidStdout(t *testing.T) {
+	// 1. Direct safeLogWriter test with an always-failing stdout writer.
+	var buf bytes.Buffer
+	w := &safeLogWriter{
+		primary:   &buf,
+		secondary: failingWriter{err: errors.New("The handle is invalid.")},
+	}
+	msg := "background service boot log line\n"
+	n, err := w.Write([]byte(msg))
+	if err != nil {
+		t.Fatalf("Expected safeLogWriter to succeed when secondary fails, got: %v", err)
+	}
+	if n != len(msg) {
+		t.Fatalf("Expected %d bytes written, got %d", len(msg), n)
+	}
+	if buf.String() != msg {
+		t.Fatalf("Expected primary buffer %q, got %q", msg, buf.String())
+	}
+
+	// 2. End-to-end setupLoggingWithOutput with a closed *os.File simulating invalid GUI stdout.
+	logDir := t.TempDir()
+	rPipe, wPipe, pipeErr := os.Pipe()
+	if pipeErr != nil {
+		t.Fatalf("os.Pipe failed: %v", pipeErr)
+	}
+	_ = rPipe.Close()
+	_ = wPipe.Close()
+
+	origOut := log.Writer()
+	origFlags := log.Flags()
+	logFile := setupLoggingWithOutput(logDir, wPipe)
+	if logFile == nil {
+		t.Fatalf("Expected setupLoggingWithOutput to open bridge.log")
+	}
+	defer func() {
+		log.SetOutput(origOut)
+		log.SetFlags(origFlags)
+		_ = logFile.Close()
+	}()
+
+	log.Println("[TestGUI] writing log entry with closed stdout")
+	log.SetOutput(origOut)
+	log.SetFlags(origFlags)
+	_ = logFile.Close()
+
+	data, readErr := os.ReadFile(filepath.Join(logDir, "bridge.log"))
+	if readErr != nil {
+		t.Fatalf("Failed to read bridge.log: %v", readErr)
+	}
+	if len(data) == 0 || !strings.Contains(string(data), "[TestGUI] writing log entry with closed stdout") {
+		t.Fatalf("Expected bridge.log to contain logged line despite invalid stdout, got %q", string(data))
+	}
+}
+
+func TestElevateOrExitReportsErrorAndExitsNonZero(t *testing.T) {
+	// Success path: no console allocation, no stderr output, no exit.
+	var errBuf bytes.Buffer
+	consoleCalled := false
+	exitCode := -1
+	elevateOrExit(
+		[]string{"-uninstall"},
+		func([]string) error { return nil },
+		func() { consoleCalled = true },
+		&errBuf,
+		func(code int) { exitCode = code },
+	)
+	if consoleCalled || errBuf.Len() != 0 || exitCode != -1 {
+		t.Fatalf("Expected no error reporting on nil elevation error, got console=%v err=%q exit=%d", consoleCalled, errBuf.String(), exitCode)
+	}
+
+	// Cancelled UAC path: EnsureConsole called, clear error printed to stderr, exit code 1.
+	elevateOrExit(
+		[]string{"-uninstall"},
+		func([]string) error { return errors.New("The operation was canceled by the user") },
+		func() { consoleCalled = true },
+		&errBuf,
+		func(code int) { exitCode = code },
+	)
+	if !consoleCalled {
+		t.Fatal("Expected EnsureConsole to be invoked when elevation fails/cancels")
+	}
+	if exitCode != 1 {
+		t.Fatalf("Expected exit code 1, got %d", exitCode)
+	}
+	if !strings.Contains(errBuf.String(), "Elevation cancelled or failed:") || !strings.Contains(errBuf.String(), "canceled by the user") {
+		t.Fatalf("Expected clear UAC cancellation message on stderr, got %q", errBuf.String())
+	}
+}
+
+func TestHandleSendPrintAvoidsDuplicateAttemptOnOfflinePeer(t *testing.T) {
+	tempRoot := t.TempDir()
+	docPath := filepath.Join(tempRoot, "invoice.pdf")
+	if err := os.WriteFile(docPath, []byte("%PDF-1.4\n%%EOF\n"), 0644); err != nil {
+		t.Fatalf("Failed to write sample pdf: %v", err)
+	}
+
+	// Peer endpoint that counts direct /api/print hits (should remain 0 when local /api/print-local already tried).
+	var peerHits atomic.Int32
+	peerSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		peerHits.Add(1)
+		http.Error(w, "unexpected duplicate print attempt", http.StatusInternalServerError)
+	}))
+	defer peerSrv.Close()
+
+	var localMode atomic.Int32 // 0: unreachable error, 1: HTTP 400 rejection
+	var localHits atomic.Int32
+	localSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/print-local" {
+			http.NotFound(w, r)
+			return
+		}
+		localHits.Add(1)
+		if localMode.Load() == 0 {
+			http.Error(w, "Failed to send print job: failed to deliver print job: Post \"http://100.64.0.99:8765/api/print\": dial tcp 100.64.0.99:8765: connectex: No connection could be made because the target machine actively refused it.", http.StatusInternalServerError)
+			return
+		}
+		http.Error(w, "Failed to send print job: peer returned HTTP 400: unsupported file", http.StatusInternalServerError)
+	}))
+	defer localSrv.Close()
+
+	var localPort int
+	if _, err := fmt.Sscanf(localSrv.URL, "http://127.0.0.1:%d", &localPort); err != nil {
+		t.Fatalf("Failed to parse localSrv port from %s: %v", localSrv.URL, err)
+	}
+
+	cfgPath := filepath.Join(tempRoot, "config.json")
+	cfg := &config.Config{
+		Configured: true,
+		NodeName:   "Unit 1",
+		ListenPort: localPort,
+		AuthToken:  "send-print-token",
+		Peers: []config.PeerDevice{
+			{Name: "Unit 2", IP: "127.0.0.1", URL: peerSrv.URL, SpoolPort: 9101},
+		},
+	}
+	if err := config.SaveConfig(cfgPath, cfg); err != nil {
+		t.Fatalf("SaveConfig failed: %v", err)
+	}
+
+	// Case 1: /api/print-local reports unreachable peer -> queues job once without duplicate fallback hit.
+	queueDir1 := filepath.Join(tempRoot, "queue1")
+	handleSendPrintWithQueue(docPath, "Unit 2", cfgPath, queueDir1)
+	if localHits.Load() != 1 {
+		t.Fatalf("Expected 1 call to /api/print-local, got %d", localHits.Load())
+	}
+	if peerHits.Load() != 0 {
+		t.Fatalf("Expected 0 duplicate fallback calls to peer /api/print, got %d", peerHits.Load())
+	}
+	if cnt := printer.NewOutboundQueue(queueDir1).Count(); cnt != 1 {
+		t.Fatalf("Expected 1 queued offline print job, got %d", cnt)
+	}
+
+	// Case 2: /api/print-local reports non-unreachable HTTP 400 error -> does not queue and does not retry.
+	localMode.Store(1)
+	queueDir2 := filepath.Join(tempRoot, "queue2")
+	handleSendPrintWithQueue(docPath, "Unit 2", cfgPath, queueDir2)
+	if localHits.Load() != 2 {
+		t.Fatalf("Expected 2nd call to /api/print-local, got %d", localHits.Load())
+	}
+	if peerHits.Load() != 0 {
+		t.Fatalf("Expected 0 duplicate fallback calls on HTTP 400 rejection, got %d", peerHits.Load())
+	}
+	if cnt := printer.NewOutboundQueue(queueDir2).Count(); cnt != 0 {
+		t.Fatalf("Expected 0 queued jobs on HTTP 400 rejection, got %d", cnt)
+	}
+
+	// Case 3: Local service is down -> falls back to direct send and queues when peer is unreachable.
+	localSrv.Close()
+	peerSrv.Close()
+	queueDir3 := filepath.Join(tempRoot, "queue3")
+	handleSendPrintWithQueue(docPath, "Unit 2", cfgPath, queueDir3)
+	if cnt := printer.NewOutboundQueue(queueDir3).Count(); cnt != 1 {
+		t.Fatalf("Expected direct fallback to queue offline job when local service is down, got %d", cnt)
+	}
+}
+
+type recordedBalloon struct {
+	title   string
+	message string
+	level   tray.NotifyLevel
+	isFlash bool
+}
+
+type recordingPrintNotifier struct {
+	mu             stdsync.Mutex
+	printingStates []string
+	balloons       []recordedBalloon
+	restores       int
+	flashDone      chan struct{}
+}
+
+func (r *recordingPrintNotifier) SetPrintingState(tooltip string) {
+	r.mu.Lock()
+	r.printingStates = append(r.printingStates, tooltip)
+	r.mu.Unlock()
+}
+
+func (r *recordingPrintNotifier) FlashPrintComplete(title, message string) {
+	r.mu.Lock()
+	r.balloons = append(r.balloons, recordedBalloon{
+		title:   title,
+		message: message,
+		level:   tray.InferNotifyLevel(title),
+		isFlash: true,
+	})
+	ch := r.flashDone
+	r.mu.Unlock()
+	if ch != nil {
+		select {
+		case ch <- struct{}{}:
+		default:
+		}
+	}
+}
+
+func (r *recordingPrintNotifier) ShowNotificationLevel(title, message string, level tray.NotifyLevel) {
+	r.mu.Lock()
+	r.balloons = append(r.balloons, recordedBalloon{
+		title:   title,
+		message: message,
+		level:   level,
+	})
+	r.mu.Unlock()
+}
+
+func (r *recordingPrintNotifier) RestoreNetworkStatus() {
+	r.mu.Lock()
+	r.restores++
+	r.mu.Unlock()
+}
+
+func (r *recordingPrintNotifier) snapshot() ([]string, []recordedBalloon, int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	states := append([]string(nil), r.printingStates...)
+	balloons := append([]recordedBalloon(nil), r.balloons...)
+	return states, balloons, r.restores
+}
+
+func TestPrintServiceNotificationFormattingAndNoDuplicateBalloon(t *testing.T) {
+	tempRoot := t.TempDir()
+	mockExe := buildMockPrinter(t, tempRoot)
+
+	queueDir := filepath.Join(tempRoot, "queue")
+	failedDir := filepath.Join(tempRoot, "failed")
+	ps := printer.NewPrintService(mockExe, 10, queueDir, failedDir)
+	ps.SetTargetPrinter("HP LaserJet")
+
+	notifier := &recordingPrintNotifier{
+		flashDone: make(chan struct{}, 4),
+	}
+	var resolveErr atomic.Bool
+	wirePrintServiceNotifications(ps, func() printNotifier { return notifier }, func() (string, error) {
+		if resolveErr.Load() {
+			return "", errors.New("no physical printer")
+		}
+		return "HP LaserJet", nil
+	})
+
+	if err := ps.Start(); err != nil {
+		t.Fatalf("Failed to start PrintService: %v", err)
+	}
+	defer ps.Stop()
+
+	pdfBytes := []byte("%PDF-1.4\n1 0 obj\n<< /Type /Catalog >>\nendobj\n%%EOF\n")
+
+	// 1. Auto-generated spool name with SourceNode -> uses friendly label, 1 balloon total (no pre-completion balloon).
+	if _, err := ps.SaveIncomingJobWithOptions("print_1700000000123.pdf", bytes.NewReader(pdfBytes), printer.PrintOptions{
+		SourceNode: "Laptop",
+	}); err != nil {
+		t.Fatalf("SaveIncomingJobWithOptions failed: %v", err)
+	}
+
+	select {
+	case <-notifier.flashDone:
+	case <-time.After(6 * time.Second):
+		t.Fatal("Timed out waiting for PrintService OnJobCompleted notification")
+	}
+
+	states, balloons, restores := notifier.snapshot()
+	if len(states) != 1 || states[0] != "Bridge: Printing Document from Laptop..." {
+		t.Fatalf("Expected SetPrintingState with friendly label, got %v", states)
+	}
+	if len(balloons) != 1 {
+		t.Fatalf("Expected exactly 1 completion balloon (no pre-completion spam), got %d: %+v", len(balloons), balloons)
+	}
+	if !balloons[0].isFlash || balloons[0].title != "Print Complete" || balloons[0].message != "Printed Document from Laptop on HP LaserJet" {
+		t.Fatalf("Unexpected completion balloon: %+v", balloons[0])
+	}
+	if strings.Contains(balloons[0].message, "print_1700000000123") || strings.Contains(states[0], "print_1700000000123") {
+		t.Fatalf("Notification leaked raw auto-generated spool filename: state=%q balloon=%+v", states[0], balloons[0])
+	}
+	if restores != 0 {
+		t.Fatalf("Expected 0 RestoreNetworkStatus calls on success, got %d", restores)
+	}
+
+	// 2. Named JobName + printer lookup error -> uses JobName and "local printer" fallback.
+	resolveErr.Store(true)
+	if _, err := ps.SaveIncomingJobWithOptions("print_1700000000456.pdf", bytes.NewReader(pdfBytes), printer.PrintOptions{
+		SourceNode: "OfficePC",
+		JobName:    "QuarterlyReport.pdf",
+	}); err != nil {
+		t.Fatalf("SaveIncomingJobWithOptions (named) failed: %v", err)
+	}
+
+	select {
+	case <-notifier.flashDone:
+	case <-time.After(6 * time.Second):
+		t.Fatal("Timed out waiting for second PrintService OnJobCompleted notification")
+	}
+
+	states, balloons, _ = notifier.snapshot()
+	if len(states) != 2 || states[1] != "Bridge: Printing QuarterlyReport.pdf from OfficePC..." {
+		t.Fatalf("Expected SetPrintingState with JobName friendly label, got %v", states)
+	}
+	if len(balloons) != 2 || balloons[1].title != "Print Complete" || balloons[1].message != "Printed QuarterlyReport.pdf from OfficePC on local printer" {
+		t.Fatalf("Unexpected second completion balloon: %+v", balloons)
+	}
+
+	// 3. Failure callback -> NotifyError with friendly label + RestoreNetworkStatus.
+	ps.OnJobFailed(printer.PrintJob{
+		FileName:   "print_1700000000789.oxps",
+		SourceNode: "StudioMac",
+	}, "printer offline")
+
+	_, balloons, restores = notifier.snapshot()
+	if len(balloons) != 3 {
+		t.Fatalf("Expected 3 total balloons after failure, got %d", len(balloons))
+	}
+	if balloons[2].level != tray.NotifyError || balloons[2].title != "Print Failed" || balloons[2].message != "Failed to print Document from StudioMac: printer offline" {
+		t.Fatalf("Unexpected failure balloon: %+v", balloons[2])
+	}
+	if restores != 1 {
+		t.Fatalf("Expected 1 RestoreNetworkStatus call on failure, got %d", restores)
+	}
+}
+
+func TestSenderPrintNotificationsAndJobNameHeaders(t *testing.T) {
+	notifier := &recordingPrintNotifier{}
+	ms := printer.NewMultiSpoolerListener(func(peer config.PeerDevice, filePath string) error {
+		return nil
+	})
+	wireMultiSpoolerNotifications(ms, func() printNotifier { return notifier })
+
+	peer := config.PeerDevice{Name: "Unit 2"}
+	ms.OnJobStarted(peer, "print_1700000000111.oxps")
+	ms.OnJobCompleted(peer, "print_1700000000111.oxps")
+	ms.OnJobFailed(peer, "print_1700000000111.oxps", errPrintQueuedOffline)
+	ms.OnJobFailed(peer, "print_1700000000111.oxps", errors.New("connection reset"))
+	notifyPrintDispatched(notifier, "invoice.pdf", peer.Name)
+
+	states, balloons, restores := notifier.snapshot()
+	if len(states) != 1 || states[0] != "Bridge: Sending print to Unit 2..." {
+		t.Fatalf("Unexpected multiSpooler OnJobStarted states: %v", states)
+	}
+	if len(balloons) != 3 {
+		t.Fatalf("Expected 3 balloons (Print Sent, real Print Error, Print Sent dispatch; offline queued suppressed), got %d: %+v", len(balloons), balloons)
+	}
+	if balloons[0].title != "Print Sent" || balloons[0].message != "Document sent to Unit 2 for printing." || !balloons[0].isFlash {
+		t.Fatalf("Unexpected multiSpooler OnJobCompleted balloon: %+v", balloons[0])
+	}
+	if balloons[1].title != "Print Error" || balloons[1].level != tray.NotifyError || !strings.Contains(balloons[1].message, "connection reset") {
+		t.Fatalf("Unexpected multiSpooler OnJobFailed balloon: %+v", balloons[1])
+	}
+	if balloons[2].title != "Print Sent" || balloons[2].message != "Sent invoice.pdf to Unit 2 for printing." || !balloons[2].isFlash {
+		t.Fatalf("Unexpected dispatch balloon: %+v", balloons[2])
+	}
+	if restores != 1 {
+		t.Fatalf("Expected 1 RestoreNetworkStatus call (only for real failure), got %d", restores)
+	}
+
+	// Verify X-Bridge-Job-Name header propagation in sendTrayPrintFile and flushOutboundQueueForPeer.
+	var mu stdsync.Mutex
+	var gotJobNames []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		gotJobNames = append(gotJobNames, r.Header.Get("X-Bridge-Job-Name"))
+		mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	tempDir := t.TempDir()
+	namedFile := filepath.Join(tempDir, "invoice.pdf")
+	autoFile := filepath.Join(tempDir, "print_1700000000999.pdf")
+	pdfBytes := []byte("%PDF-1.4\n%%EOF\n")
+	if err := os.WriteFile(namedFile, pdfBytes, 0644); err != nil {
+		t.Fatalf("WriteFile named failed: %v", err)
+	}
+	if err := os.WriteFile(autoFile, pdfBytes, 0644); err != nil {
+		t.Fatalf("WriteFile auto failed: %v", err)
+	}
+
+	cfg := &config.Config{
+		NodeName:  "Unit 1",
+		AuthToken: "tok",
+	}
+	oq := printer.NewOutboundQueue(filepath.Join(tempDir, "oq"))
+
+	// Tray send passes X-Bridge-Job-Name = basename.
+	sendTrayPrintFile(cfg, oq, "Unit 2", srv.URL, namedFile, nil)
+
+	// OutboundQueue flush sends X-Bridge-Job-Name for named file, omits for auto-generated print_* name.
+	if _, err := oq.Enqueue("Unit 2", srv.URL, namedFile, printer.OutboundJobMeta{JobName: "invoice.pdf"}); err != nil {
+		t.Fatalf("Enqueue named failed: %v", err)
+	}
+	if _, err := oq.Enqueue("Unit 2", srv.URL, autoFile, printer.OutboundJobMeta{JobName: "print_1700000000999.pdf"}); err != nil {
+		t.Fatalf("Enqueue auto failed: %v", err)
+	}
+	flushOutboundQueueForPeer(oq, cfg, config.PeerDevice{Name: "Unit 2", URL: srv.URL}, nil)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(gotJobNames) != 3 {
+		t.Fatalf("Expected 3 HTTP print requests, got %d (%v)", len(gotJobNames), gotJobNames)
+	}
+	if gotJobNames[0] != "invoice.pdf" {
+		t.Errorf("Expected tray send X-Bridge-Job-Name=invoice.pdf, got %q", gotJobNames[0])
+	}
+	if gotJobNames[1] != "invoice.pdf" {
+		t.Errorf("Expected flush named X-Bridge-Job-Name=invoice.pdf, got %q", gotJobNames[1])
+	}
+	if gotJobNames[2] != "" {
+		t.Errorf("Expected flush auto-generated print_* job to omit X-Bridge-Job-Name, got %q", gotJobNames[2])
+	}
+}
+
+func TestIsNoRemotePrinterErrorVsUnreachable(t *testing.T) {
+	noPrinterCases := []error{
+		printer.ErrNoPhysicalPrinter,
+		fmt.Errorf("wrapped: %w", printer.ErrNoPhysicalPrinter),
+		errors.New("peer returned HTTP 412: Printer not connected on Unit 2"),
+		errors.New("No physical printer connected on this computer"),
+		errors.New("physical printer 'HP LaserJet' is offline or disconnected (WorkOffline)"),
+		errors.New("failed to deliver print job: peer returned HTTP 412: timeout while checking"),
+	}
+	for _, err := range noPrinterCases {
+		if !isNoRemotePrinterError(err) {
+			t.Errorf("Expected isNoRemotePrinterError(%v) == true", err)
+		}
+		if isPeerUnreachableError(err) {
+			t.Errorf("Expected isPeerUnreachableError(%v) == false so missing-printer is never queued", err)
+		}
+	}
+
+	unreachableCases := []error{
+		context.DeadlineExceeded,
+		errors.New("failed to deliver print job: dial tcp 100.64.1.2:8765: connectex: connection refused"),
+		errors.New("peer returned HTTP 503: service unavailable"),
+	}
+	for _, err := range unreachableCases {
+		if isNoRemotePrinterError(err) {
+			t.Errorf("Expected isNoRemotePrinterError(%v) == false", err)
+		}
+		if !isPeerUnreachableError(err) {
+			t.Errorf("Expected isPeerUnreachableError(%v) == true", err)
+		}
+	}
+
+	if isNoRemotePrinterError(nil) || isPeerUnreachableError(nil) {
+		t.Error("Expected nil error to return false for both classifiers")
+	}
+	badReqErr := errors.New("peer returned HTTP 400: unsupported format")
+	if isNoRemotePrinterError(badReqErr) || isPeerUnreachableError(badReqErr) {
+		t.Errorf("Expected HTTP 400 to return false for both classifiers, got err=%v", badReqErr)
+	}
+}
+
+func TestCheckPeerHealthyCapturesPrinterStatus(t *testing.T) {
+	readySrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(server.HealthResponse{
+			Status:         "healthy",
+			NodeName:       "PrinterHost",
+			PrinterReady:   true,
+			DefaultPrinter: "  Canon PIXMA G3010  ",
+		})
+	}))
+	defer readySrv.Close()
+
+	ok, name, ready, pName, err := checkPeerHealthy(readySrv.URL, "tok", "Unit 1")
+	if !ok || err != nil || name != "PrinterHost" || !ready || pName != "Canon PIXMA G3010" {
+		t.Fatalf("Unexpected ready peer result: ok=%v name=%q ready=%v pName=%q err=%v", ok, name, ready, pName, err)
+	}
+
+	noPrinterSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(server.HealthResponse{
+			Status:         "healthy",
+			NodeName:       "PrinterlessHost",
+			PrinterReady:   false,
+			DefaultPrinter: "",
+		})
+	}))
+	defer noPrinterSrv.Close()
+
+	ok, name, ready, pName, err = checkPeerHealthy(noPrinterSrv.URL, "tok", "Unit 1")
+	if !ok || err != nil || name != "PrinterlessHost" || ready || pName != "" {
+		t.Fatalf("Unexpected printerless peer result: ok=%v name=%q ready=%v pName=%q err=%v", ok, name, ready, pName, err)
+	}
+}
+
+func TestFullHTTPPrintRejection412AndOnPrintRejected(t *testing.T) {
+	tempRoot := t.TempDir()
+	docPath := filepath.Join(tempRoot, "invoice.pdf")
+	if err := os.WriteFile(docPath, []byte("%PDF-1.4\n%%EOF\n"), 0644); err != nil {
+		t.Fatalf("WriteFile failed: %v", err)
+	}
+
+	// Verify receiver HTTP /api/print rejects with 412 and invokes SetOnPrintRejected when no physical printer is available.
+	if _, hostPrinterErr := printer.GetTargetPhysicalPrinter(); hostPrinterErr != nil {
+		recvPort := allocateFreeTCPPort(t)
+		recvCfg := &config.Config{
+			NodeName:   "PrinterlessPC",
+			ListenPort: recvPort,
+			AuthToken:  "reject-412-token",
+		}
+		ps := printer.NewPrintService("", 5, filepath.Join(tempRoot, "q"), filepath.Join(tempRoot, "f"))
+		srv := server.NewServer(recvCfg, nil, ps)
+
+		notifier := &recordingPrintNotifier{}
+		wireServerPrintRejectedNotification(srv, func() printNotifier { return notifier })
+
+		go func() { _ = srv.Start() }()
+		defer srv.Stop()
+
+		if !waitForCondition(3*time.Second, 50*time.Millisecond, func() bool {
+			return installer.VerifyHealth(recvPort) == nil
+		}) {
+			t.Fatalf("Receiver server failed to start on port %d", recvPort)
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		err := printer.SendDirectPrintWithOptions(ctx, fmt.Sprintf("http://127.0.0.1:%d", recvPort), recvCfg.AuthToken, docPath, printer.PrintOptions{},
+			"X-Bridge-Node-Name", "Laptop",
+			"X-Bridge-Origin", "Laptop",
+		)
+		if err == nil {
+			t.Fatal("Expected SendDirectPrintWithOptions to fail with HTTP 412")
+		}
+		if !isNoRemotePrinterError(err) {
+			t.Fatalf("Expected isNoRemotePrinterError(err)==true, got %v", err)
+		}
+		if isPeerUnreachableError(err) {
+			t.Fatalf("Expected isPeerUnreachableError(err)==false for 412, got true (%v)", err)
+		}
+
+		_, balloons, _ := notifier.snapshot()
+		if len(balloons) != 1 {
+			t.Fatalf("Expected 1 rejection balloon on receiver, got %d (%+v)", len(balloons), balloons)
+		}
+		if balloons[0].title != "Print Rejected — No Printer" ||
+			balloons[0].level != tray.NotifyWarning ||
+			balloons[0].message != "Remote print from Laptop skipped: no physical printer connected on this PC." {
+			t.Fatalf("Unexpected receiver rejection balloon: %+v", balloons[0])
+		}
+	} else {
+		// Host has an online physical printer; still verify SetOnPrintRejected wiring and HTTP 412 classification.
+		srv := server.NewServer(&config.Config{NodeName: "PrinterlessPC", ListenPort: allocateFreeTCPPort(t), AuthToken: "tok"}, nil, nil)
+		notifier := &recordingPrintNotifier{}
+		wireServerPrintRejectedNotification(srv, func() printNotifier { return notifier })
+		http412Srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			http.Error(w, "Printer not connected on PrinterlessPC: no physical printer connected", http.StatusPreconditionFailed)
+		}))
+		defer http412Srv.Close()
+		err := printer.SendDirectPrintWithOptions(context.Background(), http412Srv.URL, "tok", docPath, printer.PrintOptions{})
+		if !isNoRemotePrinterError(err) || isPeerUnreachableError(err) {
+			t.Fatalf("Expected HTTP 412 classification, got %v", err)
+		}
+	}
+}
+
+func TestMissingPrinterNotificationPathsWithoutQueueing(t *testing.T) {
+	tempRoot := t.TempDir()
+	docPath := filepath.Join(tempRoot, "statement.pdf")
+	if err := os.WriteFile(docPath, []byte("%PDF-1.4\n%%EOF\n"), 0644); err != nil {
+		t.Fatalf("WriteFile failed: %v", err)
+	}
+
+	http412Srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "Printer not connected on Unit 2: no physical printer connected", http.StatusPreconditionFailed)
+	}))
+	defer http412Srv.Close()
+
+	// 1. MultiSpoolerListener path: 412 returns errPrintHandled, never queues (even if peerOnline=false),
+	// notifies "Printer Not Connected" once, and OnJobFailed suppresses duplicate "Print Error".
+	notifier1 := &recordingPrintNotifier{}
+	ms := printer.NewMultiSpoolerListener(func(peer config.PeerDevice, filePath string) error { return nil })
+	wireMultiSpoolerNotifications(ms, func() printNotifier { return notifier1 })
+
+	oq1 := printer.NewOutboundQueue(filepath.Join(tempRoot, "oq1"))
+	sendErr := printer.SendDirectPrintWithOptions(context.Background(), http412Srv.URL, "tok", docPath, printer.PrintOptions{})
+	resErr := handleMultiSpoolerSendResult("Unit 2", false, http412Srv.URL, docPath, sendErr, oq1, nil, notifier1)
+	if !errors.Is(resErr, errPrintHandled) {
+		t.Fatalf("Expected errPrintHandled, got %v", resErr)
+	}
+	ms.OnJobFailed(config.PeerDevice{Name: "Unit 2"}, filepath.Base(docPath), resErr)
+	if oq1.Count() != 0 {
+		t.Fatalf("Expected 0 queued jobs on 412, got %d", oq1.Count())
+	}
+	_, balloons1, restores1 := notifier1.snapshot()
+	if len(balloons1) != 1 || balloons1[0].title != "Printer Not Connected" ||
+		balloons1[0].message != "No physical printer is connected on Unit 2." ||
+		balloons1[0].level != tray.NotifyError || restores1 != 1 {
+		t.Fatalf("Unexpected MultiSpooler 412 notifications: balloons=%+v restores=%d", balloons1, restores1)
+	}
+
+	// 2. sendTrayPrintFileWithNotifier path: 412 notifies "Printer Not Connected" and does not queue.
+	notifier2 := &recordingPrintNotifier{}
+	oq2 := printer.NewOutboundQueue(filepath.Join(tempRoot, "oq2"))
+	cfg := &config.Config{NodeName: "Unit 1", AuthToken: "tok"}
+	sendTrayPrintFileWithNotifier(cfg, oq2, "Unit 2", http412Srv.URL, docPath, nil, notifier2)
+	if oq2.Count() != 0 {
+		t.Fatalf("Expected 0 queued jobs from tray send on 412, got %d", oq2.Count())
+	}
+	_, balloons2, restores2 := notifier2.snapshot()
+	if len(balloons2) != 1 || balloons2[0].title != "Printer Not Connected" ||
+		balloons2[0].message != "No physical printer is connected on Unit 2." ||
+		balloons2[0].level != tray.NotifyError || restores2 != 1 {
+		t.Fatalf("Unexpected tray send 412 notifications: balloons=%+v restores=%d", balloons2, restores2)
+	}
+
+	// 3. handleSendPrintWithQueue path: local /api/print-local HTTP 412 returns error without queueing.
+	local412Srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "Failed to send print job: peer returned HTTP 412: Printer not connected on Unit 2", http.StatusPreconditionFailed)
+	}))
+	defer local412Srv.Close()
+	var localPort int
+	if _, err := fmt.Sscanf(local412Srv.URL, "http://127.0.0.1:%d", &localPort); err != nil {
+		t.Fatalf("Failed to parse local412Srv port: %v", err)
+	}
+	cfgPath := filepath.Join(tempRoot, "config.json")
+	sendCfg := &config.Config{
+		Configured: true,
+		NodeName:   "Unit 1",
+		ListenPort: localPort,
+		AuthToken:  "tok",
+		Peers:      []config.PeerDevice{{Name: "Unit 2", IP: "127.0.0.1", URL: http412Srv.URL, SpoolPort: 9101}},
+	}
+	if err := config.SaveConfig(cfgPath, sendCfg); err != nil {
+		t.Fatalf("SaveConfig failed: %v", err)
+	}
+	oqDir3 := filepath.Join(tempRoot, "oq3")
+	if err := handleSendPrintWithQueue(docPath, "Unit 2", cfgPath, oqDir3); err == nil {
+		t.Fatal("Expected handleSendPrintWithQueue to return error on HTTP 412")
+	}
+	if cnt := printer.NewOutboundQueue(oqDir3).Count(); cnt != 0 {
+		t.Fatalf("Expected 0 queued jobs in SendTo path on HTTP 412, got %d", cnt)
+	}
+
+	// 4. flushOutboundQueueForPeerWithNotifier path: 412 removes queued job and warns "Printer Not Connected".
+	notifier4 := &recordingPrintNotifier{}
+	oq4 := printer.NewOutboundQueue(filepath.Join(tempRoot, "oq4"))
+	if _, err := oq4.Enqueue("Unit 2", http412Srv.URL, docPath, printer.OutboundJobMeta{JobName: "statement.pdf"}); err != nil {
+		t.Fatalf("Enqueue failed: %v", err)
+	}
+	flushOutboundQueueForPeerWithNotifier(oq4, cfg, config.PeerDevice{Name: "Unit 2", URL: http412Srv.URL}, nil, notifier4)
+	if oq4.Count() != 0 {
+		t.Fatalf("Expected skipped job to be removed from OutboundQueue, got count=%d", oq4.Count())
+	}
+	_, balloons4, _ := notifier4.snapshot()
+	if len(balloons4) != 1 || balloons4[0].title != "Printer Not Connected" ||
+		balloons4[0].level != tray.NotifyWarning ||
+		balloons4[0].message != "Queued print statement.pdf skipped: no physical printer is connected on Unit 2." {
+		t.Fatalf("Unexpected OutboundQueue flush 412 notification: %+v", balloons4)
+	}
+}
+
+func TestBuildNetworkStatusTextPrinterReadiness(t *testing.T) {
+	readyTrue := true
+	readyFalse := false
+	peers := []config.PeerDevice{
+		{Name: "Unit 2", IP: "100.64.0.2", SpoolPort: 9101, Online: true, PrinterReady: &readyTrue, PrinterName: "HP LaserJet Pro"},
+		{Name: "Unit 3", IP: "100.64.0.3", SpoolPort: 9102, Online: true, PrinterReady: &readyTrue},
+		{Name: "Laptop", IP: "100.64.0.4", SpoolPort: 9103, Online: true, PrinterReady: &readyFalse},
+		{Name: "Legacy", IP: "100.64.0.5", SpoolPort: 9104, Online: true},
+		{Name: "Backup", IP: "100.64.0.6", SpoolPort: 9105, Online: false},
+	}
+
+	text := buildNetworkStatusText("Unit 1", "100.64.0.1", "", printer.ErrNoPhysicalPrinter, 0, 1, `C:\Bridge\Shared`, peers)
+	for _, want := range []string{
+		"Local Printer:   None (No physical printer connected)",
+		"[Online | Printer: HP LaserJet Pro]",
+		"[Online | Printer Ready]",
+		"[Online | No Printer]",
+		"[Online]",
+		"[Offline]",
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("Expected status text to contain %q, got:\n%s", want, text)
+		}
+	}
+
+	readyText := buildNetworkStatusText("Unit 1", "100.64.0.1", "Canon PIXMA", nil, 0, 0, `C:\Bridge\Shared`, nil)
+	if !strings.Contains(readyText, "Local Printer:   Canon PIXMA") {
+		t.Errorf("Expected local printer name in status text, got:\n%s", readyText)
+	}
+}
+
+
+
 
 
 

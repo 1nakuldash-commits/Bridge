@@ -8,28 +8,43 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"sync"
 	"time"
 )
 
 // FileRecord tracks the known state of a synchronized file.
 type FileRecord struct {
-	RelPath string `json:"rel_path"`
-	Hash    string `json:"hash"`
-	Size    int64  `json:"size"`
-	ModTime int64  `json:"mod_time"`          // Unix timestamp in nanoseconds
-	Deleted bool   `json:"deleted,omitempty"` // Tombstone marker for deleted files
+	RelPath     string `json:"rel_path"`
+	Hash        string `json:"hash"`
+	Size        int64  `json:"size"`
+	ModTime     int64  `json:"mod_time"`                // Logical sync timestamp in nanoseconds
+	DiskModTime int64  `json:"disk_mod_time,omitempty"` // Actual local disk modtime (ns) when distinct from ModTime
+	Deleted     bool   `json:"deleted,omitempty"`       // Tombstone marker for deleted files
 }
 
 // StateManager persists and provides thread-safe access to sync file states.
 type StateManager struct {
-	mu        sync.RWMutex
-	filePath  string
-	records   map[string]FileRecord
+	mu       sync.RWMutex
+	saveMu   sync.Mutex
+	filePath string
+	records  map[string]FileRecord
+	seq      uint64
+	savedSeq uint64
 }
 
 type stateFileFormat struct {
 	Files map[string]FileRecord `json:"files"`
+}
+
+func normalizeStateKey(relPath string) string {
+	trimmed := strings.TrimSpace(relPath)
+	if trimmed == "" {
+		return ""
+	}
+	clean := filepath.Clean(filepath.FromSlash(trimmed))
+	return filepath.ToSlash(clean)
 }
 
 // NewStateManager loads or initializes a StateManager for the given state file path.
@@ -58,7 +73,27 @@ func (sm *StateManager) load() error {
 	}
 
 	if sf.Files != nil {
-		sm.records = sf.Files
+		normalized := make(map[string]FileRecord, len(sf.Files))
+		for k, rec := range sf.Files {
+			normKey := normalizeStateKey(k)
+			if normKey == "" || normKey == "." {
+				continue
+			}
+			rec.RelPath = normKey
+			if runtime.GOOS == "windows" {
+				for existingKey, existingRec := range normalized {
+					if strings.EqualFold(existingKey, normKey) && existingKey != normKey {
+						if existingRec.ModTime > rec.ModTime {
+							rec = existingRec
+						}
+						delete(normalized, existingKey)
+						break
+					}
+				}
+			}
+			normalized[normKey] = rec
+		}
+		sm.records = normalized
 	}
 	return nil
 }
@@ -78,15 +113,47 @@ func renameWithRetry(src, dst string) error {
 	return err
 }
 
-// Save writes current state atomically to disk. Must be called with lock held or via public methods.
-func (sm *StateManager) saveLocked() error {
+func (sm *StateManager) findKeyLocked(normKey string) (string, FileRecord, bool) {
+	if normKey == "" {
+		return "", FileRecord{}, false
+	}
+	if rec, ok := sm.records[normKey]; ok {
+		return normKey, rec, true
+	}
+	if runtime.GOOS == "windows" {
+		for k, rec := range sm.records {
+			if strings.EqualFold(k, normKey) {
+				return k, rec, true
+			}
+		}
+	}
+	return "", FileRecord{}, false
+}
+
+// flushToDisk serializes and atomically writes the latest state snapshot without holding sm.mu across disk I/O.
+func (sm *StateManager) flushToDisk(targetSeq uint64) error {
+	sm.saveMu.Lock()
+	defer sm.saveMu.Unlock()
+
+	sm.mu.RLock()
+	if sm.savedSeq >= targetSeq {
+		sm.mu.RUnlock()
+		return nil
+	}
+	latestSeq := sm.seq
+	snapshot := make(map[string]FileRecord, len(sm.records))
+	for k, v := range sm.records {
+		snapshot[k] = v
+	}
+	sm.mu.RUnlock()
+
 	dir := filepath.Dir(sm.filePath)
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return err
 	}
 
 	sf := stateFileFormat{
-		Files: sm.records,
+		Files: snapshot,
 	}
 
 	data, err := json.MarshalIndent(sf, "", "  ")
@@ -94,20 +161,46 @@ func (sm *StateManager) saveLocked() error {
 		return err
 	}
 
-	tmpPath := sm.filePath + ".tmp"
-	if err := os.WriteFile(tmpPath, data, 0644); err != nil {
+	tmpFile, err := os.CreateTemp(dir, filepath.Base(sm.filePath)+".*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmpFile.Name()
+	cleanupTmp := true
+	defer func() {
+		if cleanupTmp {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+
+	if _, err := tmpFile.Write(data); err != nil {
+		_ = tmpFile.Close()
+		return err
+	}
+	if err := tmpFile.Close(); err != nil {
 		return err
 	}
 
 	// Atomic replace with brief retry for transient Windows file locks
-	return renameWithRetry(tmpPath, sm.filePath)
+	if err := renameWithRetry(tmpPath, sm.filePath); err != nil {
+		return err
+	}
+	cleanupTmp = false
+
+	sm.mu.Lock()
+	if latestSeq > sm.savedSeq {
+		sm.savedSeq = latestSeq
+	}
+	sm.mu.Unlock()
+	return nil
 }
 
 // Get returns the recorded state for a relative file path.
 func (sm *StateManager) Get(relPath string) (FileRecord, bool) {
+	normKey := normalizeStateKey(relPath)
 	sm.mu.RLock()
 	defer sm.mu.RUnlock()
-	rec, ok := sm.records[filepath.Clean(relPath)]
+	_, rec, ok := sm.findKeyLocked(normKey)
 	return rec, ok
 }
 
@@ -124,28 +217,76 @@ func (sm *StateManager) GetAll() map[string]FileRecord {
 
 // Set updates or inserts a record and saves state.
 func (sm *StateManager) Set(relPath string, rec FileRecord) error {
+	normKey := normalizeStateKey(relPath)
+	if normKey == "" || normKey == "." {
+		return fmt.Errorf("invalid relative path %q", relPath)
+	}
+
 	sm.mu.Lock()
-	defer sm.mu.Unlock()
-	cleanPath := filepath.Clean(relPath)
-	rec.RelPath = cleanPath
-	sm.records[cleanPath] = rec
-	return sm.saveLocked()
+	if runtime.GOOS == "windows" {
+		if oldKey, _, ok := sm.findKeyLocked(normKey); ok && oldKey != normKey {
+			delete(sm.records, oldKey)
+		}
+	}
+	rec.RelPath = normKey
+	sm.records[normKey] = rec
+	sm.seq++
+	targetSeq := sm.seq
+	sm.mu.Unlock()
+
+	return sm.flushToDisk(targetSeq)
 }
 
 // Delete removes a record and saves state.
 func (sm *StateManager) Delete(relPath string) error {
+	normKey := normalizeStateKey(relPath)
+
 	sm.mu.Lock()
-	defer sm.mu.Unlock()
-	cleanPath := filepath.Clean(relPath)
-	delete(sm.records, cleanPath)
-	return sm.saveLocked()
+	existingKey, _, ok := sm.findKeyLocked(normKey)
+	if !ok {
+		sm.mu.Unlock()
+		return nil
+	}
+	delete(sm.records, existingKey)
+	sm.seq++
+	targetSeq := sm.seq
+	sm.mu.Unlock()
+
+	return sm.flushToDisk(targetSeq)
+}
+
+// PruneTombstones removes deletion tombstones older than maxAge and persists if any were removed.
+func (sm *StateManager) PruneTombstones(maxAge time.Duration) (int, error) {
+	if maxAge <= 0 {
+		return 0, nil
+	}
+	cutoff := time.Now().Add(-maxAge).UnixNano()
+
+	sm.mu.Lock()
+	pruned := 0
+	for k, rec := range sm.records {
+		if rec.Deleted && rec.ModTime > 0 && rec.ModTime < cutoff {
+			delete(sm.records, k)
+			pruned++
+		}
+	}
+	if pruned == 0 {
+		sm.mu.Unlock()
+		return 0, nil
+	}
+	sm.seq++
+	targetSeq := sm.seq
+	sm.mu.Unlock()
+
+	return pruned, sm.flushToDisk(targetSeq)
 }
 
 // IsSynced checks whether the given hash matches the last recorded hash for relPath.
 func (sm *StateManager) IsSynced(relPath string, hash string) bool {
+	normKey := normalizeStateKey(relPath)
 	sm.mu.RLock()
 	defer sm.mu.RUnlock()
-	rec, ok := sm.records[filepath.Clean(relPath)]
+	_, rec, ok := sm.findKeyLocked(normKey)
 	if !ok || rec.Deleted {
 		return false
 	}
@@ -154,16 +295,18 @@ func (sm *StateManager) IsSynced(relPath string, hash string) bool {
 
 // IsDeleted checks if the file is recorded as deleted (tombstone).
 func (sm *StateManager) IsDeleted(relPath string) bool {
+	normKey := normalizeStateKey(relPath)
 	sm.mu.RLock()
 	defer sm.mu.RUnlock()
-	rec, ok := sm.records[filepath.Clean(relPath)]
+	_, rec, ok := sm.findKeyLocked(normKey)
 	return ok && rec.Deleted
 }
 
 // MarkAsDeleted records a deletion tombstone so that local events do not echo it back.
 func (sm *StateManager) MarkAsDeleted(relPath string, modTime int64) error {
-	return sm.Set(relPath, FileRecord{
-		RelPath: filepath.Clean(relPath),
+	normKey := normalizeStateKey(relPath)
+	return sm.Set(normKey, FileRecord{
+		RelPath: normKey,
 		Hash:    "",
 		Size:    0,
 		ModTime: modTime,
@@ -173,8 +316,9 @@ func (sm *StateManager) MarkAsDeleted(relPath string, modTime int64) error {
 
 // MarkAsReceived records a file received from a peer so that local events do not echo it back.
 func (sm *StateManager) MarkAsReceived(relPath string, hash string, size int64, modTime int64) error {
-	return sm.Set(relPath, FileRecord{
-		RelPath: filepath.Clean(relPath),
+	normKey := normalizeStateKey(relPath)
+	return sm.Set(normKey, FileRecord{
+		RelPath: normKey,
 		Hash:    hash,
 		Size:    size,
 		ModTime: modTime,

@@ -4,6 +4,7 @@ import (
 	"archive/zip"
 	"bytes"
 	"compress/zlib"
+	"encoding/binary"
 	"fmt"
 	"image"
 	_ "image/gif"
@@ -24,20 +25,24 @@ const (
 	ptPerMm = 72.0 / 25.4 // ~2.8346 pt per mm
 
 	// Standard ISO & ANSI page sizes (in points, normalized: short edge, long edge)
-	a2ShortPt  = 420.0 * ptPerMm  // 1190.551
-	a2LongPt   = 594.0 * ptPerMm  // 1683.780
-	a3ShortPt  = 297.0 * ptPerMm  // 841.890
-	a3LongPt   = 420.0 * ptPerMm  // 1190.551
-	a4ShortPt  = 210.0 * ptPerMm  // 595.276
-	a4LongPt   = 297.0 * ptPerMm  // 841.890
-	a5ShortPt  = 148.0 * ptPerMm  // 419.528
-	a5LongPt   = 210.0 * ptPerMm  // 595.276
-	ltrShortPt = 8.5 * 72.0       // 612.0
-	ltrLongPt  = 11.0 * 72.0      // 792.0
-	lglShortPt = 8.5 * 72.0       // 612.0
-	lglLongPt  = 14.0 * 72.0      // 1008.0
-	tabShortPt = 11.0 * 72.0      // 792.0
-	tabLongPt  = 17.0 * 72.0      // 1224.0
+	a2ShortPt   = 420.0 * ptPerMm  // 1190.551
+	a2LongPt    = 594.0 * ptPerMm  // 1683.780
+	a3ShortPt   = 297.0 * ptPerMm  // 841.890
+	a3LongPt    = 420.0 * ptPerMm  // 1190.551
+	a4ShortPt   = 210.0 * ptPerMm  // 595.276
+	a4LongPt    = 297.0 * ptPerMm  // 841.890
+	a5ShortPt   = 148.0 * ptPerMm  // 419.528
+	a5LongPt    = 210.0 * ptPerMm  // 595.276
+	a6ShortPt   = 105.0 * ptPerMm  // 297.638
+	a6LongPt    = 148.0 * ptPerMm  // 419.528
+	ltrShortPt  = 8.5 * 72.0       // 612.0
+	ltrLongPt   = 11.0 * 72.0      // 792.0
+	lglShortPt  = 8.5 * 72.0       // 612.0
+	lglLongPt   = 14.0 * 72.0      // 1008.0
+	tabShortPt  = 11.0 * 72.0      // 792.0
+	tabLongPt   = 17.0 * 72.0      // 1224.0
+	stmtShortPt = 5.5 * 72.0       // 396.0
+	stmtLongPt  = 8.5 * 72.0       // 612.0
 )
 
 // DocumentGeometry captures the detected dimensions, orientation, paper size, and page count.
@@ -126,7 +131,9 @@ func DetectDocumentGeometry(filePath string) DocumentGeometry {
 			geom.Format = imgExt
 		}
 	} else if bytes.HasPrefix(header, []byte("PK\x03\x04")) {
-		if geom.Format != ".oxps" {
+		if detected := detectZIPSpoolFormatFromFile(filePath); detected != "" {
+			geom.Format = detected
+		} else if geom.Format != ".oxps" {
 			geom.Format = ".xps"
 		}
 	} else if bytes.HasPrefix(header, []byte("%PDF-")) || bytes.Contains(header, []byte("%PDF-")) {
@@ -181,29 +188,189 @@ func detectImageGeometry(f *os.File, geom *DocumentGeometry) {
 	geom.PaperName = "A4"
 	geom.Orientation = "portrait"
 
-	_, _ = f.Seek(0, io.SeekStart)
-	if cfg, _, err := image.DecodeConfig(f); err == nil && cfg.Width > 0 && cfg.Height > 0 {
-		if cfg.Width > cfg.Height {
+	w, h, orient := readImageDimensionsAndOrientation(f)
+	if w > 0 && h > 0 {
+		// Apply EXIF/TIFF orientation 5..8 (90/270 degree rotation)
+		if orient >= 5 && orient <= 8 {
+			w, h = h, w
+		}
+		// Convert pixels to points at 96 DPI (72/96 = 0.75 pt/px)
+		geom.WidthPt = float64(w) * 0.75
+		geom.HeightPt = float64(h) * 0.75
+		if w > h {
 			geom.Orientation = "landscape"
 		} else {
 			geom.Orientation = "portrait"
 		}
-		return
+	}
+}
+
+func readImageDimensionsAndOrientation(f *os.File) (width int, height int, exifOrient int) {
+	_, _ = f.Seek(0, io.SeekStart)
+	var magic [8]byte
+	n, _ := io.ReadFull(f, magic[:])
+	hdr := magic[:n]
+
+	// 1. TIFF (II*\x00 or MM\x00*)
+	if bytes.HasPrefix(hdr, []byte("II*\x00")) || bytes.HasPrefix(hdr, []byte("MM\x00*")) {
+		var order binary.ByteOrder = binary.LittleEndian
+		if hdr[0] == 'M' {
+			order = binary.BigEndian
+		}
+		w, h, orient := parseTIFFIFD0(f, order, 0)
+		return w, h, orient
 	}
 
-	// Lightweight header fallback for BMP (width/height at bytes 18..25)
-	_, _ = f.Seek(0, io.SeekStart)
-	var hdr [26]byte
-	if n, err := io.ReadFull(f, hdr[:]); err == nil && n == 26 && hdr[0] == 'B' && hdr[1] == 'M' {
-		w := int32(hdr[18]) | int32(hdr[19])<<8 | int32(hdr[20])<<16 | int32(hdr[21])<<24
-		h := int32(hdr[22]) | int32(hdr[23])<<8 | int32(hdr[24])<<16 | int32(hdr[25])<<24
-		if h < 0 {
-			h = -h
-		}
-		if w > 0 && h > 0 && w > h {
-			geom.Orientation = "landscape"
+	// 2. BMP (width/height at bytes 18..25)
+	if bytes.HasPrefix(hdr, []byte("BM")) {
+		_, _ = f.Seek(0, io.SeekStart)
+		var bmpHdr [26]byte
+		if bn, err := io.ReadFull(f, bmpHdr[:]); err == nil && bn == 26 {
+			w := int(int32(bmpHdr[18]) | int32(bmpHdr[19])<<8 | int32(bmpHdr[20])<<16 | int32(bmpHdr[21])<<24)
+			h := int(int32(bmpHdr[22]) | int32(bmpHdr[23])<<8 | int32(bmpHdr[24])<<16 | int32(bmpHdr[25])<<24)
+			if h < 0 {
+				h = -h
+			}
+			return w, h, 0
 		}
 	}
+
+	// 3. Standard PNG / JPEG / GIF via image.DecodeConfig
+	_, _ = f.Seek(0, io.SeekStart)
+	if cfg, format, err := image.DecodeConfig(f); err == nil && cfg.Width > 0 && cfg.Height > 0 {
+		width, height = cfg.Width, cfg.Height
+		if format == "jpeg" {
+			exifOrient = readJPEGExifOrientation(f)
+		}
+		return width, height, exifOrient
+	}
+
+	return 0, 0, 0
+}
+
+// readJPEGExifOrientation scans JPEG APP1 segments for an Exif TIFF IFD0 Orientation tag (0x0112).
+func readJPEGExifOrientation(f *os.File) int {
+	_, _ = f.Seek(2, io.SeekStart)
+	var marker [4]byte
+	for i := 0; i < 64; i++ {
+		if _, err := io.ReadFull(f, marker[:2]); err != nil {
+			return 0
+		}
+		if marker[0] != 0xFF {
+			return 0
+		}
+		// Skip fill bytes
+		for marker[1] == 0xFF {
+			if _, err := io.ReadFull(f, marker[1:2]); err != nil {
+				return 0
+			}
+		}
+		// Start of Scan (0xDA) or EOI (0xD9): no more metadata segments
+		if marker[1] == 0xDA || marker[1] == 0xD9 {
+			return 0
+		}
+		// Standalone markers without length (RSTn, TEM)
+		if marker[1] == 0x01 || (marker[1] >= 0xD0 && marker[1] <= 0xD8) {
+			continue
+		}
+		if _, err := io.ReadFull(f, marker[2:4]); err != nil {
+			return 0
+		}
+		segLen := int(binary.BigEndian.Uint16(marker[2:4]))
+		if segLen < 2 {
+			return 0
+		}
+		payloadLen := segLen - 2
+		segStart, err := f.Seek(0, io.SeekCurrent)
+		if err != nil {
+			return 0
+		}
+
+		// APP1 (0xE1) with "Exif\x00\x00" header
+		if marker[1] == 0xE1 && payloadLen >= 14 {
+			var exifHdr [8]byte
+			if _, err := io.ReadFull(f, exifHdr[:6]); err == nil && bytes.Equal(exifHdr[:6], []byte("Exif\x00\x00")) {
+				tiffBase := segStart + 6
+				var tiffMagic [4]byte
+				if _, err := io.ReadFull(f, tiffMagic[:4]); err == nil {
+					var order binary.ByteOrder
+					if bytes.Equal(tiffMagic[:4], []byte("II*\x00")) {
+						order = binary.LittleEndian
+					} else if bytes.Equal(tiffMagic[:4], []byte("MM\x00*")) {
+						order = binary.BigEndian
+					}
+					if order != nil {
+						_, _, orient := parseTIFFIFD0(f, order, tiffBase)
+						return orient
+					}
+				}
+			}
+		}
+
+		if _, err := f.Seek(segStart+int64(payloadLen), io.SeekStart); err != nil {
+			return 0
+		}
+	}
+	return 0
+}
+
+// parseTIFFIFD0 reads ImageWidth (0x0100), ImageLength (0x0101), and Orientation (0x0112)
+// from a TIFF IFD0 starting relative to tiffBase.
+func parseTIFFIFD0(r io.ReaderAt, order binary.ByteOrder, tiffBase int64) (width int, height int, orient int) {
+	var ifdOffBuf [4]byte
+	if _, err := r.ReadAt(ifdOffBuf[:], tiffBase+4); err != nil {
+		return 0, 0, 0
+	}
+	ifdOff := int64(order.Uint32(ifdOffBuf[:]))
+	if ifdOff < 8 {
+		return 0, 0, 0
+	}
+
+	var countBuf [2]byte
+	if _, err := r.ReadAt(countBuf[:], tiffBase+ifdOff); err != nil {
+		return 0, 0, 0
+	}
+	numEntries := int(order.Uint16(countBuf[:]))
+	if numEntries <= 0 || numEntries > 512 {
+		return 0, 0, 0
+	}
+
+	entryBuf := make([]byte, numEntries*12)
+	if _, err := r.ReadAt(entryBuf, tiffBase+ifdOff+2); err != nil {
+		return 0, 0, 0
+	}
+
+	readScalar := func(entry []byte) int {
+		fieldType := order.Uint16(entry[2:4])
+		count := order.Uint32(entry[4:8])
+		if count == 0 {
+			return 0
+		}
+		switch fieldType {
+		case 3: // SHORT (2 bytes)
+			return int(order.Uint16(entry[8:10]))
+		case 4: // LONG (4 bytes)
+			return int(order.Uint32(entry[8:12]))
+		case 1: // BYTE (1 byte)
+			return int(entry[8])
+		default:
+			return 0
+		}
+	}
+
+	for i := 0; i < numEntries; i++ {
+		entry := entryBuf[i*12 : (i+1)*12]
+		tag := order.Uint16(entry[0:2])
+		switch tag {
+		case 0x0100: // ImageWidth
+			width = readScalar(entry)
+		case 0x0101: // ImageLength
+			height = readScalar(entry)
+		case 0x0112: // Orientation
+			orient = readScalar(entry)
+		}
+	}
+	return width, height, orient
 }
 
 func detectPDFGeometry(f *os.File, geom *DocumentGeometry) []pageDimensions {
@@ -280,7 +447,8 @@ func detectPDFGeometry(f *os.File, geom *DocumentGeometry) []pageDimensions {
 			searchBuf = append(searchBuf, dec...)
 		}
 
-		if w, h, ok := parseBoxDims(searchBuf, mediaBoxOnlyRegex); ok {
+		// Prefer /CropBox (visible area) over /MediaBox, falling back to /MediaBox
+		if w, h, ok := parseBoxDims(searchBuf, cropBoxOnlyRegex); ok {
 			uu := parseUserUnit(searchBuf)
 			w *= uu
 			h *= uu
@@ -288,7 +456,7 @@ func detectPDFGeometry(f *os.File, geom *DocumentGeometry) []pageDimensions {
 				w, h = h, w
 			}
 			pages = append(pages, pageDimensions{widthPt: w, heightPt: h})
-		} else if w, h, ok := parseBoxDims(searchBuf, cropBoxOnlyRegex); ok {
+		} else if w, h, ok := parseBoxDims(searchBuf, mediaBoxOnlyRegex); ok {
 			uu := parseUserUnit(searchBuf)
 			w *= uu
 			h *= uu
@@ -505,12 +673,12 @@ func collectPDFPages(objID int, objects map[int][]byte, inherited pdfPageAttrs, 
 		return
 	}
 
-	// Leaf /Page node: prefer /MediaBox, fall back to /CropBox
+	// Leaf /Page node: prefer /CropBox (visible/printed region), fall back to /MediaBox
 	var w, h float64
-	if attrs.hasMediaBox {
-		w, h = attrs.mediaW, attrs.mediaH
-	} else if attrs.hasCropBox {
+	if attrs.hasCropBox && attrs.cropW > 0 && attrs.cropH > 0 {
 		w, h = attrs.cropW, attrs.cropH
+	} else if attrs.hasMediaBox {
+		w, h = attrs.mediaW, attrs.mediaH
 	}
 	if w <= 0 || h <= 0 {
 		return
@@ -600,6 +768,12 @@ func parseUserUnit(data []byte) float64 {
 	return uu
 }
 
+var (
+	xpsPTOrientFeatureRe = regexp.MustCompile(`(?is)<[^:>]*:?Feature[^>]*name\s*=\s*["'][^"']*PageOrientation["'][^>]*>(.*?)</[^:>]*:?Feature>`)
+	xpsPTOptionNameRe    = regexp.MustCompile(`(?is)<[^:>]*:?Option[^>]*name\s*=\s*["']([^"']+)["']`)
+	xpsRelsTargetRe      = regexp.MustCompile(`(?is)<Relationship[^>]*Target\s*=\s*["']([^"']+)["']`)
+)
+
 func detectXPSGeometry(filePath string, geom *DocumentGeometry) []pageDimensions {
 	zr, err := zip.OpenReader(filePath)
 	if err != nil {
@@ -608,13 +782,36 @@ func detectXPSGeometry(filePath string, geom *DocumentGeometry) []pageDimensions
 	defer zr.Close()
 
 	var fpageFiles []*zip.File
+	filesByLower := make(map[string]*zip.File, len(zr.File))
+	ptByLower := make(map[string]string)
+
 	for _, file := range zr.File {
-		if strings.HasSuffix(strings.ToLower(file.Name), ".fpage") {
+		lower := strings.ToLower(strings.TrimLeft(filepath.ToSlash(file.Name), "/"))
+		filesByLower[lower] = file
+		if strings.HasSuffix(lower, ".fpage") {
 			fpageFiles = append(fpageFiles, file)
+		} else if strings.HasSuffix(lower, "_pt.xml") || strings.Contains(lower, "printticket") && strings.HasSuffix(lower, ".xml") {
+			if orient := parseXPSPrintTicketOrientation(file); orient != "" {
+				ptByLower[lower] = orient
+			}
 		}
 	}
 	if len(fpageFiles) == 0 {
 		return nil
+	}
+
+	// Determine job/document-level PrintTicket fallback orientation
+	jobDefaultOrient := ""
+	for name, orient := range ptByLower {
+		if strings.Contains(name, "job_pt.xml") || strings.Contains(name, "fixeddocseq") || strings.Contains(name, "doc") && !strings.Contains(name, "page") {
+			jobDefaultOrient = orient
+			break
+		}
+	}
+	if jobDefaultOrient == "" && len(ptByLower) == 1 {
+		for _, orient := range ptByLower {
+			jobDefaultOrient = orient
+		}
 	}
 
 	// Sort deterministically by natural order so 1.fpage comes before 2.fpage and 10.fpage
@@ -636,19 +833,96 @@ func detectXPSGeometry(filePath string, geom *DocumentGeometry) []pageDimensions
 		if len(data) == 0 {
 			continue
 		}
+
+		var wPt, hPt float64
 		// XPS Width and Height are in 1/96 inch units -> multiply by 0.75 for 1/72 inch points
 		if m := fpageDimRegex.FindSubmatch(data); len(m) == 3 {
 			w96, _ := strconv.ParseFloat(string(m[1]), 64)
 			h96, _ := strconv.ParseFloat(string(m[2]), 64)
-			pages = append(pages, pageDimensions{widthPt: w96 * 0.75, heightPt: h96 * 0.75})
+			wPt, hPt = w96*0.75, h96*0.75
 		} else if m := fpageAltRegex.FindSubmatch(data); len(m) == 3 {
 			h96, _ := strconv.ParseFloat(string(m[1]), 64)
 			w96, _ := strconv.ParseFloat(string(m[2]), 64)
-			pages = append(pages, pageDimensions{widthPt: w96 * 0.75, heightPt: h96 * 0.75})
+			wPt, hPt = w96*0.75, h96*0.75
 		}
+		if wPt <= 0 || hPt <= 0 {
+			continue
+		}
+
+		ptOrient := resolvePagePrintTicketOrientation(file.Name, filesByLower, ptByLower, jobDefaultOrient)
+		if ptOrient == "landscape" && wPt < hPt {
+			wPt, hPt = hPt, wPt
+		} else if ptOrient == "portrait" && wPt > hPt {
+			wPt, hPt = hPt, wPt
+		}
+
+		pages = append(pages, pageDimensions{widthPt: wPt, heightPt: hPt})
 	}
 
 	return pages
+}
+
+func parseXPSPrintTicketOrientation(file *zip.File) string {
+	rc, err := file.Open()
+	if err != nil {
+		return ""
+	}
+	data, _ := io.ReadAll(io.LimitReader(rc, 128*1024))
+	_ = rc.Close()
+	if len(data) == 0 {
+		return ""
+	}
+	if fm := xpsPTOrientFeatureRe.FindSubmatch(data); len(fm) == 2 {
+		if om := xpsPTOptionNameRe.FindSubmatch(fm[1]); len(om) == 2 {
+			opt := strings.ToLower(string(om[1]))
+			if strings.Contains(opt, "landscape") {
+				return "landscape"
+			}
+			if strings.Contains(opt, "portrait") {
+				return "portrait"
+			}
+		}
+	}
+	return ""
+}
+
+func resolvePagePrintTicketOrientation(fpageName string, filesByLower map[string]*zip.File, ptByLower map[string]string, fallback string) string {
+	if len(ptByLower) == 0 {
+		return ""
+	}
+	slashName := strings.TrimLeft(filepath.ToSlash(fpageName), "/")
+	dir := filepath.ToSlash(filepath.Dir(slashName))
+	base := filepath.Base(slashName)
+	stem := strings.TrimSuffix(base, filepath.Ext(base))
+
+	// 1. Check page .rels file (e.g. Documents/1/Pages/_rels/1.fpage.rels)
+	relsKey := strings.ToLower(filepath.ToSlash(filepath.Join(dir, "_rels", base+".rels")))
+	if relsFile, ok := filesByLower[relsKey]; ok {
+		if rc, err := relsFile.Open(); err == nil {
+			relsData, _ := io.ReadAll(io.LimitReader(rc, 32*1024))
+			_ = rc.Close()
+			for _, m := range xpsRelsTargetRe.FindAllSubmatch(relsData, -1) {
+				target := strings.ToLower(string(m[1]))
+				if !strings.Contains(target, "_pt.xml") && !strings.Contains(target, "printticket") {
+					continue
+				}
+				resolved := strings.ToLower(strings.TrimLeft(filepath.ToSlash(filepath.Clean(filepath.Join(dir, target))), "/"))
+				if orient, found := ptByLower[resolved]; found {
+					return orient
+				}
+			}
+		}
+	}
+
+	// 2. Match Metadata/Page<N>_PT.xml or <stem>_PT.xml
+	for name, orient := range ptByLower {
+		ptBase := filepath.Base(name)
+		if strings.EqualFold(ptBase, "page"+stem+"_pt.xml") || strings.EqualFold(ptBase, stem+"_pt.xml") {
+			return orient
+		}
+	}
+
+	return fallback
 }
 
 func naturalLess(a, b string) bool {
@@ -761,7 +1035,8 @@ func finalizeMultiPageGeometry(pages []pageDimensions, geom *DocumentGeometry) {
 }
 
 // matchStandardPaper matches short and long edge dimensions in points to a standard paper size
-// supported by SumatraPDF/GDI print settings (A2, A3, A4, A5, Letter, Legal, Tabloid).
+// supported by SumatraPDF/GDI print settings (A2, A3, A4, A5, A6, Letter, Legal, Tabloid, Statement).
+// Custom/non-standard dimensions return "" so noscale never clips them onto an incompatible paper size.
 func matchStandardPaper(shortPt, longPt float64) string {
 	// 1. A4 check (595.28 x 841.89 pt): tolerance +/- 12 pt
 	if math.Abs(shortPt-a4ShortPt) <= 12.0 && math.Abs(longPt-a4LongPt) <= 12.0 {
@@ -793,37 +1068,23 @@ func matchStandardPaper(shortPt, longPt float64) string {
 		return "A5"
 	}
 
-	// 7. Tabloid / Ledger check (792.0 x 1224.0 pt): tolerance +/- 20 pt
+	// 7. A6 check (297.64 x 419.53 pt): tolerance +/- 10 pt
+	if math.Abs(shortPt-a6ShortPt) <= 10.0 && math.Abs(longPt-a6LongPt) <= 10.0 {
+		return "A6"
+	}
+
+	// 8. Statement check (396.0 x 612.0 pt): tolerance +/- 10 pt
+	if math.Abs(shortPt-stmtShortPt) <= 10.0 && math.Abs(longPt-stmtLongPt) <= 10.0 {
+		return "Statement"
+	}
+
+	// 9. Tabloid / Ledger check (792.0 x 1224.0 pt): tolerance +/- 20 pt
 	if math.Abs(shortPt-tabShortPt) <= 20.0 && math.Abs(longPt-tabLongPt) <= 20.0 {
 		return "Tabloid"
 	}
 
-	// Oversized documents (> A2) have no valid GDI/Sumatra paper name; handled via shrink fallback
-	if isOversizedPaper(shortPt, longPt) {
-		return ""
-	}
-
-	// Fallback by aspect ratio for non-oversized pages
-	if shortPt > 0 {
-		ratio := longPt / shortPt
-		// ISO A-series aspect ratio is sqrt(2) ~ 1.4142
-		if math.Abs(ratio-1.4142) <= 0.08 {
-			if shortPt > 1000 {
-				return "A2"
-			} else if shortPt > 700 {
-				return "A3"
-			} else if shortPt < 500 {
-				return "A5"
-			}
-			return "A4"
-		}
-		// US Letter ratio is 792 / 612 = 1.2941
-		if math.Abs(ratio-1.2941) <= 0.08 {
-			return "Letter"
-		}
-	}
-
-	return "A4" // Default to A4 for international compatibility
+	// Oversized (> A2) or custom/non-standard dimensions: omit forced paper=... so noscale does not clip
+	return ""
 }
 
 func isValidSumatraPaperName(name string) bool {
@@ -871,4 +1132,47 @@ func BuildPrintSettings(geom DocumentGeometry) string {
 	settings = append(settings, scale)
 
 	return strings.Join(settings, ",")
+}
+
+// BuildPrintSettingsWithOptions builds SumatraPDF -print-settings with optional PrintOptions overrides.
+func BuildPrintSettingsWithOptions(geom DocumentGeometry, opts PrintOptions) string {
+	merged := applyPrintOptionsToGeometry(geom, opts)
+	base := BuildPrintSettings(merged)
+
+	var extra []string
+	if opts.Copies > 1 {
+		extra = append(extra, fmt.Sprintf("%dx", opts.Copies))
+	}
+	if opts.Color != nil {
+		if *opts.Color {
+			extra = append(extra, "color")
+		} else {
+			extra = append(extra, "monochrome")
+		}
+	}
+	if len(extra) == 0 {
+		return base
+	}
+	if base == "" {
+		return strings.Join(extra, ",")
+	}
+	return base + "," + strings.Join(extra, ",")
+}
+
+func applyPrintOptionsToGeometry(geom DocumentGeometry, opts PrintOptions) DocumentGeometry {
+	if p := strings.TrimSpace(opts.PaperSize); p != "" {
+		geom.PaperName = p
+		geom.MixedSizes = false
+	}
+	if o := strings.ToLower(strings.TrimSpace(opts.Orientation)); o == "portrait" || o == "landscape" {
+		geom.Orientation = o
+		geom.MixedOrientations = false
+	}
+	if opts.PageCount > 0 {
+		geom.PageCount = opts.PageCount
+	}
+	if s := strings.TrimSpace(opts.ScaleMode); s != "" {
+		geom.ScaleMode = s
+	}
+	return geom
 }

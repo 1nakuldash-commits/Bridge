@@ -4,10 +4,13 @@ import (
 	"archive/zip"
 	"bytes"
 	"compress/zlib"
+	"encoding/binary"
 	"fmt"
 	"image"
 	"image/color"
+	"image/jpeg"
 	"image/png"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -524,5 +527,192 @@ func TestDetectDocumentGeometryImage_ScalingMode(t *testing.T) {
 	s := BuildPrintSettings(geom)
 	if strings.Contains(s, "noscale") || !strings.Contains(s, "fit") {
 		t.Errorf("Expected image print settings to use 'fit' and not 'noscale', got %q", s)
+	}
+	if geom.WidthPt <= 0 || geom.HeightPt <= 0 || geom.WidthPt <= geom.HeightPt {
+		t.Errorf("Expected positive landscape WidthPt > HeightPt for 200x100 PNG, got %.2fx%.2f", geom.WidthPt, geom.HeightPt)
+	}
+}
+
+func TestDetectDocumentGeometryPDF_PrefersCropBoxOverMediaBox(t *testing.T) {
+	tempDir := t.TempDir()
+	pdfPath := filepath.Join(tempDir, "crop_over_media.pdf")
+
+	// MediaBox is Letter (612x792), CropBox is A5 (419.53x595.28)
+	pdfContent := `%PDF-1.4
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [3 0 R] /Count 1 >>
+endobj
+3 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612.0 792.0] /CropBox [0 0 419.53 595.28] >>
+endobj
+trailer
+<< /Size 4 /Root 1 0 R >>
+%%EOF`
+	if err := os.WriteFile(pdfPath, []byte(pdfContent), 0644); err != nil {
+		t.Fatalf("write pdf: %v", err)
+	}
+
+	geom := DetectDocumentGeometry(pdfPath)
+	if geom.PaperName != "A5" {
+		t.Errorf("Expected /CropBox to take precedence and detect A5, got %q (%.1fx%.1f)", geom.PaperName, geom.WidthPt, geom.HeightPt)
+	}
+}
+
+func TestDetectDocumentGeometryXPS_PrintTicketLandscape(t *testing.T) {
+	tempDir := t.TempDir()
+	xpsPath := filepath.Join(tempDir, "pt_landscape.xps")
+
+	f, err := os.Create(xpsPath)
+	if err != nil {
+		t.Fatalf("create xps: %v", err)
+	}
+	zw := zip.NewWriter(f)
+
+	w1, _ := zw.Create("Documents/1/Pages/1.fpage")
+	_, _ = w1.Write([]byte(`<FixedPage xmlns="http://schemas.microsoft.com/xps/2005/06" Width="793.7" Height="1122.5"/>`))
+
+	wPT, _ := zw.Create("Documents/1/Metadata/Page1_PT.xml")
+	_, _ = wPT.Write([]byte(`<?xml version="1.0" encoding="utf-8"?>
+<psf:PrintTicket xmlns:psf="http://schemas.microsoft.com/windows/2003/08/printing/printschemaframework" xmlns:psk="http://schemas.microsoft.com/windows/2003/08/printing/printschemakeywords">
+  <psf:Feature name="psk:PageOrientation">
+    <psf:Option name="psk:Landscape" />
+  </psf:Feature>
+</psf:PrintTicket>`))
+	_ = zw.Close()
+	_ = f.Close()
+
+	geom := DetectDocumentGeometry(xpsPath)
+	if geom.Orientation != "landscape" {
+		t.Errorf("Expected PrintTicket Landscape to yield landscape orientation, got %q", geom.Orientation)
+	}
+	if geom.WidthPt <= geom.HeightPt {
+		t.Errorf("Expected WidthPt > HeightPt for landscape XPS, got %.2fx%.2f", geom.WidthPt, geom.HeightPt)
+	}
+}
+
+func buildTestTIFF(width, height uint32, orient uint16, littleEndian bool) []byte {
+	var order binary.ByteOrder = binary.BigEndian
+	magic := []byte("MM\x00*")
+	if littleEndian {
+		order = binary.LittleEndian
+		magic = []byte("II*\x00")
+	}
+
+	var buf bytes.Buffer
+	buf.Write(magic)
+	_ = binary.Write(&buf, order, uint32(8)) // IFD0 at offset 8
+
+	_ = binary.Write(&buf, order, uint16(3)) // 3 entries
+
+	writeEntry := func(tag, ftype uint16, val uint32) {
+		_ = binary.Write(&buf, order, tag)
+		_ = binary.Write(&buf, order, ftype)
+		_ = binary.Write(&buf, order, uint32(1))
+		if ftype == 3 {
+			_ = binary.Write(&buf, order, uint16(val))
+			_ = binary.Write(&buf, order, uint16(0))
+		} else {
+			_ = binary.Write(&buf, order, val)
+		}
+	}
+	writeEntry(0x0100, 4, width)
+	writeEntry(0x0101, 4, height)
+	writeEntry(0x0112, 3, uint32(orient))
+	_ = binary.Write(&buf, order, uint32(0)) // next IFD
+	return buf.Bytes()
+}
+
+func injectJPEGExifOrientation(t *testing.T, rawJPEG []byte, orient uint16) []byte {
+	t.Helper()
+	if len(rawJPEG) < 2 || rawJPEG[0] != 0xFF || rawJPEG[1] != 0xD8 {
+		t.Fatalf("invalid JPEG header")
+	}
+	// Build minimal TIFF with 1 IFD0 entry (Orientation 0x0112)
+	var tiff bytes.Buffer
+	tiff.WriteString("II*\x00")
+	_ = binary.Write(&tiff, binary.LittleEndian, uint32(8))
+	_ = binary.Write(&tiff, binary.LittleEndian, uint16(1))
+	_ = binary.Write(&tiff, binary.LittleEndian, uint16(0x0112))
+	_ = binary.Write(&tiff, binary.LittleEndian, uint16(3))
+	_ = binary.Write(&tiff, binary.LittleEndian, uint32(1))
+	_ = binary.Write(&tiff, binary.LittleEndian, orient)
+	_ = binary.Write(&tiff, binary.LittleEndian, uint16(0))
+	_ = binary.Write(&tiff, binary.LittleEndian, uint32(0))
+
+	app1Payload := append([]byte("Exif\x00\x00"), tiff.Bytes()...)
+	segLen := uint16(len(app1Payload) + 2)
+
+	var out bytes.Buffer
+	out.Write(rawJPEG[:2])
+	out.Write([]byte{0xFF, 0xE1})
+	_ = binary.Write(&out, binary.BigEndian, segLen)
+	out.Write(app1Payload)
+	out.Write(rawJPEG[2:])
+	return out.Bytes()
+}
+
+func TestDetectDocumentGeometryImage_EXIFOrientationAndTIFF(t *testing.T) {
+	tempDir := t.TempDir()
+
+	// 1. Landscape pixel JPEG (160x80) with EXIF Orientation=6 (rotated 90 deg CW -> portrait)
+	img := image.NewRGBA(image.Rect(0, 0, 160, 80))
+	var jpgBuf bytes.Buffer
+	if err := jpeg.Encode(&jpgBuf, img, nil); err != nil {
+		t.Fatalf("jpeg encode: %v", err)
+	}
+	exifJPG := injectJPEGExifOrientation(t, jpgBuf.Bytes(), 6)
+	jpgPath := filepath.Join(tempDir, "phone_portrait.jpg")
+	if err := os.WriteFile(jpgPath, exifJPG, 0644); err != nil {
+		t.Fatalf("write jpg: %v", err)
+	}
+
+	geomJPG := DetectDocumentGeometry(jpgPath)
+	if geomJPG.Orientation != "portrait" {
+		t.Errorf("Expected portrait for 160x80 JPEG with EXIF orient=6, got %q", geomJPG.Orientation)
+	}
+	if math.Abs(geomJPG.WidthPt-60.0) > 0.1 || math.Abs(geomJPG.HeightPt-120.0) > 0.1 {
+		t.Errorf("Expected swapped 60x120 pt for EXIF orient=6, got %.2fx%.2f", geomJPG.WidthPt, geomJPG.HeightPt)
+	}
+
+	// 2. TIFF little-endian 400x200 (landscape) & big-endian 400x200 with orient=8 (portrait)
+	tifLE := filepath.Join(tempDir, "scan_le.tif")
+	_ = os.WriteFile(tifLE, buildTestTIFF(400, 200, 1, true), 0644)
+	geomTifLE := DetectDocumentGeometry(tifLE)
+	if geomTifLE.Format != ".tif" || geomTifLE.Orientation != "landscape" {
+		t.Errorf("Expected .tif landscape, got format=%q orient=%q", geomTifLE.Format, geomTifLE.Orientation)
+	}
+	if math.Abs(geomTifLE.WidthPt-300.0) > 0.1 || math.Abs(geomTifLE.HeightPt-150.0) > 0.1 {
+		t.Errorf("Expected 300x150 pt for 400x200 TIFF, got %.2fx%.2f", geomTifLE.WidthPt, geomTifLE.HeightPt)
+	}
+
+	tifBE := filepath.Join(tempDir, "scan_be.tiff")
+	_ = os.WriteFile(tifBE, buildTestTIFF(400, 200, 8, false), 0644)
+	geomTifBE := DetectDocumentGeometry(tifBE)
+	if geomTifBE.Orientation != "portrait" || geomTifBE.WidthPt >= geomTifBE.HeightPt {
+		t.Errorf("Expected portrait 150x300 pt for big-endian TIFF orient=8, got %q %.2fx%.2f",
+			geomTifBE.Orientation, geomTifBE.WidthPt, geomTifBE.HeightPt)
+	}
+}
+
+func TestMatchStandardPaper_A6_Statement_AndCustom(t *testing.T) {
+	tests := []struct {
+		short float64
+		long  float64
+		want  string
+	}{
+		{297.64, 419.53, "A6"},
+		{396.0, 612.0, "Statement"},
+		{500.0, 707.0, ""}, // Custom ISO-ratio size must NOT coerce to A5 (419x595)
+		{300.0, 300.0, ""}, // Square custom size must NOT coerce to A4
+		{612.0, 936.0, ""}, // Foolscap/Folio must NOT coerce to A4
+	}
+	for _, tc := range tests {
+		got := matchStandardPaper(tc.short, tc.long)
+		if got != tc.want {
+			t.Errorf("matchStandardPaper(%.2f, %.2f) = %q; want %q", tc.short, tc.long, got, tc.want)
+		}
 	}
 }

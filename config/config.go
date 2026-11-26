@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net"
 	"net/url"
 	"os"
@@ -15,35 +16,64 @@ import (
 
 // PeerDevice represents a remote Bridge node in the multi-device network.
 type PeerDevice struct {
-	Name       string    `json:"name"`                  // Friendly name (e.g. "Unit 1", "Unit 2")
-	CustomName bool      `json:"custom_name,omitempty"` // True when user explicitly set a custom local name
-	IP         string    `json:"ip"`                    // Tailscale IPv4 address (e.g. "100.64.1.2")
-	URL        string    `json:"url"`                   // HTTP endpoint (e.g. "http://100.64.1.2:8765")
-	SpoolPort  int       `json:"spool_port,omitempty"`  // Local TCP port for virtual printer (e.g. 9101, 9102)
-	Online     bool      `json:"online,omitempty"`      // Dynamic connectivity state
-	LastSeen   time.Time `json:"last_seen,omitempty"`   // Timestamp of last successful contact
+	Name         string    `json:"name"`                    // Friendly name (e.g. "Unit 1", "Unit 2")
+	CustomName   bool      `json:"custom_name,omitempty"`   // True when user explicitly set a custom local name
+	IP           string    `json:"ip"`                      // Tailscale IPv4 address (e.g. "100.64.1.2")
+	URL          string    `json:"url"`                     // HTTP endpoint (e.g. "http://100.64.1.2:8765")
+	SpoolPort    int       `json:"spool_port,omitempty"`    // Local TCP port for virtual printer (e.g. 9101, 9102)
+	Online       bool      `json:"online,omitempty"`        // Dynamic connectivity state
+	LastSeen     time.Time `json:"last_seen,omitempty"`     // Timestamp of last successful contact
+	PrinterReady *bool     `json:"printer_ready,omitempty"` // nil = unknown/not yet probed, true = connected & ready, false = no physical printer connected
+	PrinterName  string    `json:"printer_name,omitempty"`  // Active physical printer name reported by peer
+}
+
+// IsPrinterKnownMissing reports whether the peer was probed and confirmed to have no ready physical printer.
+func (p PeerDevice) IsPrinterKnownMissing() bool {
+	return p.PrinterReady != nil && !*p.PrinterReady
+}
+
+// IsPrinterReadyOrUnknown reports whether the peer's printer is ready or has not been probed yet.
+func (p PeerDevice) IsPrinterReadyOrUnknown() bool {
+	return p.PrinterReady == nil || *p.PrinterReady
+}
+
+func clonePeerDevice(p PeerDevice) PeerDevice {
+	if p.PrinterReady != nil {
+		ready := *p.PrinterReady
+		p.PrinterReady = &ready
+	}
+	return p
+}
+
+// IgnoredPeer represents a discovered peer that the user explicitly declined or ignored.
+type IgnoredPeer struct {
+	Name      string    `json:"name,omitempty"`
+	IP        string    `json:"ip,omitempty"`
+	URL       string    `json:"url,omitempty"`
+	IgnoredAt time.Time `json:"ignored_at"`
 }
 
 // Config represents the multi-device application configuration.
 type Config struct {
 	mu              sync.RWMutex
-	Configured      bool         `json:"configured,omitempty"`       // Explicitly confirmed by user in setup wizard
-	ConfigPath      string       `json:"-"`
-	NodeName        string       `json:"node_name"`                  // Friendly name of this device (e.g. "Unit 1")
-	PeerName        string       `json:"peer_name,omitempty"`        // Legacy peer name (backward compatibility)
-	PeerURL         string       `json:"peer_url,omitempty"`         // Legacy peer URL (backward compatibility)
-	Peers           []PeerDevice `json:"peers,omitempty"`            // Multi-device peers list
-	ListenPort      int          `json:"listen_port"`                // HTTP API port (default: 8765)
-	AuthToken       string       `json:"auth_token"`                 // Shared secret for X-Bridge-Token
-	SharedDir       string       `json:"shared_dir"`                 // Global shared folder (e.g. C:\Bridge\Shared)
-	PrintDir        string       `json:"print_dir"`                  // e.g. "C:\\Bridge\\Print"
-	SumatraPath     string       `json:"sumatra_path,omitempty"`     // Path to SumatraPDF.exe
-	PrintTimeoutSec int          `json:"print_timeout_sec"`          // Timeout for print execution in seconds (default 45)
-	StateFile       string       `json:"state_file,omitempty"`       // Path to state.json
-	PrintQueueDir   string       `json:"print_queue_dir,omitempty"`  // Staging for incoming print jobs
-	PrintFailedDir  string       `json:"print_failed_dir,omitempty"` // Directory for hung/failed print jobs
-	PrintSentDir    string       `json:"print_sent_dir,omitempty"`   // Directory for successfully uploaded print jobs
-	LogDir          string       `json:"log_dir,omitempty"`          // Directory for log files
+	Configured      bool          `json:"configured,omitempty"`       // Explicitly confirmed by user in setup wizard
+	ConfigPath      string        `json:"-"`
+	NodeName        string        `json:"node_name"`                  // Friendly name of this device (e.g. "Unit 1")
+	PeerName        string        `json:"peer_name,omitempty"`        // Legacy peer name (backward compatibility)
+	PeerURL         string        `json:"peer_url,omitempty"`         // Legacy peer URL (backward compatibility)
+	Peers           []PeerDevice  `json:"peers,omitempty"`            // Multi-device peers list
+	IgnoredPeers    []IgnoredPeer `json:"ignored_peers,omitempty"`    // Explicitly ignored discovery peers
+	ListenPort      int           `json:"listen_port"`                // HTTP API port (default: 8765)
+	AuthToken       string        `json:"auth_token"`                 // Shared secret for X-Bridge-Token
+	SharedDir       string        `json:"shared_dir"`                 // Global shared folder (e.g. C:\Bridge\Shared)
+	PrintDir        string        `json:"print_dir"`                  // e.g. "C:\\Bridge\\Print"
+	SumatraPath     string        `json:"sumatra_path,omitempty"`     // Path to SumatraPDF.exe
+	PrintTimeoutSec int           `json:"print_timeout_sec"`          // Timeout for print execution in seconds (default 120)
+	StateFile       string        `json:"state_file,omitempty"`       // Path to state.json
+	PrintQueueDir   string        `json:"print_queue_dir,omitempty"`  // Staging for incoming print jobs
+	PrintFailedDir  string        `json:"print_failed_dir,omitempty"` // Directory for hung/failed print jobs
+	PrintSentDir    string        `json:"print_sent_dir,omitempty"`   // Directory for successfully uploaded print jobs
+	LogDir          string        `json:"log_dir,omitempty"`          // Directory for log files
 
 	// Backward compatibility field
 	Role string `json:"role,omitempty"`
@@ -61,12 +91,13 @@ func DefaultConfig() *Config {
 		PeerName:        "",
 		PeerURL:         "",
 		Peers:           make([]PeerDevice, 0),
+		IgnoredPeers:    make([]IgnoredPeer, 0),
 		ListenPort:      8765,
 		AuthToken:       "bridge-secret-token",
 		SharedDir:       `C:\Bridge\Shared`,
 		PrintDir:        `C:\Bridge\Print`,
 		SumatraPath:     `C:\BridgeApp\SumatraPDF.exe`,
-		PrintTimeoutSec: 45,
+		PrintTimeoutSec: 120,
 		StateFile:       `C:\BridgeApp\state.json`,
 		PrintQueueDir:   `C:\Bridge\PrintQueue`,
 		PrintFailedDir:  `C:\Bridge\PrintFailed`,
@@ -275,44 +306,29 @@ func LoadConfig(path string) (*Config, error) {
 		}
 	}
 
-	// Ensure each peer has a valid SpoolPort assigned starting at 9101
-	usedPorts := make(map[int]bool)
+	// Never trust persisted online/last_seen/printer runtime state from disk.
 	for i := range cfg.Peers {
-		cfg.Peers[i].URL = strings.TrimRight(strings.TrimSpace(cfg.Peers[i].URL), "/")
-		if cfg.Peers[i].IP == "" && cfg.Peers[i].URL != "" {
-			cfg.Peers[i].IP = ExtractIP(cfg.Peers[i].URL)
-		}
-		if cfg.Peers[i].SpoolPort > 0 {
-			usedPorts[cfg.Peers[i].SpoolPort] = true
-		}
-	}
-	nextPort := 9101
-	for i := range cfg.Peers {
-		if cfg.Peers[i].SpoolPort <= 0 {
-			for usedPorts[nextPort] {
-				nextPort++
-			}
-			cfg.Peers[i].SpoolPort = nextPort
-			usedPorts[nextPort] = true
-			migrated = true
-		}
+		cfg.Peers[i].Online = false
+		cfg.Peers[i].LastSeen = time.Time{}
+		cfg.Peers[i].PrinterReady = nil
+		cfg.Peers[i].PrinterName = ""
 	}
 
-	// Strictly purge self device from Peers slice if erroneously present from prior versions
-	var cleanPeers []PeerDevice
-	for _, p := range cfg.Peers {
-		if !isSelfTarget(p.Name, p.IP, p.URL, cfg.NodeName, cfg.ListenPort) {
-			cleanPeers = append(cleanPeers, p)
-		} else {
-			migrated = true
-		}
-	}
+	// Prune self, normalize endpoints, and deduplicate SpoolPorts (avoiding 9100 and ListenPort).
+	cleanPeers, peersChanged := normalizeAndDeduplicatePeers(cfg.Peers, cfg.NodeName, cfg.ListenPort)
 	cfg.Peers = cleanPeers
+	if peersChanged {
+		migrated = true
+	}
 
-	// Keep legacy fields synchronized with primary peer
+	// Keep legacy fields synchronized with primary peer (or cleared when empty).
 	if len(cfg.Peers) > 0 {
 		cfg.PeerName = cfg.Peers[0].Name
 		cfg.PeerURL = cfg.Peers[0].URL
+	} else if cfg.PeerName != "" || cfg.PeerURL != "" {
+		cfg.PeerName = ""
+		cfg.PeerURL = ""
+		migrated = true
 	}
 
 	// Normalize legacy peer URL if present
@@ -326,7 +342,7 @@ func LoadConfig(path string) (*Config, error) {
 		return nil, errors.New("auth_token cannot be empty")
 	}
 	if cfg.PrintTimeoutSec <= 0 {
-		cfg.PrintTimeoutSec = 45
+		cfg.PrintTimeoutSec = 120
 	}
 	if cfg.StateFile == "" {
 		cfg.StateFile = filepath.Join(filepath.Dir(path), "state.json")
@@ -345,10 +361,128 @@ func LoadConfig(path string) (*Config, error) {
 	}
 
 	if migrated {
-		_ = SaveConfig(path, cfg)
+		if err := SaveConfig(path, cfg); err != nil {
+			return nil, fmt.Errorf("failed to persist migrated config %s: %w", path, err)
+		}
 	}
 
 	return cfg, nil
+}
+
+// normalizeAndDeduplicatePeers strips self entries, normalizes URL/IP fields,
+// and assigns unique spool ports starting at 9101 (avoiding 9100 and listenPort).
+func normalizeAndDeduplicatePeers(peers []PeerDevice, nodeName string, listenPort int) ([]PeerDevice, bool) {
+	changed := false
+	usedPorts := map[int]bool{9100: true}
+	if listenPort > 0 {
+		usedPorts[listenPort] = true
+	}
+
+	cleanPeers := make([]PeerDevice, 0, len(peers))
+	for _, p := range peers {
+		if isSelfTarget(p.Name, p.IP, p.URL, nodeName, listenPort) {
+			changed = true
+			continue
+		}
+		origURL := p.URL
+		origIP := p.IP
+		p.Name = strings.TrimSpace(p.Name)
+		p.IP = strings.TrimSpace(p.IP)
+		p.URL = strings.TrimRight(strings.TrimSpace(p.URL), "/")
+		if p.IP == "" && p.URL != "" {
+			p.IP = ExtractIP(p.URL)
+		}
+		if p.URL == "" && p.IP != "" {
+			p.URL = fmt.Sprintf("http://%s:8765", p.IP)
+		}
+		if p.URL != origURL || p.IP != origIP {
+			changed = true
+		}
+
+		if p.SpoolPort > 0 && !usedPorts[p.SpoolPort] {
+			usedPorts[p.SpoolPort] = true
+		} else {
+			if p.SpoolPort != 0 {
+				changed = true
+			}
+			p.SpoolPort = 0
+		}
+		cleanPeers = append(cleanPeers, p)
+	}
+
+	nextPort := 9101
+	for i := range cleanPeers {
+		if cleanPeers[i].SpoolPort <= 0 {
+			for usedPorts[nextPort] {
+				nextPort++
+			}
+			cleanPeers[i].SpoolPort = nextPort
+			usedPorts[nextPort] = true
+			changed = true
+		}
+	}
+
+	return cleanPeers, changed
+}
+
+// isPlaceholderPeerName reports whether name is an auto-generated placeholder
+// such as "Device (<ip>)", the raw IP itself, "Remote PC", or "Peer N".
+func isPlaceholderPeerName(name, ip string) bool {
+	clean := strings.TrimSpace(name)
+	if clean == "" {
+		return true
+	}
+	if ip != "" && (clean == ip || strings.EqualFold(clean, fmt.Sprintf("Device (%s)", ip))) {
+		return true
+	}
+	low := strings.ToLower(clean)
+	if strings.HasPrefix(low, "device (") && strings.HasSuffix(low, ")") {
+		return true
+	}
+	if strings.EqualFold(clean, "Remote PC") {
+		return true
+	}
+	return net.ParseIP(clean) != nil
+}
+
+// findPeerIndexLocked locates a peer by URL -> IP -> Name priority.
+// Caller must hold c.mu (read or write lock).
+func (c *Config) findPeerIndexLocked(target string) int {
+	cleanTarget := strings.TrimRight(strings.TrimSpace(target), "/")
+	if cleanTarget == "" {
+		return -1
+	}
+	for i := range c.Peers {
+		if c.Peers[i].URL != "" && strings.EqualFold(c.Peers[i].URL, cleanTarget) {
+			return i
+		}
+	}
+	for i := range c.Peers {
+		if c.Peers[i].IP != "" && c.Peers[i].IP == cleanTarget {
+			return i
+		}
+	}
+	for i := range c.Peers {
+		if c.Peers[i].Name != "" && strings.EqualFold(c.Peers[i].Name, cleanTarget) {
+			return i
+		}
+	}
+	return -1
+}
+
+// syncLegacyPeerFieldsLocked keeps legacy PeerName/PeerURL synchronized with Peers[0].
+// Caller must hold c.mu.Lock().
+func (c *Config) syncLegacyPeerFieldsLocked() bool {
+	if len(c.Peers) > 0 {
+		changed := c.PeerName != c.Peers[0].Name || c.PeerURL != c.Peers[0].URL
+		c.PeerName = c.Peers[0].Name
+		c.PeerURL = c.Peers[0].URL
+		return changed
+	}
+	changed := c.PeerName != "" || c.PeerURL != ""
+	c.PeerName = ""
+	c.PeerURL = ""
+	return changed
 }
 
 // GetNodeName returns the current node's friendly name.
@@ -378,6 +512,7 @@ func (c *Config) SetNodeName(name string) error {
 		}
 	}
 	c.Peers = cleanPeers
+	c.syncLegacyPeerFieldsLocked()
 	configPath := c.ConfigPath
 	c.mu.Unlock()
 
@@ -392,27 +527,18 @@ func (c *Config) GetPeers() []PeerDevice {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	res := make([]PeerDevice, len(c.Peers))
-	copy(res, c.Peers)
+	for i, p := range c.Peers {
+		res[i] = clonePeerDevice(p)
+	}
 	return res
 }
 
 // SetPeers thread-safely updates the peers list and saves configuration.
 func (c *Config) SetPeers(peers []PeerDevice) error {
 	c.mu.Lock()
-	c.Peers = make([]PeerDevice, 0, len(peers))
-	for _, p := range peers {
-		if isSelfTarget(p.Name, p.IP, p.URL, c.NodeName, c.ListenPort) {
-			continue // Strictly exclude self device from peers
-		}
-		c.Peers = append(c.Peers, p)
-	}
-	if len(c.Peers) > 0 {
-		c.PeerName = c.Peers[0].Name
-		c.PeerURL = c.Peers[0].URL
-	} else {
-		c.PeerName = ""
-		c.PeerURL = ""
-	}
+	cleanPeers, _ := normalizeAndDeduplicatePeers(peers, c.NodeName, c.ListenPort)
+	c.Peers = cleanPeers
+	c.syncLegacyPeerFieldsLocked()
 	configPath := c.ConfigPath
 	c.mu.Unlock()
 
@@ -440,53 +566,58 @@ func (c *Config) SetPeerOnlineStatus(target string, online bool) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	cleanTarget := strings.TrimRight(strings.TrimSpace(target), "/")
-	if cleanTarget == "" {
+	idx := c.findPeerIndexLocked(target)
+	if idx == -1 {
 		return false
 	}
-
-	for i := range c.Peers {
-		if strings.EqualFold(c.Peers[i].Name, cleanTarget) || strings.EqualFold(c.Peers[i].URL, cleanTarget) || c.Peers[i].IP == cleanTarget {
-			c.Peers[i].Online = online
-			if online {
-				c.Peers[i].LastSeen = time.Now()
-			}
-			return true
-		}
+	c.Peers[idx].Online = online
+	if online {
+		c.Peers[idx].LastSeen = time.Now()
 	}
-	return false
+	return true
+}
+
+// SetPeerPrinterStatus thread-safely updates the transient printer readiness state of a peer.
+func (c *Config) SetPeerPrinterStatus(target string, ready bool, printerName string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	idx := c.findPeerIndexLocked(target)
+	if idx == -1 {
+		return false
+	}
+	readyCopy := ready
+	c.Peers[idx].PrinterReady = &readyCopy
+	c.Peers[idx].PrinterName = strings.TrimSpace(printerName)
+	return true
 }
 
 // SetPeerName updates a peer's friendly name and saves config unless the peer uses a local custom name.
 func (c *Config) SetPeerName(target, newName string) bool {
 	cleanName := strings.TrimSpace(newName)
-	cleanTarget := strings.TrimRight(strings.TrimSpace(target), "/")
-	if cleanName == "" || cleanTarget == "" {
+	if cleanName == "" || strings.TrimSpace(target) == "" {
 		return false
 	}
 
 	c.mu.Lock()
 	changed := false
-	for i := range c.Peers {
-		if strings.EqualFold(c.Peers[i].Name, cleanTarget) || strings.EqualFold(c.Peers[i].URL, cleanTarget) || c.Peers[i].IP == cleanTarget {
-			if c.Peers[i].CustomName {
-				break
-			}
-			if c.Peers[i].Name != cleanName {
-				c.Peers[i].Name = cleanName
-				changed = true
-			}
-			break
+	idx := c.findPeerIndexLocked(target)
+	if idx != -1 && !c.Peers[idx].CustomName {
+		if c.Peers[idx].Name != cleanName {
+			c.Peers[idx].Name = cleanName
+			changed = true
 		}
 	}
-	if changed && len(c.Peers) > 0 {
-		c.PeerName = c.Peers[0].Name
+	if changed {
+		c.syncLegacyPeerFieldsLocked()
 	}
 	configPath := c.ConfigPath
 	c.mu.Unlock()
 
 	if changed && configPath != "" {
-		_ = SaveConfig(configPath, c)
+		if err := SaveConfig(configPath, c); err != nil {
+			log.Printf("[Config] Warning: failed to save config after SetPeerName: %v", err)
+		}
 	}
 	return changed
 }
@@ -494,35 +625,12 @@ func (c *Config) SetPeerName(target, newName string) bool {
 // SetPeerCustomName sets a peer's friendly name and CustomName flag, saving config if changed.
 func (c *Config) SetPeerCustomName(target, customName string, custom bool) bool {
 	cleanName := strings.TrimSpace(customName)
-	cleanTarget := strings.TrimRight(strings.TrimSpace(target), "/")
-	if cleanName == "" || cleanTarget == "" {
+	if cleanName == "" || strings.TrimSpace(target) == "" {
 		return false
 	}
 
 	c.mu.Lock()
-	idx := -1
-	for i := range c.Peers {
-		if strings.EqualFold(c.Peers[i].URL, cleanTarget) {
-			idx = i
-			break
-		}
-	}
-	if idx == -1 {
-		for i := range c.Peers {
-			if c.Peers[i].IP == cleanTarget {
-				idx = i
-				break
-			}
-		}
-	}
-	if idx == -1 {
-		for i := range c.Peers {
-			if strings.EqualFold(c.Peers[i].Name, cleanTarget) {
-				idx = i
-				break
-			}
-		}
-	}
+	idx := c.findPeerIndexLocked(target)
 
 	changed := false
 	if idx != -1 {
@@ -532,14 +640,16 @@ func (c *Config) SetPeerCustomName(target, customName string, custom bool) bool 
 			changed = true
 		}
 	}
-	if changed && len(c.Peers) > 0 {
-		c.PeerName = c.Peers[0].Name
+	if changed {
+		c.syncLegacyPeerFieldsLocked()
 	}
 	configPath := c.ConfigPath
 	c.mu.Unlock()
 
 	if changed && configPath != "" {
-		_ = SaveConfig(configPath, c)
+		if err := SaveConfig(configPath, c); err != nil {
+			log.Printf("[Config] Warning: failed to save config after SetPeerCustomName: %v", err)
+		}
 	}
 	return changed
 }
@@ -550,18 +660,24 @@ func (c *Config) AllocateSpoolPort(name string) int {
 	defer c.mu.Unlock()
 
 	for _, p := range c.Peers {
-		if strings.EqualFold(p.Name, name) && p.SpoolPort > 0 {
+		if strings.EqualFold(p.Name, name) && p.SpoolPort > 0 && p.SpoolPort != 9100 && p.SpoolPort != c.ListenPort {
 			return p.SpoolPort
 		}
 	}
 
-	used := make(map[int]bool)
-	for _, p := range c.Peers {
-		if p.SpoolPort > 0 {
+	return c.nextAvailableSpoolPortLocked(-1)
+}
+
+func (c *Config) nextAvailableSpoolPortLocked(excludeIdx int) int {
+	used := map[int]bool{9100: true}
+	if c.ListenPort > 0 {
+		used[c.ListenPort] = true
+	}
+	for i, p := range c.Peers {
+		if i != excludeIdx && p.SpoolPort > 0 {
 			used[p.SpoolPort] = true
 		}
 	}
-
 	port := 9101
 	for used[port] {
 		port++
@@ -569,7 +685,49 @@ func (c *Config) AllocateSpoolPort(name string) int {
 	return port
 }
 
-// AddOrUpdatePeer adds a peer device or updates an existing matching peer by IP, URL, or Name.
+func (c *Config) hasPeerNameCollisionLocked(name string, excludeIdx int) bool {
+	if name == "" {
+		return false
+	}
+	for i, p := range c.Peers {
+		if i != excludeIdx && strings.EqualFold(p.Name, name) {
+			return true
+		}
+	}
+	return false
+}
+
+// HasPeerNameCollision reports whether a different peer already uses the given friendly name.
+func (c *Config) HasPeerNameCollision(name, ip, peerURL string) bool {
+	cleanName := strings.TrimSpace(name)
+	cleanIP := strings.TrimSpace(ip)
+	cleanURL := strings.TrimRight(strings.TrimSpace(peerURL), "/")
+	if cleanIP == "" && cleanURL != "" {
+		cleanIP = ExtractIP(cleanURL)
+	}
+	if cleanName == "" {
+		return false
+	}
+
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	for _, p := range c.Peers {
+		if !strings.EqualFold(p.Name, cleanName) {
+			continue
+		}
+		if cleanURL != "" && p.URL != "" && strings.EqualFold(cleanURL, p.URL) {
+			continue
+		}
+		if cleanIP != "" && p.IP != "" && cleanIP == p.IP {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+// AddOrUpdatePeer adds a peer device or updates an existing matching peer by URL or IP.
+// It avoids silently overwriting a different peer that merely shares a friendly Name.
 // It returns the updated PeerDevice and a boolean indicating if this was a new peer.
 func (c *Config) AddOrUpdatePeer(name, ip, peerURL string) (PeerDevice, bool) {
 	c.mu.Lock()
@@ -593,18 +751,12 @@ func (c *Config) AddOrUpdatePeer(name, ip, peerURL string) (PeerDevice, bool) {
 
 	// Search for existing peer:
 	// Priority 1: Match by exact URL
-	// Priority 2: Match by exact Name (if non-empty)
-	// Priority 3: Match by IP only if URLs and Names do not conflict
+	// Priority 2: Match by IP when URLs do not contradict (supports placeholder/hostname updates)
+	// Priority 3: Match by Name only if neither side provides a conflicting IP/URL
 	idx := -1
-	for i, p := range c.Peers {
-		if cleanURL != "" && strings.EqualFold(p.URL, cleanURL) {
-			idx = i
-			break
-		}
-	}
-	if idx == -1 && cleanName != "" {
+	if cleanURL != "" {
 		for i, p := range c.Peers {
-			if strings.EqualFold(p.Name, cleanName) {
+			if p.URL != "" && strings.EqualFold(p.URL, cleanURL) {
 				idx = i
 				break
 			}
@@ -613,11 +765,21 @@ func (c *Config) AddOrUpdatePeer(name, ip, peerURL string) (PeerDevice, bool) {
 	if idx == -1 && cleanIP != "" {
 		for i, p := range c.Peers {
 			if p.IP == cleanIP {
-				// Don't match if URLs or Names explicitly contradict each other
 				if cleanURL != "" && p.URL != "" && !strings.EqualFold(cleanURL, p.URL) {
 					continue
 				}
-				if cleanName != "" && p.Name != "" && !strings.EqualFold(cleanName, p.Name) {
+				idx = i
+				break
+			}
+		}
+	}
+	if idx == -1 && cleanName != "" && !isPlaceholderPeerName(cleanName, cleanIP) {
+		for i, p := range c.Peers {
+			if strings.EqualFold(p.Name, cleanName) {
+				if cleanURL != "" && p.URL != "" && !strings.EqualFold(cleanURL, p.URL) {
+					continue
+				}
+				if cleanIP != "" && p.IP != "" && cleanIP != p.IP {
 					continue
 				}
 				idx = i
@@ -631,23 +793,19 @@ func (c *Config) AddOrUpdatePeer(name, ip, peerURL string) (PeerDevice, bool) {
 	var dev PeerDevice
 
 	if isNew {
-		// Allocate next available spool port
-		used := make(map[int]bool)
-		for _, p := range c.Peers {
-			if p.SpoolPort > 0 {
-				used[p.SpoolPort] = true
-			}
-		}
-		port := 9101
-		for used[port] {
-			port++
-		}
+		port := c.nextAvailableSpoolPortLocked(-1)
 
 		if cleanName == "" {
 			if cleanIP != "" {
 				cleanName = cleanIP
 			} else {
 				cleanName = fmt.Sprintf("Peer %d", len(c.Peers)+1)
+			}
+		} else if c.hasPeerNameCollisionLocked(cleanName, -1) {
+			if cleanIP != "" {
+				cleanName = fmt.Sprintf("%s (%s)", cleanName, cleanIP)
+			} else {
+				cleanName = fmt.Sprintf("%s (%d)", cleanName, len(c.Peers)+1)
 			}
 		}
 
@@ -668,7 +826,14 @@ func (c *Config) AddOrUpdatePeer(name, ip, peerURL string) (PeerDevice, bool) {
 		prevPort := dev.SpoolPort
 
 		if !dev.CustomName && cleanName != "" && dev.Name != cleanName {
-			dev.Name = cleanName
+			// Do not replace a real friendly name with a placeholder such as "Device (<ip>)".
+			if !isPlaceholderPeerName(cleanName, cleanIP) || isPlaceholderPeerName(dev.Name, dev.IP) {
+				candidateName := cleanName
+				if c.hasPeerNameCollisionLocked(candidateName, idx) && cleanIP != "" {
+					candidateName = fmt.Sprintf("%s (%s)", cleanName, cleanIP)
+				}
+				dev.Name = candidateName
+			}
 		}
 		if cleanIP != "" {
 			dev.IP = cleanIP
@@ -676,18 +841,8 @@ func (c *Config) AddOrUpdatePeer(name, ip, peerURL string) (PeerDevice, bool) {
 		if cleanURL != "" {
 			dev.URL = cleanURL
 		}
-		if dev.SpoolPort <= 0 {
-			used := make(map[int]bool)
-			for i, p := range c.Peers {
-				if i != idx && p.SpoolPort > 0 {
-					used[p.SpoolPort] = true
-				}
-			}
-			port := 9101
-			for used[port] {
-				port++
-			}
-			dev.SpoolPort = port
+		if dev.SpoolPort <= 0 || dev.SpoolPort == 9100 || dev.SpoolPort == c.ListenPort {
+			dev.SpoolPort = c.nextAvailableSpoolPortLocked(idx)
 		}
 		if dev.Name != prevName || dev.IP != prevIP || dev.URL != prevURL || dev.SpoolPort != prevPort {
 			changed = true
@@ -697,60 +852,226 @@ func (c *Config) AddOrUpdatePeer(name, ip, peerURL string) (PeerDevice, bool) {
 		c.Peers[idx] = dev
 	}
 
-	// Update legacy fields to match primary peer
-	if len(c.Peers) > 0 {
-		if c.PeerName != c.Peers[0].Name {
-			c.PeerName = c.Peers[0].Name
-			changed = true
-		}
-		if c.PeerURL != c.Peers[0].URL {
-			c.PeerURL = c.Peers[0].URL
-			changed = true
-		}
+	if c.syncLegacyPeerFieldsLocked() {
+		changed = true
 	}
 	configPath := c.ConfigPath
 	c.mu.Unlock()
 
 	if changed && configPath != "" {
-		_ = SaveConfig(configPath, c)
+		if err := SaveConfig(configPath, c); err != nil {
+			log.Printf("[Config] Warning: failed to save config after AddOrUpdatePeer: %v", err)
+		}
 	}
 
-	return dev, isNew
+	return clonePeerDevice(dev), isNew
 }
 
-// RemovePeer removes a peer by name, IP, or URL.
-func (c *Config) RemovePeer(target string) bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	cleanTarget := strings.TrimRight(strings.TrimSpace(target), "/")
-	if cleanTarget == "" {
-		return false
+// UpdatePeerAddressByName explicitly updates an existing peer's IP and URL by matching its Name
+// (used when a known peer migrates to a new IP/URL). Falls back to AddOrUpdatePeer if no match exists.
+func (c *Config) UpdatePeerAddressByName(name, ip, peerURL string) (PeerDevice, bool) {
+	cleanName := strings.TrimSpace(name)
+	cleanIP := strings.TrimSpace(ip)
+	cleanURL := strings.TrimRight(strings.TrimSpace(peerURL), "/")
+	if cleanIP == "" && cleanURL != "" {
+		cleanIP = ExtractIP(cleanURL)
 	}
+	if cleanURL == "" && cleanIP != "" {
+		cleanURL = fmt.Sprintf("http://%s:8765", cleanIP)
+	}
+	if isSelfTarget(cleanName, cleanIP, cleanURL, c.NodeName, c.ListenPort) {
+		return PeerDevice{}, false
+	}
+
+	c.mu.Lock()
 	idx := -1
-	for i, p := range c.Peers {
-		if strings.EqualFold(p.Name, cleanTarget) || strings.EqualFold(p.URL, cleanTarget) || p.IP == cleanTarget {
-			idx = i
-			break
+	if cleanURL != "" {
+		for i, p := range c.Peers {
+			if p.URL != "" && strings.EqualFold(p.URL, cleanURL) {
+				idx = i
+				break
+			}
+		}
+	}
+	if idx == -1 && cleanName != "" && !isPlaceholderPeerName(cleanName, cleanIP) {
+		for i, p := range c.Peers {
+			if strings.EqualFold(p.Name, cleanName) {
+				idx = i
+				break
+			}
 		}
 	}
 	if idx == -1 {
+		c.mu.Unlock()
+		return c.AddOrUpdatePeer(name, ip, peerURL)
+	}
+
+	dev := c.Peers[idx]
+	changed := false
+	if cleanIP != "" && dev.IP != cleanIP {
+		dev.IP = cleanIP
+		changed = true
+	}
+	if cleanURL != "" && dev.URL != cleanURL {
+		dev.URL = cleanURL
+		changed = true
+	}
+	dev.Online = true
+	dev.LastSeen = time.Now()
+	c.Peers[idx] = dev
+	if c.syncLegacyPeerFieldsLocked() {
+		changed = true
+	}
+	configPath := c.ConfigPath
+	c.mu.Unlock()
+
+	if changed && configPath != "" {
+		if err := SaveConfig(configPath, c); err != nil {
+			log.Printf("[Config] Warning: failed to save config after UpdatePeerAddressByName: %v", err)
+		}
+	}
+	return clonePeerDevice(dev), false
+}
+
+// RemovePeer removes a peer by URL, IP, or Name (in that priority order).
+func (c *Config) RemovePeer(target string) bool {
+	c.mu.Lock()
+	idx := c.findPeerIndexLocked(target)
+	if idx == -1 {
+		c.mu.Unlock()
 		return false
 	}
 
 	c.Peers = append(c.Peers[:idx], c.Peers[idx+1:]...)
-	if len(c.Peers) > 0 {
-		c.PeerName = c.Peers[0].Name
-		c.PeerURL = c.Peers[0].URL
-	} else {
-		c.PeerName = ""
-		c.PeerURL = ""
-	}
+	c.syncLegacyPeerFieldsLocked()
+	configPath := c.ConfigPath
+	c.mu.Unlock()
 
-	if c.ConfigPath != "" {
-		_ = SaveConfig(c.ConfigPath, c)
+	if configPath != "" {
+		if err := SaveConfig(configPath, c); err != nil {
+			log.Printf("[Config] Warning: failed to save config after RemovePeer: %v", err)
+		}
 	}
 	return true
+}
+
+// AddIgnoredPeer records a discovered peer as ignored/declined and persists config if ConfigPath is set.
+func (c *Config) AddIgnoredPeer(name, ip, peerURL string) error {
+	cleanName := strings.TrimSpace(name)
+	cleanIP := strings.TrimSpace(ip)
+	cleanURL := strings.TrimRight(strings.TrimSpace(peerURL), "/")
+	if cleanIP == "" && cleanURL != "" {
+		cleanIP = ExtractIP(cleanURL)
+	}
+	if cleanName == "" && cleanIP == "" && cleanURL == "" {
+		return nil
+	}
+
+	c.mu.Lock()
+	now := time.Now()
+	updated := false
+	for i := range c.IgnoredPeers {
+		ig := &c.IgnoredPeers[i]
+		matchURL := cleanURL != "" && ig.URL != "" && strings.EqualFold(ig.URL, cleanURL)
+		matchIP := cleanIP != "" && ig.IP != "" && ig.IP == cleanIP
+		matchName := cleanName != "" && ig.Name != "" && strings.EqualFold(ig.Name, cleanName) &&
+			(cleanIP == "" || ig.IP == "" || cleanIP == ig.IP)
+		if matchURL || matchIP || matchName {
+			if cleanName != "" {
+				ig.Name = cleanName
+			}
+			if cleanIP != "" {
+				ig.IP = cleanIP
+			}
+			if cleanURL != "" {
+				ig.URL = cleanURL
+			}
+			ig.IgnoredAt = now
+			updated = true
+			break
+		}
+	}
+	if !updated {
+		c.IgnoredPeers = append(c.IgnoredPeers, IgnoredPeer{
+			Name:      cleanName,
+			IP:        cleanIP,
+			URL:       cleanURL,
+			IgnoredAt: now,
+		})
+	}
+	configPath := c.ConfigPath
+	c.mu.Unlock()
+
+	if configPath != "" {
+		return SaveConfig(configPath, c)
+	}
+	return nil
+}
+
+// RemoveIgnoredPeer removes matching entries from IgnoredPeers by URL, IP, or Name and persists config.
+func (c *Config) RemoveIgnoredPeer(target string) error {
+	cleanTarget := strings.TrimRight(strings.TrimSpace(target), "/")
+	if cleanTarget == "" {
+		return nil
+	}
+
+	c.mu.Lock()
+	filtered := make([]IgnoredPeer, 0, len(c.IgnoredPeers))
+	removed := false
+	for _, ig := range c.IgnoredPeers {
+		if (ig.URL != "" && strings.EqualFold(ig.URL, cleanTarget)) ||
+			(ig.IP != "" && ig.IP == cleanTarget) ||
+			(ig.Name != "" && strings.EqualFold(ig.Name, cleanTarget)) {
+			removed = true
+			continue
+		}
+		filtered = append(filtered, ig)
+	}
+	c.IgnoredPeers = filtered
+	configPath := c.ConfigPath
+	c.mu.Unlock()
+
+	if removed && configPath != "" {
+		return SaveConfig(configPath, c)
+	}
+	return nil
+}
+
+// IsPeerIgnored reports whether a discovered peer matches an entry in IgnoredPeers.
+func (c *Config) IsPeerIgnored(name, ip, peerURL string) bool {
+	cleanName := strings.TrimSpace(name)
+	cleanIP := strings.TrimSpace(ip)
+	cleanURL := strings.TrimRight(strings.TrimSpace(peerURL), "/")
+	if cleanIP == "" && cleanURL != "" {
+		cleanIP = ExtractIP(cleanURL)
+	}
+
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	for _, ig := range c.IgnoredPeers {
+		if cleanURL != "" && ig.URL != "" && strings.EqualFold(ig.URL, cleanURL) {
+			return true
+		}
+		if cleanIP != "" && ig.IP != "" && ig.IP == cleanIP {
+			return true
+		}
+		if cleanName != "" && ig.Name != "" && strings.EqualFold(ig.Name, cleanName) {
+			if cleanIP != "" && ig.IP != "" && cleanIP != ig.IP {
+				continue
+			}
+			return true
+		}
+	}
+	return false
+}
+
+// GetIgnoredPeers returns a copy of all ignored discovery peers.
+func (c *Config) GetIgnoredPeers() []IgnoredPeer {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	res := make([]IgnoredPeer, len(c.IgnoredPeers))
+	copy(res, c.IgnoredPeers)
+	return res
 }
 
 // FindPeer finds a peer by name, IP, or URL.
@@ -765,21 +1086,21 @@ func (c *Config) FindPeer(target string) *PeerDevice {
 	// Try Name first
 	for _, p := range c.Peers {
 		if strings.EqualFold(p.Name, cleanTarget) {
-			cp := p
+			cp := clonePeerDevice(p)
 			return &cp
 		}
 	}
 	// Try URL
 	for _, p := range c.Peers {
 		if strings.EqualFold(p.URL, cleanTarget) {
-			cp := p
+			cp := clonePeerDevice(p)
 			return &cp
 		}
 	}
 	// Try IP
 	for _, p := range c.Peers {
 		if p.IP == cleanTarget {
-			cp := p
+			cp := clonePeerDevice(p)
 			return &cp
 		}
 	}
@@ -793,7 +1114,7 @@ func (c *Config) FindPeerBySpoolPort(port int) *PeerDevice {
 
 	for _, p := range c.Peers {
 		if p.SpoolPort == port {
-			cp := p
+			cp := clonePeerDevice(p)
 			return &cp
 		}
 	}
@@ -875,11 +1196,49 @@ func (c *Config) UpdatePeerURL(newURL string) error {
 	return nil
 }
 
-// SaveConfig writes the configuration to a JSON file atomically.
+func (c *Config) cloneForPersistenceLocked() *Config {
+	peers := make([]PeerDevice, len(c.Peers))
+	for i, p := range c.Peers {
+		p.Online = false
+		p.LastSeen = time.Time{}
+		p.PrinterReady = nil
+		p.PrinterName = ""
+		peers[i] = p
+	}
+	var ignored []IgnoredPeer
+	if len(c.IgnoredPeers) > 0 {
+		ignored = make([]IgnoredPeer, len(c.IgnoredPeers))
+		copy(ignored, c.IgnoredPeers)
+	}
+	return &Config{
+		Configured:      c.Configured,
+		NodeName:        c.NodeName,
+		PeerName:        c.PeerName,
+		PeerURL:         c.PeerURL,
+		Peers:           peers,
+		IgnoredPeers:    ignored,
+		ListenPort:      c.ListenPort,
+		AuthToken:       c.AuthToken,
+		SharedDir:       c.SharedDir,
+		PrintDir:        c.PrintDir,
+		SumatraPath:     c.SumatraPath,
+		PrintTimeoutSec: c.PrintTimeoutSec,
+		StateFile:       c.StateFile,
+		PrintQueueDir:   c.PrintQueueDir,
+		PrintFailedDir:  c.PrintFailedDir,
+		PrintSentDir:    c.PrintSentDir,
+		LogDir:          c.LogDir,
+		Role:            c.Role,
+	}
+}
+
+// SaveConfig writes the configuration to a JSON file atomically without persisting transient peer online status.
 func SaveConfig(path string, cfg *Config) error {
 	cfg.mu.RLock()
-	data, err := json.MarshalIndent(cfg, "", "  ")
+	snapshot := cfg.cloneForPersistenceLocked()
 	cfg.mu.RUnlock()
+
+	data, err := json.MarshalIndent(snapshot, "", "  ")
 	if err != nil {
 		return err
 	}

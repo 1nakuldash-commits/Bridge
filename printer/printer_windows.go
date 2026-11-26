@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -119,9 +118,11 @@ func enumPrintersWin32() ([]WindowsPrinter, error) {
 		}
 
 		list = append(list, WindowsPrinter{
-			Name:     pName,
-			PortName: portName,
-			Default:  strings.EqualFold(pName, defPrinter),
+			Name:        pName,
+			PortName:    portName,
+			Default:     strings.EqualFold(pName, defPrinter),
+			WorkOffline: (p2Slice[i].Attributes & printerAttributeWorkOffline) != 0,
+			Status:      p2Slice[i].Status,
 		})
 	}
 
@@ -147,12 +148,6 @@ func GetDefaultWindowsPrinter() (string, error) {
 	return syscall.UTF16ToString(buf), nil
 }
 
-var (
-	lastVirtualNotice string
-	lastAutoSelect    string
-	noticeMu          sync.Mutex
-)
-
 // GetTargetPhysicalPrinter detects the true physical printer connected to this machine.
 func GetTargetPhysicalPrinter() (string, error) {
 	// 1. Check current Windows default printer
@@ -163,43 +158,11 @@ func GetTargetPhysicalPrinter() (string, error) {
 	if err != nil && defPrinter != "" && !IsVirtualPrinterName(defPrinter, "") {
 		return defPrinter, nil
 	}
-
-	// If default printer is valid physical printer, verify port and return it
-	if defPrinter != "" {
-		isVirtual := false
-		for _, p := range printers {
-			if strings.EqualFold(p.Name, defPrinter) {
-				if IsVirtualPrinterName(p.Name, p.PortName) {
-					isVirtual = true
-				}
-				break
-			}
-		}
-		if !isVirtual && !IsVirtualPrinterName(defPrinter, "") {
-			return defPrinter, nil
-		}
-		noticeMu.Lock()
-		if lastVirtualNotice != defPrinter {
-			lastVirtualNotice = defPrinter
-			log.Printf("[Printer] Notice: Default printer '%s' is virtual. Searching for physical printer...", defPrinter)
-		}
-		noticeMu.Unlock()
+	if err != nil {
+		return "", errors.New("no physical printer connected on this computer")
 	}
 
-	// Default was virtual or empty: find first physical printer
-	for _, p := range printers {
-		if !IsVirtualPrinterName(p.Name, p.PortName) {
-			noticeMu.Lock()
-			if lastAutoSelect != p.Name {
-				lastAutoSelect = p.Name
-				log.Printf("[Printer] Auto-selected physical printer '%s' (port: %s)", p.Name, p.PortName)
-			}
-			noticeMu.Unlock()
-			return p.Name, nil
-		}
-	}
-
-	return "", errors.New("no physical printer connected on this computer")
+	return resolvePhysicalPrinterFromList(defPrinter, printers)
 }
 
 func hasPhysicalPrinter(printers []WindowsPrinter) bool {
@@ -217,6 +180,14 @@ var (
 	printerQueryMu   sync.Mutex
 )
 
+// InvalidatePrinterCache clears the cached Windows printer enumeration so subsequent queries refresh immediately.
+func InvalidatePrinterCache() {
+	printerQueryMu.Lock()
+	cachedPrinters = nil
+	lastPrinterQuery = time.Time{}
+	printerQueryMu.Unlock()
+}
+
 // hideCmd configures Windows subprocess execution to be completely invisible.
 func hideCmd(cmd *exec.Cmd) {
 	if cmd != nil {
@@ -231,8 +202,8 @@ func queryWindowsPrinters() ([]WindowsPrinter, error) {
 	printerQueryMu.Lock()
 	defer printerQueryMu.Unlock()
 
-	// 30-second debounce cache prevents repeated registry/CIM queries on rapid health checks
-	if len(cachedPrinters) > 0 && time.Since(lastPrinterQuery) < 30*time.Second {
+	// 5-second debounce cache prevents repeated queries on rapid health checks while updating quickly on USB plug/unplug
+	if len(cachedPrinters) > 0 && time.Since(lastPrinterQuery) < 5*time.Second {
 		return cachedPrinters, nil
 	}
 
@@ -434,7 +405,7 @@ func queryPrintersFromCim() ([]WindowsPrinter, error) {
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, "powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
-		"-Command", "@(Get-CimInstance Win32_Printer -ErrorAction SilentlyContinue | Select-Object Name, PortName, Default) | ConvertTo-Json -Compress")
+		"-Command", "@(Get-CimInstance Win32_Printer -ErrorAction SilentlyContinue | Select-Object Name, PortName, Default, WorkOffline) | ConvertTo-Json -Compress")
 	hideCmd(cmd)
 	out, err := cmd.Output()
 	if err != nil {

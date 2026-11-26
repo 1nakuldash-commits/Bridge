@@ -4,6 +4,7 @@ package installer
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -408,69 +409,35 @@ oLink.Save
 	return cmd.Run()
 }
 
-// InstallVirtualPrinter registers a Windows RAW TCP port on 127.0.0.1:port and creates
-// a virtual printer named "Print on <PeerName>".
-func InstallVirtualPrinter(peerName string, port int) error {
-	if strings.TrimSpace(peerName) == "" {
-		return nil
-	}
-	cleanPeer := SanitizeFileName(peerName)
-	if cleanPeer == "" {
-		return nil
-	}
-
-	localNode := ""
-	if cfg, err := config.LoadConfig(TargetConfig); err == nil && cfg.NodeName != "" {
-		localNode = cfg.NodeName
-	}
-	if config.IsSelfTarget(cleanPeer, "", "", localNode, 0) {
-		return nil // Strictly never install virtual printer for self device
-	}
-
-	if port <= 0 {
-		port = 9101
-	}
-	printerName := fmt.Sprintf("Print on %s", cleanPeer)
-	portName := fmt.Sprintf("Bridge_Port_%d", port)
-	const printerAttrWorkOffline = 0x00000400
-
-	// In-Process Fast Registry Check (0 subprocesses, <1ms):
-	// Verify printer exists with matching port, WorkOffline is disabled, and TCP port has SNMP disabled.
-	printerClean := false
-	k, err := registry.OpenKey(registry.LOCAL_MACHINE, `SOFTWARE\Microsoft\Windows NT\CurrentVersion\Print\Printers\`+printerName, registry.QUERY_VALUE)
-	if err == nil {
-		portVal, _, portErr := k.GetStringValue("Port")
-		attrs, _, attrErr := k.GetIntegerValue("Attributes")
-		k.Close()
-
-		if portErr == nil && strings.EqualFold(strings.TrimSpace(portVal), portName) &&
-			attrErr == nil && (attrs&printerAttrWorkOffline) == 0 {
-			pk, pkErr := registry.OpenKey(registry.LOCAL_MACHINE, `SYSTEM\CurrentControlSet\Control\Print\Monitors\Standard TCP/IP Port\Ports\`+portName, registry.QUERY_VALUE)
-			if pkErr == nil {
-				snmpVal, _, snmpErr := pk.GetIntegerValue("SNMP Enabled")
-				portNum, _, numErr := pk.GetIntegerValue("PortNumber")
-				pk.Close()
-				if snmpErr == nil && snmpVal == 0 && numErr == nil && int(portNum) == port {
-					printerClean = true
-				}
-			}
-		}
-	}
-	if printerClean {
-		return nil // Already installed and cleanly configured (SNMP=0, WorkOffline=false)
-	}
-
-	if !IsElevated() {
-		return fmt.Errorf("administrator privileges required to configure virtual printer %q on port %d", printerName, port)
-	}
-
+func buildInstallVirtualPrinterScript(printerName, portName string, port int) string {
 	psPortName := strings.ReplaceAll(portName, `'`, `''`)
 	psPrinterName := strings.ReplaceAll(printerName, `'`, `''`)
 
-	psScript := fmt.Sprintf(`
+	return fmt.Sprintf(`$ErrorActionPreference = 'Stop'
 $portName = '%s'
 $portNumber = %d
 $printerName = '%s'
+
+function Test-BridgeVirtualPrinter {
+    param($p)
+    if (-not $p) { return $true }
+    $n = ([string]$p.Name).ToLowerInvariant().Trim()
+    $pt = ([string]$p.PortName).ToLowerInvariant().Trim()
+    if ($n.StartsWith('print on ')) { return $true }
+    if ($pt.Contains('bridge_tcp_port') -or $pt.Contains('bridge_port_') -or $pt.Contains('bridge - ')) { return $true }
+    if ($pt -eq 'portprompt:' -or $pt -eq 'nul:' -or $pt.StartsWith('file:')) { return $true }
+    $keywords = @(
+        'print to pdf', 'pdf creator', 'pdfcreator', 'pdf24', 'win2pdf', 'clawpdf',
+        'adobe pdf', 'foxit', 'cutepdf', 'bullzip', 'primopdf', 'dopdf', 'novapdf',
+        'nitro pdf', 'soda pdf', 'xps document writer', 'openxps',
+        'generic / text only', 'generic', 'text only',
+        'anydesk', 'fax', 'onenote', 'snagit', 'virtual printer'
+    )
+    foreach ($kw in $keywords) {
+        if ($n.Contains($kw)) { return $true }
+    }
+    return $false
+}
 
 # 1. Protect Windows default printer mode
 Set-ItemProperty "HKCU:\Software\Microsoft\Windows NT\CurrentVersion\Windows" -Name "LegacyDefaultPrinterMode" -Value 1 -Type DWord -ErrorAction SilentlyContinue
@@ -482,18 +449,30 @@ try {
 } catch {}
 
 if (-not (Get-PrinterPort -Name $portName -ErrorAction SilentlyContinue)) {
-    Add-PrinterPort -Name $portName -PrinterHostAddress '127.0.0.1' -PortNumber $portNumber -SNMP 0 -ErrorAction Stop
+    Add-PrinterPort -Name $portName -PrinterHostAddress '127.0.0.1' -PortNumber $portNumber -ErrorAction Stop
 }
 try {
-    Set-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\Print\Monitors\Standard TCP/IP Port\Ports\$portName" -Name "SNMP Enabled" -Value 0 -Type DWord -ErrorAction SilentlyContinue
+    Set-ItemProperty -LiteralPath "HKLM:\SYSTEM\CurrentControlSet\Control\Print\Monitors\Standard TCP/IP Port\Ports\$portName" -Name "SNMP Enabled" -Value 0 -Type DWord -ErrorAction SilentlyContinue
+} catch {}
+try {
+    $wmiPort = Get-CimInstance Win32_TCPIPPrinterPort -Filter "Name = '$($portName.Replace("'", "''"))'" -ErrorAction SilentlyContinue
+    if ($wmiPort) {
+        Set-CimInstance -InputObject $wmiPort -Property @{ SNMPEnabled = $false } -ErrorAction SilentlyContinue
+    }
 } catch {}
 
-$preferredDrivers = @('Microsoft XPS Document Writer v4', 'Microsoft XPS Document Writer', 'OpenXPS Document Writer')
+$preferredDrivers = @('Microsoft Print To PDF', 'Microsoft XPS Document Writer v4', 'Microsoft XPS Document Writer', 'OpenXPS Document Writer')
 $driver = $null
 foreach ($d in $preferredDrivers) {
     if (Get-PrinterDriver -Name $d -ErrorAction SilentlyContinue) {
         $driver = $d
         break
+    }
+}
+if (-not $driver) {
+    try { Add-PrinterDriver -Name 'Microsoft Print To PDF' -ErrorAction SilentlyContinue } catch {}
+    if (Get-PrinterDriver -Name 'Microsoft Print To PDF' -ErrorAction SilentlyContinue) {
+        $driver = 'Microsoft Print To PDF'
     }
 }
 if (-not $driver) {
@@ -509,7 +488,8 @@ if (-not $driver) {
     }
 }
 if (-not $driver) {
-    # If XPS driver was removed in Windows optional features, enable Printing-XPSServices-Features
+    # If neither PDF nor XPS driver is loaded yet, attempt enabling optional features
+    Start-Process -FilePath "dism.exe" -ArgumentList "/Online /Enable-Feature /FeatureName:Printing-PrintToPDFServices-Features /NoRestart /Quiet" -Wait -WindowStyle Hidden -ErrorAction SilentlyContinue
     Start-Process -FilePath "dism.exe" -ArgumentList "/Online /Enable-Feature /FeatureName:Printing-XPSServices-Features /NoRestart /Quiet" -Wait -WindowStyle Hidden -ErrorAction SilentlyContinue
     foreach ($d in $preferredDrivers) {
         if (Get-PrinterDriver -Name $d -ErrorAction SilentlyContinue) {
@@ -536,18 +516,29 @@ if (-not $driver) {
     }
 }
 if (-not $driver) {
-    if (Get-PrinterDriver -Name 'Microsoft Print To PDF' -ErrorAction SilentlyContinue) {
-        $driver = 'Microsoft Print To PDF'
-    }
-}
-if (-not $driver) {
     throw "A compatible virtual printer driver (Microsoft XPS Document Writer or Microsoft Print To PDF) is required for native remote printing but is not installed."
 }
 
 if (-not (Get-Printer -Name $printerName -ErrorAction SilentlyContinue)) {
     Add-Printer -Name $printerName -DriverName $driver -PortName $portName -ErrorAction Stop
 } else {
-    Set-Printer -Name $printerName -PortName $portName -DriverName $driver -ErrorAction SilentlyContinue
+    Set-Printer -Name $printerName -PortName $portName -DriverName $driver -ErrorAction Stop
+}
+
+$verifiedPrinter = Get-Printer -Name $printerName -ErrorAction Stop
+if (-not $verifiedPrinter) {
+    throw "Virtual printer '$printerName' verification failed after registration."
+}
+
+# Clean up legacy Bridge_Port_<portNumber> or stale Bridge - * (<portNumber>) ports once migrated
+Get-PrinterPort -ErrorAction SilentlyContinue | Where-Object {
+    ($_.Name -eq "Bridge_Port_$portNumber" -or $_.Name -like "Bridge - * ($portNumber)") -and ($_.Name -ne $portName)
+} | ForEach-Object {
+    $oldPort = $_.Name
+    $inUse = Get-Printer -ErrorAction SilentlyContinue | Where-Object { $_.PortName -eq $oldPort }
+    if (-not $inUse) {
+        Remove-PrinterPort -Name $oldPort -ErrorAction SilentlyContinue
+    }
 }
 
 # Ensure WorkOffline is always disabled and clear stuck error print jobs
@@ -569,20 +560,11 @@ try {
 
 # 3. Default Printer Selection:
 # If current default is a REAL physical printer, keep it.
-# If current default is a software/virtual printer (PDF, XPS, Fax, etc.) and no physical printer exists, set Bridge virtual printer as default.
+# If current default is a software/virtual printer and no physical printer exists, set Bridge virtual printer as default.
 $isPhysicalDefault = $false
 if ($existingDefault) {
     $matched = Get-CimInstance Win32_Printer -Filter "Name = '$($existingDefault.Replace("'", "''"))'" -ErrorAction SilentlyContinue | Where-Object {
-        $_.PortName -notlike 'Bridge_Port_*' -and
-        $_.PortName -ne 'Bridge_TCP_Port' -and
-        $_.PortName -ne 'PORTPROMPT:' -and
-        $_.PortName -ne 'nul:' -and
-        $_.Name -notlike 'Print on *' -and
-        $_.Name -notlike '*PDF*' -and
-        $_.Name -notlike '*XPS*' -and
-        $_.Name -notlike '*AnyDesk*' -and
-        $_.Name -notlike '*Fax*' -and
-        $_.Name -notlike '*OneNote*'
+        -not (Test-BridgeVirtualPrinter $_)
     }
     if ($matched) { $isPhysicalDefault = $true }
 }
@@ -591,16 +573,7 @@ if ($isPhysicalDefault) {
     (New-Object -ComObject WScript.Network).SetDefaultPrinter($existingDefault)
 } else {
     $physical = Get-CimInstance Win32_Printer -ErrorAction SilentlyContinue | Where-Object {
-        $_.PortName -notlike 'Bridge_Port_*' -and
-        $_.PortName -ne 'Bridge_TCP_Port' -and
-        $_.PortName -ne 'PORTPROMPT:' -and
-        $_.PortName -ne 'nul:' -and
-        $_.Name -notlike 'Print on *' -and
-        $_.Name -notlike '*PDF*' -and
-        $_.Name -notlike '*XPS*' -and
-        $_.Name -notlike '*AnyDesk*' -and
-        $_.Name -notlike '*Fax*' -and
-        $_.Name -notlike '*OneNote*'
+        -not (Test-BridgeVirtualPrinter $_)
     } | Select-Object -First 1
     if ($physical) {
         (New-Object -ComObject WScript.Network).SetDefaultPrinter($physical.Name)
@@ -609,6 +582,107 @@ if ($isPhysicalDefault) {
     }
 }
 `, psPortName, port, psPrinterName)
+}
+
+func isBridgePortName(portName string) bool {
+	low := strings.ToLower(strings.TrimSpace(portName))
+	return strings.HasPrefix(low, "bridge_port_") || low == "bridge_tcp_port" || strings.HasPrefix(low, "bridge - ")
+}
+
+// IsVirtualPrinterRegistered checks via Windows registry whether the native virtual printer
+// "Print on <PeerName>" is installed and bound to a Bridge port.
+func IsVirtualPrinterRegistered(peerName string) bool {
+	cleanPeer := SanitizeFileName(peerName)
+	if cleanPeer == "" {
+		return false
+	}
+	printerName := fmt.Sprintf("Print on %s", cleanPeer)
+	k, err := registry.OpenKey(registry.LOCAL_MACHINE, `SOFTWARE\Microsoft\Windows NT\CurrentVersion\Print\Printers\`+printerName, registry.QUERY_VALUE)
+	if err != nil {
+		return false
+	}
+	portVal, _, portErr := k.GetStringValue("Port")
+	k.Close()
+	if portErr != nil || !isBridgePortName(portVal) {
+		return false
+	}
+	pk, pkErr := registry.OpenKey(registry.LOCAL_MACHINE, `SYSTEM\CurrentControlSet\Control\Print\Monitors\Standard TCP/IP Port\Ports\`+strings.TrimSpace(portVal), registry.QUERY_VALUE)
+	if pkErr != nil {
+		return false
+	}
+	pk.Close()
+	return true
+}
+
+// CheckVirtualPrinters returns a map of peer name -> whether its native Windows virtual printer is registered.
+func CheckVirtualPrinters(peers []config.PeerDevice) map[string]bool {
+	res := make(map[string]bool, len(peers))
+	for _, p := range peers {
+		res[p.Name] = IsVirtualPrinterRegistered(p.Name)
+	}
+	return res
+}
+
+// InstallVirtualPrinter registers a Windows RAW TCP port on 127.0.0.1:port and creates
+// a virtual printer named "Print on <PeerName>".
+func InstallVirtualPrinter(peerName string, port int) error {
+	if strings.TrimSpace(peerName) == "" {
+		return nil
+	}
+	cleanPeer := SanitizeFileName(peerName)
+	if cleanPeer == "" {
+		return nil
+	}
+
+	localNode := ""
+	if cfg, err := config.LoadConfig(TargetConfig); err == nil && cfg.NodeName != "" {
+		localNode = cfg.NodeName
+	}
+	if config.IsSelfTarget(cleanPeer, "", "", localNode, 0) {
+		return nil // Strictly never install virtual printer for self device
+	}
+
+	if port <= 0 {
+		port = 9101
+	}
+	printerName := fmt.Sprintf("Print on %s", cleanPeer)
+	portName := BridgePortName(cleanPeer, port)
+	const printerAttrWorkOffline = 0x00000400
+
+	// In-Process Fast Registry Check (0 subprocesses, <1ms):
+	// Verify printer exists with matching canonical port, WorkOffline is disabled, and TCP port has SNMP disabled.
+	printerClean := false
+	k, err := registry.OpenKey(registry.LOCAL_MACHINE, `SOFTWARE\Microsoft\Windows NT\CurrentVersion\Print\Printers\`+printerName, registry.QUERY_VALUE)
+	if err == nil {
+		portVal, _, portErr := k.GetStringValue("Port")
+		attrs, _, attrErr := k.GetIntegerValue("Attributes")
+		drvVal, _, _ := k.GetStringValue("Printer Driver")
+		k.Close()
+
+		if portErr == nil && strings.EqualFold(strings.TrimSpace(portVal), portName) &&
+			attrErr == nil && (attrs&printerAttrWorkOffline) == 0 {
+			pk, pkErr := registry.OpenKey(registry.LOCAL_MACHINE, `SYSTEM\CurrentControlSet\Control\Print\Monitors\Standard TCP/IP Port\Ports\`+portName, registry.QUERY_VALUE)
+			if pkErr == nil {
+				snmpVal, _, snmpErr := pk.GetIntegerValue("SNMP Enabled")
+				portNum, _, numErr := pk.GetIntegerValue("PortNumber")
+				pk.Close()
+				if snmpErr == nil && snmpVal == 0 && numErr == nil && int(portNum) == port {
+					if !shouldUpgradeVirtualPrinterDriver(drvVal, hasMicrosoftPrintToPDFDriver(), IsElevated()) {
+						printerClean = true
+					}
+				}
+			}
+		}
+	}
+	if printerClean {
+		return nil // Already installed and cleanly configured (SNMP=0, WorkOffline=false)
+	}
+
+	if !IsElevated() {
+		return fmt.Errorf("%w: administrator privileges required to configure virtual printer %q on port %d", ErrElevationRequired, printerName, port)
+	}
+
+	psScript := buildInstallVirtualPrinterScript(printerName, portName, port)
 
 	cmd := exec.Command("powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", psScript)
 	hideCmd(cmd)
@@ -619,23 +693,131 @@ if ($isPhysicalDefault) {
 	return nil
 }
 
-// RemoveVirtualPrinter uninstalls a specific Bridge virtual printer if present.
-func RemoveVirtualPrinter(peerName string) error {
+func hasMicrosoftPrintToPDFDriver() bool {
+	dk, err := registry.OpenKey(registry.LOCAL_MACHINE, `SYSTEM\CurrentControlSet\Control\Print\Environments\Windows x64\Drivers\Version-4\Microsoft Print To PDF`, registry.QUERY_VALUE)
+	if err != nil {
+		return false
+	}
+	dk.Close()
+	return true
+}
+
+func shouldUpgradeVirtualPrinterDriver(currentDriver string, hasMPDF, elevated bool) bool {
+	if !elevated || !hasMPDF {
+		return false
+	}
+	lower := strings.ToLower(strings.TrimSpace(currentDriver))
+	return strings.Contains(lower, "xps")
+}
+
+func buildRemoveVirtualPrinterScript(peerName string) string {
 	cleanPeer := SanitizeFileName(peerName)
 	printerName := fmt.Sprintf("Print on %s", cleanPeer)
+	portPrefix := fmt.Sprintf("Bridge - %s (", cleanPeer)
 
-	psScript := fmt.Sprintf(`
+	return fmt.Sprintf(`
 $pName = '%s'
+$portPrefix = '%s'
+
+# 1. Guard default printer before removal
+$currDef = $null
+try { $currDef = (Get-CimInstance Win32_Printer -Filter "Default = True" -ErrorAction SilentlyContinue).Name } catch {}
+if ($currDef -and ($currDef -ieq $pName)) {
+    $fallback = (Get-CimInstance Win32_Printer -ErrorAction SilentlyContinue | Where-Object {
+        $_.Name -ine $pName -and
+        $_.Name -notlike 'Print on *' -and
+        $_.PortName -notlike 'Bridge_Port_*' -and
+        $_.PortName -ne 'Bridge_TCP_Port' -and
+        $_.PortName -notlike 'Bridge - *'
+    } | Select-Object -First 1).Name
+    if ($fallback) {
+        (New-Object -ComObject WScript.Network).SetDefaultPrinter($fallback)
+    }
+}
+
+# 2. Capture any Bridge port bound to this printer and clear stuck jobs
+$portsToRemove = @()
+$existing = Get-Printer -Name $pName -ErrorAction SilentlyContinue
+if ($existing -and $existing.PortName -and ($existing.PortName -like 'Bridge_Port_*' -or $existing.PortName -eq 'Bridge_TCP_Port' -or $existing.PortName -like 'Bridge - *')) {
+    $portsToRemove += $existing.PortName
+}
+Get-PrintJob -PrinterName $pName -ErrorAction SilentlyContinue | Remove-PrintJob -ErrorAction SilentlyContinue
+
+# 3. Remove printer
 Get-Printer -Name $pName -ErrorAction SilentlyContinue | Remove-Printer -ErrorAction SilentlyContinue
 Get-CimInstance Win32_Printer -Filter "Name = '$($pName.Replace("'", "''"))'" -ErrorAction SilentlyContinue | Remove-CimInstance -ErrorAction SilentlyContinue
-`, strings.ReplaceAll(printerName, `'`, `''`))
+
+# 4. Collect matching Bridge - <peer> (*) ports and wait for spooler running before removal
+Get-PrinterPort -ErrorAction SilentlyContinue | Where-Object {
+    $_.Name.StartsWith($portPrefix, [System.StringComparison]::OrdinalIgnoreCase) -or ($_.Name -in $portsToRemove)
+} | ForEach-Object {
+    $targetPort = $_.Name
+    $inUse = Get-Printer -ErrorAction SilentlyContinue | Where-Object { $_.PortName -eq $targetPort }
+    if (-not $inUse) {
+        $svc = Get-Service -Name spooler -ErrorAction SilentlyContinue
+        if ($svc -and $svc.Status -ne 'Running') {
+            Start-Service -Name spooler -ErrorAction SilentlyContinue
+            for ($i = 0; $i -lt 20; $i++) {
+                $svc = Get-Service -Name spooler -ErrorAction SilentlyContinue
+                if ($svc -and $svc.Status -eq 'Running') { break }
+                Start-Sleep -Milliseconds 250
+            }
+        }
+        Remove-PrinterPort -Name $targetPort -ErrorAction SilentlyContinue
+    }
+}
+`, strings.ReplaceAll(printerName, `'`, `''`), strings.ReplaceAll(portPrefix, `'`, `''`))
+}
+
+func hasVirtualPrinterOrPortForPeer(peerName string) bool {
+	cleanPeer := SanitizeFileName(peerName)
+	if strings.TrimSpace(peerName) == "" || cleanPeer == "" {
+		return false
+	}
+	printerName := fmt.Sprintf("Print on %s", cleanPeer)
+	k, err := registry.OpenKey(registry.LOCAL_MACHINE, `SOFTWARE\Microsoft\Windows NT\CurrentVersion\Print\Printers\`+printerName, registry.QUERY_VALUE)
+	if err == nil {
+		k.Close()
+		return true
+	}
+	if !errors.Is(err, registry.ErrNotExist) {
+		return true
+	}
+
+	portsKey, err := registry.OpenKey(registry.LOCAL_MACHINE, `SYSTEM\CurrentControlSet\Control\Print\Monitors\Standard TCP/IP Port\Ports`, registry.ENUMERATE_SUB_KEYS)
+	if err != nil {
+		if errors.Is(err, registry.ErrNotExist) {
+			return false
+		}
+		return true
+	}
+	defer portsKey.Close()
+
+	portNames, err := portsKey.ReadSubKeyNames(-1)
+	if err != nil {
+		return true
+	}
+	portPrefix := strings.ToLower(fmt.Sprintf("Bridge - %s (", cleanPeer))
+	for _, pn := range portNames {
+		if strings.HasPrefix(strings.ToLower(pn), portPrefix) {
+			return true
+		}
+	}
+	return false
+}
+
+// RemoveVirtualPrinter uninstalls a specific Bridge virtual printer and its Bridge port if present.
+func RemoveVirtualPrinter(peerName string) error {
+	if !hasVirtualPrinterOrPortForPeer(peerName) {
+		return nil
+	}
+	psScript := buildRemoveVirtualPrinterScript(peerName)
 	cmd := exec.Command("powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", psScript)
 	hideCmd(cmd)
 	return cmd.Run()
 }
 
-// PruneObsoleteVirtualPrinters removes any virtual printers and TCP ports that do not match the active peers.
-func PruneObsoleteVirtualPrinters(activePeers []config.PeerDevice) error {
+func buildPruneObsoleteVirtualPrintersScript(activePeers []config.PeerDevice) string {
 	var validPrinters []string
 	var validPorts []string
 
@@ -646,19 +828,34 @@ func PruneObsoleteVirtualPrinters(activePeers []config.PeerDevice) error {
 		if port <= 0 {
 			port = 9101
 		}
-		validPorts = append(validPorts, fmt.Sprintf("'Bridge_Port_%d'", port))
+		validPorts = append(validPorts, fmt.Sprintf("'%s'", strings.ReplaceAll(BridgePortName(clean, port), `'`, `''`)))
 	}
 
 	printersArray := strings.Join(validPrinters, ", ")
 	portsArray := strings.Join(validPorts, ", ")
 
-	psScript := fmt.Sprintf(`
+	return fmt.Sprintf(`
 $validPrinters = @( %s )
 $validPorts = @( %s )
 
-# 1. Remove obsolete Bridge virtual printers that are not in validPrinters
+# 1. Guard default printer if an obsolete Bridge virtual printer is default
+$currDef = $null
+try { $currDef = (Get-CimInstance Win32_Printer -Filter "Default = True" -ErrorAction SilentlyContinue).Name } catch {}
+if ($currDef -and ($currDef -like 'Print on *') -and ($currDef -notin $validPrinters)) {
+    $fallback = (Get-CimInstance Win32_Printer -ErrorAction SilentlyContinue | Where-Object {
+        $_.Name -notlike 'Print on *' -and
+        $_.PortName -notlike 'Bridge_Port_*' -and
+        $_.PortName -ne 'Bridge_TCP_Port' -and
+        $_.PortName -notlike 'Bridge - *'
+    } | Select-Object -First 1).Name
+    if ($fallback) {
+        (New-Object -ComObject WScript.Network).SetDefaultPrinter($fallback)
+    }
+}
+
+# 2. Remove obsolete Bridge virtual printers that are not in validPrinters
 Get-Printer -ErrorAction SilentlyContinue | Where-Object {
-    ($_.Name -like 'Print on *' -or $_.PortName -like 'Bridge_Port_*' -or $_.PortName -eq 'Bridge_TCP_Port') -and ($_.Name -notin $validPrinters)
+    ($_.Name -like 'Print on *' -or $_.PortName -like 'Bridge_Port_*' -or $_.PortName -eq 'Bridge_TCP_Port' -or $_.PortName -like 'Bridge - *') -and ($_.Name -notin $validPrinters)
 } | ForEach-Object {
     $pName = $_.Name
     Get-PrintJob -PrinterName $pName -ErrorAction SilentlyContinue | Remove-PrintJob -ErrorAction SilentlyContinue
@@ -668,25 +865,126 @@ Get-Printer -ErrorAction SilentlyContinue | Where-Object {
     } catch {}
 }
 
-# 2. Remove obsolete Bridge TCP ports that are not in validPorts
-Get-PrinterPort -ErrorAction SilentlyContinue | Where-Object {
-    ($_.Name -like 'Bridge_Port_*' -or $_.Name -eq 'Bridge_TCP_Port') -and ($_.Name -notin $validPorts)
-} | ForEach-Object {
-    Remove-PrinterPort -Name $_.Name -ErrorAction SilentlyContinue
+# 3. Remove obsolete Bridge TCP ports (both legacy Bridge_Port_* and Bridge - * (*))
+$obsoletePorts = Get-PrinterPort -ErrorAction SilentlyContinue | Where-Object {
+    ($_.Name -like 'Bridge_Port_*' -or $_.Name -eq 'Bridge_TCP_Port' -or $_.Name -like 'Bridge - *') -and ($_.Name -notin $validPorts)
+}
+if ($obsoletePorts) {
+    $svc = Get-Service -Name spooler -ErrorAction SilentlyContinue
+    if ($svc -and $svc.Status -ne 'Running') {
+        Start-Service -Name spooler -ErrorAction SilentlyContinue
+        for ($i = 0; $i -lt 20; $i++) {
+            $svc = Get-Service -Name spooler -ErrorAction SilentlyContinue
+            if ($svc -and $svc.Status -eq 'Running') { break }
+            Start-Sleep -Milliseconds 250
+        }
+    }
+    foreach ($op in $obsoletePorts) {
+        $stillUsed = Get-Printer -ErrorAction SilentlyContinue | Where-Object { $_.PortName -eq $op.Name }
+        if (-not $stillUsed) {
+            Remove-PrinterPort -Name $op.Name -ErrorAction SilentlyContinue
+        }
+    }
 }
 `, printersArray, portsArray)
+}
 
+func shouldPruneBridgePrinter(printerName, portName string, validPrinters map[string]bool) bool {
+	lowName := strings.ToLower(strings.TrimSpace(printerName))
+	if lowName == "" || validPrinters[lowName] {
+		return false
+	}
+	return strings.HasPrefix(lowName, "print on ") || isBridgePortName(portName)
+}
+
+func shouldPruneBridgePort(portName string, validPorts map[string]bool) bool {
+	lowPort := strings.ToLower(strings.TrimSpace(portName))
+	if lowPort == "" || validPorts[lowPort] {
+		return false
+	}
+	return isBridgePortName(lowPort)
+}
+
+func buildValidPrintersAndPortsMaps(activePeers []config.PeerDevice) (map[string]bool, map[string]bool) {
+	validPrinters := make(map[string]bool, len(activePeers))
+	validPorts := make(map[string]bool, len(activePeers))
+	for _, p := range activePeers {
+		clean := SanitizeFileName(p.Name)
+		validPrinters[strings.ToLower(fmt.Sprintf("Print on %s", clean))] = true
+		port := p.SpoolPort
+		if port <= 0 {
+			port = 9101
+		}
+		validPorts[strings.ToLower(BridgePortName(clean, port))] = true
+	}
+	return validPrinters, validPorts
+}
+
+func hasObsoleteVirtualPrintersOrPorts(activePeers []config.PeerDevice) bool {
+	validPrinters, validPorts := buildValidPrintersAndPortsMaps(activePeers)
+
+	printersKey, err := registry.OpenKey(registry.LOCAL_MACHINE, `SOFTWARE\Microsoft\Windows NT\CurrentVersion\Print\Printers`, registry.ENUMERATE_SUB_KEYS)
+	if err != nil {
+		if !errors.Is(err, registry.ErrNotExist) {
+			return true
+		}
+	} else {
+		printerNames, readErr := printersKey.ReadSubKeyNames(-1)
+		if readErr != nil {
+			printersKey.Close()
+			return true
+		}
+		for _, pName := range printerNames {
+			portVal := ""
+			if pk, pkErr := registry.OpenKey(printersKey, pName, registry.QUERY_VALUE); pkErr == nil {
+				portVal, _, _ = pk.GetStringValue("Port")
+				pk.Close()
+			}
+			if shouldPruneBridgePrinter(pName, portVal, validPrinters) {
+				printersKey.Close()
+				return true
+			}
+		}
+		printersKey.Close()
+	}
+
+	portsKey, err := registry.OpenKey(registry.LOCAL_MACHINE, `SYSTEM\CurrentControlSet\Control\Print\Monitors\Standard TCP/IP Port\Ports`, registry.ENUMERATE_SUB_KEYS)
+	if err != nil {
+		if !errors.Is(err, registry.ErrNotExist) {
+			return true
+		}
+		return false
+	}
+	defer portsKey.Close()
+
+	portNames, err := portsKey.ReadSubKeyNames(-1)
+	if err != nil {
+		return true
+	}
+	for _, portName := range portNames {
+		if shouldPruneBridgePort(portName, validPorts) {
+			return true
+		}
+	}
+	return false
+}
+
+// PruneObsoleteVirtualPrinters removes any virtual printers and TCP ports that do not match the active peers.
+func PruneObsoleteVirtualPrinters(activePeers []config.PeerDevice) error {
+	if !hasObsoleteVirtualPrintersOrPorts(activePeers) {
+		return nil
+	}
+	psScript := buildPruneObsoleteVirtualPrintersScript(activePeers)
 	cmd := exec.Command("powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", psScript)
 	hideCmd(cmd)
 	return cmd.Run()
 }
 
-// UninstallAllVirtualPrinters removes all Bridge virtual printers and TCP ports.
-func UninstallAllVirtualPrinters() error {
-	psScript := `
-# 1. Clear any stuck print jobs on Bridge virtual printers
-Get-Printer -ErrorAction SilentlyContinue | Where-Object { 
-    $_.PortName -like 'Bridge_Port_*' -or $_.PortName -eq 'Bridge_TCP_Port' -or $_.Name -like 'Print on *' -or $_.Name -like '*Bridge*'
+func buildUninstallAllVirtualPrintersScript() string {
+	return `
+# 1. Clear any stuck print jobs on Bridge virtual printers (do NOT match unrelated *Bridge* printers)
+Get-Printer -ErrorAction SilentlyContinue | Where-Object {
+    $_.PortName -like 'Bridge_Port_*' -or $_.PortName -eq 'Bridge_TCP_Port' -or $_.PortName -like 'Bridge - *' -or $_.Name -like 'Print on *'
 } | ForEach-Object {
     $pName = $_.Name
     Get-PrintJob -PrinterName $pName -ErrorAction SilentlyContinue | Remove-PrintJob -ErrorAction SilentlyContinue
@@ -695,48 +993,126 @@ Get-Printer -ErrorAction SilentlyContinue | Where-Object {
 # 2. Reset default printer if set to a Bridge virtual printer
 $currDef = $null
 try { $currDef = (Get-CimInstance Win32_Printer -Filter "Default = True" -ErrorAction SilentlyContinue).Name } catch {}
-if ($currDef -and ($currDef -like 'Print on *' -or $currDef -like '*Bridge*')) {
-    $fallback = (Get-CimInstance Win32_Printer -ErrorAction SilentlyContinue | Where-Object {
-        $_.Name -notlike 'Print on *' -and
-        $_.Name -notlike '*Bridge*' -and
-        $_.PortName -notlike 'Bridge_*' -and
-        $_.PortName -ne 'Bridge_TCP_Port'
-    } | Select-Object -First 1).Name
-    if ($fallback) {
-        (New-Object -ComObject WScript.Network).SetDefaultPrinter($fallback)
+if ($currDef) {
+    $currDefObj = Get-CimInstance Win32_Printer -Filter "Name = '$($currDef.Replace("'", "''"))'" -ErrorAction SilentlyContinue
+    $isBridgeDef = ($currDef -like 'Print on *') -or ($currDefObj -and ($currDefObj.PortName -like 'Bridge_Port_*' -or $currDefObj.PortName -eq 'Bridge_TCP_Port' -or $currDefObj.PortName -like 'Bridge - *'))
+    if ($isBridgeDef) {
+        $fallback = (Get-CimInstance Win32_Printer -ErrorAction SilentlyContinue | Where-Object {
+            $_.Name -notlike 'Print on *' -and
+            $_.PortName -notlike 'Bridge_Port_*' -and
+            $_.PortName -ne 'Bridge_TCP_Port' -and
+            $_.PortName -notlike 'Bridge - *'
+        } | Select-Object -First 1).Name
+        if ($fallback) {
+            (New-Object -ComObject WScript.Network).SetDefaultPrinter($fallback)
+        }
     }
 }
 
 # 3. Remove all Bridge virtual printers via standard cmdlet and WMI CIM
-Get-Printer -ErrorAction SilentlyContinue | Where-Object { 
-    $_.PortName -like 'Bridge_Port_*' -or $_.PortName -eq 'Bridge_TCP_Port' -or $_.Name -like 'Print on *' -or $_.Name -like '*Bridge*'
+Get-Printer -ErrorAction SilentlyContinue | Where-Object {
+    $_.PortName -like 'Bridge_Port_*' -or $_.PortName -eq 'Bridge_TCP_Port' -or $_.PortName -like 'Bridge - *' -or $_.Name -like 'Print on *'
 } | Remove-Printer -ErrorAction SilentlyContinue
 
 Get-CimInstance Win32_Printer -ErrorAction SilentlyContinue | Where-Object {
-    $_.PortName -like 'Bridge_Port_*' -or $_.PortName -eq 'Bridge_TCP_Port' -or $_.Name -like 'Print on *' -or $_.Name -like '*Bridge*'
+    $_.PortName -like 'Bridge_Port_*' -or $_.PortName -eq 'Bridge_TCP_Port' -or $_.PortName -like 'Bridge - *' -or $_.Name -like 'Print on *'
 } | ForEach-Object {
     Remove-CimInstance -InputObject $_ -ErrorAction SilentlyContinue
 }
 
-# 4. Restart Spooler to flush port bindings, then remove all Bridge TCP ports
+# 4. Restart Spooler to flush port bindings, wait until Running, then remove all Bridge TCP ports
 Restart-Service spooler -Force -ErrorAction SilentlyContinue
-Get-PrinterPort -ErrorAction SilentlyContinue | Where-Object { 
-    $_.Name -like 'Bridge_Port_*' -or $_.Name -eq 'Bridge_TCP_Port' 
+for ($i = 0; $i -lt 40; $i++) {
+    $svc = Get-Service -Name spooler -ErrorAction SilentlyContinue
+    if ($svc -and $svc.Status -eq 'Running') { break }
+    Start-Sleep -Milliseconds 250
+}
+Get-PrinterPort -ErrorAction SilentlyContinue | Where-Object {
+    $_.Name -like 'Bridge_Port_*' -or $_.Name -eq 'Bridge_TCP_Port' -or $_.Name -like 'Bridge - *'
 } | Remove-PrinterPort -ErrorAction SilentlyContinue
 `
+}
+
+// UninstallAllVirtualPrinters removes all Bridge virtual printers and TCP ports.
+func UninstallAllVirtualPrinters() error {
+	psScript := buildUninstallAllVirtualPrintersScript()
 	cmd := exec.Command("powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", psScript)
 	hideCmd(cmd)
 	return cmd.Run()
 }
 
 // KillOtherBridgeProcesses terminates any other running bridge.exe instances
-// while explicitly exempting the current process PID to avoid process suicide.
+// (including any process executing TargetExe via WMI/CIM) while explicitly exempting
+// the current process PID, and verifies they have exited.
 func KillOtherBridgeProcesses() {
 	currPid := os.Getpid()
 	filter := fmt.Sprintf("PID ne %d", currPid)
 	cmd := exec.Command("taskkill", "/F", "/FI", filter, "/IM", "bridge.exe")
 	hideCmd(cmd)
 	_ = cmd.Run()
+
+	psKill := fmt.Sprintf(`
+$selfPid = %d
+$targetExe = '%s'
+$procs = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
+    $_.ProcessId -ne $selfPid -and ($_.Name -ieq 'bridge.exe' -or ($_.ExecutablePath -and $_.ExecutablePath -ieq $targetExe))
+}
+foreach ($p in $procs) {
+    Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue
+}
+for ($i = 0; $i -lt 15; $i++) {
+    $rem = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
+        $_.ProcessId -ne $selfPid -and ($_.Name -ieq 'bridge.exe' -or ($_.ExecutablePath -and $_.ExecutablePath -ieq $targetExe))
+    }
+    if (-not $rem) { break }
+    foreach ($p in $rem) { Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue }
+    Start-Sleep -Milliseconds 200
+}
+`, currPid, strings.ReplaceAll(TargetExe, `'`, `''`))
+	psCmd := exec.Command("powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", psKill)
+	hideCmd(psCmd)
+	_ = psCmd.Run()
+}
+
+func endAndDeleteTask(taskName string) {
+	cmdEnd := exec.Command("schtasks", "/End", "/TN", taskName)
+	hideCmd(cmdEnd)
+	_ = cmdEnd.Run()
+	cmdDel := exec.Command("schtasks", "/Delete", "/TN", taskName, "/F")
+	hideCmd(cmdDel)
+	_ = cmdDel.Run()
+}
+
+func startBridgeBackgroundService() error {
+	// Prefer BridgeAppLogon scheduled task when present so the service/tray runs elevated in Session 1
+	// and can register native Windows virtual printers cleanly.
+	qCmd := exec.Command("schtasks", "/Query", "/TN", LogonTaskName)
+	hideCmd(qCmd)
+	if qCmd.Run() == nil {
+		runCmd := exec.Command("schtasks", "/Run", "/TN", LogonTaskName)
+		hideCmd(runCmd)
+		if err := runCmd.Run(); err == nil {
+			return nil
+		}
+	}
+
+	if _, err := os.Stat(TargetExe); err != nil {
+		return err
+	}
+	psStart := fmt.Sprintf(`Start-Process -FilePath '%s' -ArgumentList '-autostart' -WindowStyle Hidden`, strings.ReplaceAll(TargetExe, `'`, `''`))
+	cmd := exec.Command("powershell", "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-ExecutionPolicy", "Bypass", "-Command", psStart)
+	hideCmd(cmd)
+	return cmd.Run()
+}
+
+func scheduleSelfDeleteAppDir(appDir string, pid int) {
+	_ = os.Chdir(`C:\`)
+	escDir := strings.ReplaceAll(appDir, `'`, `''`)
+	psClean := fmt.Sprintf(`$pidToWait = %d; $p = Get-Process -Id $pidToWait -ErrorAction SilentlyContinue; if ($p) { try { Wait-Process -Id $pidToWait -Timeout 30 -ErrorAction SilentlyContinue } catch {} }; Start-Sleep -Milliseconds 300; 1..20 | ForEach-Object { Remove-Item -LiteralPath '%s' -Recurse -Force -ErrorAction SilentlyContinue; if (-not (Test-Path -LiteralPath '%s')) { exit 0 }; Start-Sleep -Milliseconds 500 }`, pid, escDir, escDir)
+	cleanupCmd := exec.Command("powershell.exe", "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-ExecutionPolicy", "Bypass", "-Command", psClean)
+	cleanupCmd.Dir = `C:\`
+	hideCmd(cleanupCmd)
+	_ = cleanupCmd.Start()
 }
 
 // AcquireInteractiveLock attempts to acquire a named mutex ensuring only one interactive dashboard/setup terminal runs.
@@ -1065,7 +1441,7 @@ func UnregisterInteractiveStartup() {
 		}
 	}
 
-	// 4. Exhaustive PowerShell cleanup across all Run keys, HKEY_USERS hives, and Task Scheduler
+	// 4. Exhaustive PowerShell cleanup across all Run keys, HKEY_USERS hives (Software\BridgeApp + Run), and Task Scheduler
 	purgeScript := `
 $runKeys = @(
     "HKLM:\Software\Microsoft\Windows\CurrentVersion\Run",
@@ -1074,9 +1450,17 @@ $runKeys = @(
 )
 Get-ChildItem "Registry::HKEY_USERS" -ErrorAction SilentlyContinue | ForEach-Object {
     $runKeys += "$($_.PSPath)\Software\Microsoft\Windows\CurrentVersion\Run"
+    $bridgeSub = "$($_.PSPath)\Software\BridgeApp"
+    if (Test-Path $bridgeSub) {
+        Remove-Item -Path $bridgeSub -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+if (Test-Path "HKCU:\Software\BridgeApp") {
+    Remove-Item -Path "HKCU:\Software\BridgeApp" -Recurse -Force -ErrorAction SilentlyContinue
 }
 foreach ($rk in $runKeys) {
     if (Test-Path $rk) {
+        Remove-ItemProperty -Path $rk -Name "BridgeApp" -Force -ErrorAction SilentlyContinue
         $item = Get-ItemProperty -Path $rk -ErrorAction SilentlyContinue
         if ($item) {
             foreach ($prop in $item.PSObject.Properties) {
@@ -1087,9 +1471,12 @@ foreach ($rk in $runKeys) {
         }
     }
 }
-Get-ScheduledTask -ErrorAction SilentlyContinue | Where-Object { 
+Get-ScheduledTask -ErrorAction SilentlyContinue | Where-Object {
     $_.TaskName -like "*bridge*" -or ($_.Actions -and ($_.Actions.Execute -like "*bridge.exe*"))
-} | Unregister-ScheduledTask -Confirm:$false -ErrorAction SilentlyContinue
+} | ForEach-Object {
+    try { Stop-ScheduledTask -TaskName $_.TaskName -ErrorAction SilentlyContinue } catch {}
+    Unregister-ScheduledTask -TaskName $_.TaskName -Confirm:$false -ErrorAction SilentlyContinue
+}
 `
 	psCmd := exec.Command("powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", purgeScript)
 	hideCmd(psCmd)
@@ -1097,8 +1484,6 @@ Get-ScheduledTask -ErrorAction SilentlyContinue | Where-Object {
 
 	// 5. Explicit Task Scheduler removals (Interactive Logon task + Legacy Session 0 task)
 	for _, tn := range []string{LogonTaskName, TaskName} {
-		cmdSch := exec.Command("schtasks", "/Delete", "/TN", tn, "/F")
-		hideCmd(cmdSch)
-		_ = cmdSch.Run()
+		endAndDeleteTask(tn)
 	}
 }

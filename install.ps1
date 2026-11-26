@@ -1,4 +1,11 @@
 ﻿#Requires -RunAsAdministrator
+<#
+.SYNOPSIS
+    Bridge System Setup & Symmetrical Installer.
+.NOTES
+    To build bridge.exe without console flash on boot/tray startup, compile with:
+      go build -ldflags "-H windowsgui" -o bridge.exe .
+#>
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $false, HelpMessage = "Friendly name for this PC")]
@@ -193,11 +200,15 @@ foreach ($d in $dirsToCreate) {
 # Decommission legacy print folders if present
 Remove-Item "C:\Bridge\Print" -Recurse -Force -ErrorAction SilentlyContinue
 
-# Stop existing task/process to allow clean file update
+# Stop existing tasks/processes to allow clean file update
+schtasks /End /TN "BridgeAppLogon" 2>$null | Out-Null
+schtasks /End /TN "BridgeSystemService" 2>$null | Out-Null
+Stop-ScheduledTask -TaskName "BridgeAppLogon" -ErrorAction SilentlyContinue | Out-Null
 Stop-ScheduledTask -TaskName "BridgeSystemService" -ErrorAction SilentlyContinue | Out-Null
 Get-Process -Name "bridge" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+Start-Sleep -Milliseconds 300
 
-# Locate and copy bridge.exe
+# Locate and copy bridge.exe (or build with -ldflags "-H windowsgui" if Go toolchain is present)
 $binarySourceCandidates = @(
     "$PSScriptRoot\bridge.exe",
     "$PSScriptRoot\dist\bridge.exe",
@@ -212,45 +223,139 @@ foreach ($b in $binarySourceCandidates) {
     }
 }
 
+if (-not $sourceBinary) {
+    $goCmd = Get-Command "go.exe" -ErrorAction SilentlyContinue
+    if ($goCmd -and (Test-Path (Join-Path $PSScriptRoot "go.mod"))) {
+        Write-Host "Building bridge.exe with -ldflags `"-H windowsgui`"..." -ForegroundColor Yellow
+        Push-Location $PSScriptRoot
+        try {
+            & $goCmd.Source build -ldflags "-H windowsgui" -o "$PSScriptRoot\bridge.exe" .
+            if (Test-Path "$PSScriptRoot\bridge.exe") {
+                $sourceBinary = "$PSScriptRoot\bridge.exe"
+            }
+        } finally {
+            Pop-Location
+        }
+    } else {
+        Write-Host "Warning: bridge.exe not found. Build with: go build -ldflags `"-H windowsgui`" -o bridge.exe ." -ForegroundColor Yellow
+    }
+}
+
 if ($sourceBinary) {
     Copy-Item -Path $sourceBinary -Destination "C:\BridgeApp\bridge.exe" -Force
     Write-Host "Deployed binary to C:\BridgeApp\bridge.exe" -ForegroundColor Green
 }
 
-# Generate multi-device config.json
+# Load existing config.json on upgrade to preserve node_name, auth_token, peers, and ignored_peers
+$configPath = "C:\BridgeApp\config.json"
+$existingCfg = $null
+if (Test-Path $configPath) {
+    try {
+        $existingCfg = Get-Content -LiteralPath $configPath -Raw -ErrorAction Stop | ConvertFrom-Json
+        Write-Host "Existing config detected at $configPath; preserving saved peers and settings." -ForegroundColor Cyan
+    } catch {
+        $existingCfg = $null
+    }
+}
+
+if ($existingCfg) {
+    if (-not $PSBoundParameters.ContainsKey('Name') -and $existingCfg.node_name -and -not [string]::IsNullOrWhiteSpace($existingCfg.node_name)) {
+        $Name = [string]$existingCfg.node_name
+    }
+    if (-not $PSBoundParameters.ContainsKey('Token') -and $existingCfg.auth_token -and -not [string]::IsNullOrWhiteSpace($existingCfg.auth_token)) {
+        $Token = [string]$existingCfg.auth_token
+    }
+}
+
+# Build merged multi-device peers list (preserving existing peers and spool ports)
+$peersList = @()
+$usedPorts = @{ 9100 = $true; 8765 = $true }
+$seenUrls = @{}
+$seenIps = @{}
+
+if ($existingCfg -and $existingCfg.peers) {
+    foreach ($ep in $existingCfg.peers) {
+        if (-not $ep) { continue }
+        $epName = ([string]$ep.name).Trim()
+        $epIp = ([string]$ep.ip).Trim()
+        $epUrl = ([string]$ep.url).Trim().TrimEnd('/')
+        if (-not $epUrl -and $epIp) { $epUrl = "http://${epIp}:8765" }
+        if (-not $epIp -and $epUrl) {
+            try { $epIp = ([Uri]$epUrl).Host } catch {}
+        }
+        if (-not $epIp -and -not $epUrl) { continue }
+        if ($epName -ieq $Name) { continue }
+
+        $portNum = 0
+        if ($ep.spool_port) { $portNum = [int]$ep.spool_port }
+        if ($portNum -le 0 -or $usedPorts.ContainsKey($portNum)) {
+            $nextP = 9101
+            while ($usedPorts.ContainsKey($nextP)) { $nextP++ }
+            $portNum = $nextP
+        }
+        $usedPorts[$portNum] = $true
+        if ($epUrl) { $seenUrls[$epUrl.ToLowerInvariant()] = $true }
+        if ($epIp) { $seenIps[$epIp] = $true }
+
+        $entry = [ordered]@{
+            "name"       = $epName
+            "ip"         = $epIp
+            "url"        = $epUrl
+            "spool_port" = $portNum
+        }
+        if ($ep.custom_name) { $entry["custom_name"] = $true }
+        $peersList += $entry
+    }
+}
+
 $peerClean = $PeerIP.Trim().TrimEnd('/')
 if ($peerClean -ne "") {
     if (-not $peerClean.StartsWith("http://") -and -not $peerClean.StartsWith("https://")) {
         $peerUrl = "http://${peerClean}:8765"
+        $peerIpOnly = $peerClean
     } else {
         $peerUrl = $peerClean
+        try { $peerIpOnly = ([Uri]$peerClean).Host } catch { $peerIpOnly = $peerClean }
     }
-} else {
-    $peerUrl = ""
+    $alreadyTracked = ($peerUrl -and $seenUrls.ContainsKey($peerUrl.ToLowerInvariant())) -or ($peerIpOnly -and $seenIps.ContainsKey($peerIpOnly))
+    if (-not $alreadyTracked -and ($PeerName -ine $Name)) {
+        $nextP = 9101
+        while ($usedPorts.ContainsKey($nextP)) { $nextP++ }
+        $usedPorts[$nextP] = $true
+        $peersList += [ordered]@{
+            "name"       = $PeerName
+            "ip"         = $peerIpOnly
+            "url"        = $peerUrl
+            "spool_port" = $nextP
+        }
+    }
 }
 
-$peersList = @()
-if ($peerClean -ne "" -and ($PeerName -ine $Name)) {
-    $peersList += [ordered]@{
-        "name"       = $PeerName
-        "ip"         = $peerClean
-        "url"        = $peerUrl
-        "spool_port" = 9101
-    }
+$primaryPeerName = ""
+$primaryPeerUrl = ""
+if ($peersList.Count -gt 0) {
+    $primaryPeerName = $peersList[0].name
+    $primaryPeerUrl = $peersList[0].url
+}
+
+$ignoredPeersList = @()
+if ($existingCfg -and $existingCfg.ignored_peers) {
+    $ignoredPeersList = @($existingCfg.ignored_peers)
 }
 
 $configObj = [ordered]@{
     "node_name"         = $Name
-    "peer_name"         = $PeerName
-    "peer_url"          = $peerUrl
+    "peer_name"         = $primaryPeerName
+    "peer_url"          = $primaryPeerUrl
     "peers"             = $peersList
+    "ignored_peers"     = $ignoredPeersList
     "configured"        = $true
     "listen_port"       = 8765
     "auth_token"        = $Token
     "shared_dir"        = "C:\Bridge\Shared"
     "print_dir"         = "C:\Bridge\Print"
     "sumatra_path"      = $sumatraBin
-    "print_timeout_sec" = 45
+    "print_timeout_sec" = 120
     "state_file"        = "C:\BridgeApp\state.json"
     "print_queue_dir"   = "C:\Bridge\PrintQueue"
     "print_failed_dir"  = "C:\Bridge\PrintFailed"
@@ -258,10 +363,9 @@ $configObj = [ordered]@{
     "log_dir"           = "C:\Bridge\Logs"
 }
 
-$configJson = $configObj | ConvertTo-Json -Depth 5
-$configPath = "C:\BridgeApp\config.json"
+$configJson = $configObj | ConvertTo-Json -Depth 6
 [System.IO.File]::WriteAllText($configPath, $configJson)
-Write-Host "Generated config at $configPath" -ForegroundColor Green
+Write-Host "Saved config at $configPath (Peers: $($peersList.Count))" -ForegroundColor Green
 
 # 4. Windows Firewall Inbound Rule
 Write-Host "`n[4/5] Configuring Windows Firewall..." -ForegroundColor Cyan
@@ -351,8 +455,38 @@ if (-not $logonTaskOk) {
     Set-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" -Name "BridgeApp" -Value '"C:\BridgeApp\bridge.exe" -autostart' -Force
 }
 
-# Register Windows Virtual Printer for Ctrl+P Native Printing
-$portName = 'Bridge_Port_9101'
+# Register Windows Virtual Printers for Ctrl+P Native Printing (all peers)
+function Get-SanitizedBridgeName {
+    param([string]$RawName)
+    $res = [string]$RawName
+    foreach ($ch in @('\', '/', ':', '*', '?', '"', '<', '>', '|')) {
+        $res = $res.Replace($ch, '_')
+    }
+    $res = $res.Trim()
+    if ([string]::IsNullOrWhiteSpace($res)) { $res = "Remote PC" }
+    return $res
+}
+
+function Test-BridgeVirtualPrinter {
+    param($p)
+    if (-not $p) { return $true }
+    $n = ([string]$p.Name).ToLowerInvariant().Trim()
+    $pt = ([string]$p.PortName).ToLowerInvariant().Trim()
+    if ($n.StartsWith('print on ')) { return $true }
+    if ($pt.Contains('bridge_tcp_port') -or $pt.Contains('bridge_port_') -or $pt.Contains('bridge - ')) { return $true }
+    if ($pt -eq 'portprompt:' -or $pt -eq 'nul:' -or $pt.StartsWith('file:')) { return $true }
+    $keywords = @(
+        'print to pdf', 'pdf creator', 'pdfcreator', 'pdf24', 'win2pdf', 'clawpdf',
+        'adobe pdf', 'foxit', 'cutepdf', 'bullzip', 'primopdf', 'dopdf', 'novapdf',
+        'nitro pdf', 'soda pdf', 'xps document writer', 'openxps',
+        'generic / text only', 'generic', 'text only',
+        'anydesk', 'fax', 'onenote', 'snagit', 'virtual printer'
+    )
+    foreach ($kw in $keywords) {
+        if ($n.Contains($kw)) { return $true }
+    }
+    return $false
+}
 
 # Protect Windows default printer mode
 Set-ItemProperty -Path "HKCU:\Software\Microsoft\Windows NT\CurrentVersion\Windows" -Name "LegacyDefaultPrinterMode" -Value 1 -Type DWord -Force -ErrorAction SilentlyContinue
@@ -362,15 +496,18 @@ try {
     $existingDefault = (Get-CimInstance Win32_Printer -Filter "Default = True" -ErrorAction SilentlyContinue).Name
 } catch {}
 
-if (-not (Get-PrinterPort -Name $portName -ErrorAction SilentlyContinue)) {
-    Add-PrinterPort -Name $portName -PrinterHostAddress '127.0.0.1' -PortNumber 9101 -ErrorAction SilentlyContinue
-}
-$preferredDrivers = @('Microsoft XPS Document Writer v4', 'Microsoft XPS Document Writer', 'OpenXPS Document Writer')
+$preferredDrivers = @('Microsoft Print To PDF', 'Microsoft XPS Document Writer v4', 'Microsoft XPS Document Writer', 'OpenXPS Document Writer')
 $driver = $null
 foreach ($d in $preferredDrivers) {
     if (Get-PrinterDriver -Name $d -ErrorAction SilentlyContinue) {
         $driver = $d
         break
+    }
+}
+if (-not $driver) {
+    try { Add-PrinterDriver -Name 'Microsoft Print To PDF' -ErrorAction SilentlyContinue } catch {}
+    if (Get-PrinterDriver -Name 'Microsoft Print To PDF' -ErrorAction SilentlyContinue) {
+        $driver = 'Microsoft Print To PDF'
     }
 }
 if (-not $driver) {
@@ -403,45 +540,87 @@ if (-not $driver) {
     }
 }
 if (-not $driver) {
-    throw "Microsoft XPS Document Writer driver is required for native remote printing but is not installed. Enable 'Printing-XPSServices-Features' in Windows Features."
+    throw "Microsoft XPS Document Writer (or Microsoft Print To PDF) driver is required for native remote printing but is not installed. Enable 'Printing-XPSServices-Features' in Windows Features."
 }
-$printerName = "Print on $PeerName"
-if ($driver -and $PeerName -and ($PeerName -ine $Name)) {
-    Get-Printer -ErrorAction SilentlyContinue | Where-Object { $_.PortName -eq $portName -and $_.Name -ne $printerName } | Remove-Printer -ErrorAction SilentlyContinue
-    if (-not (Get-Printer -Name $printerName -ErrorAction SilentlyContinue)) {
-        Add-Printer -Name $printerName -DriverName $driver -PortName $portName -ErrorAction SilentlyContinue
+
+$registeredPrinters = @()
+foreach ($peer in $peersList) {
+    if (-not $peer.name -or ($peer.name -ieq $Name)) { continue }
+    $sanitizedPeer = Get-SanitizedBridgeName -RawName $peer.name
+    $spoolPort = if ($peer.spool_port -and [int]$peer.spool_port -gt 0) { [int]$peer.spool_port } else { 9101 }
+    $portName = "Bridge - $sanitizedPeer ($spoolPort)"
+    $printerName = "Print on $sanitizedPeer"
+
+    if (-not (Get-PrinterPort -Name $portName -ErrorAction SilentlyContinue)) {
+        Add-PrinterPort -Name $portName -PrinterHostAddress '127.0.0.1' -PortNumber $spoolPort -ErrorAction Stop
     }
-    Write-Host "Virtual Printer '$printerName' registered on port 9101 for Ctrl+P printing." -ForegroundColor Green
+    try {
+        Set-ItemProperty -LiteralPath "HKLM:\SYSTEM\CurrentControlSet\Control\Print\Monitors\Standard TCP/IP Port\Ports\$portName" -Name "SNMP Enabled" -Value 0 -Type DWord -ErrorAction SilentlyContinue
+        $wmiPort = Get-CimInstance Win32_TCPIPPrinterPort -Filter "Name = '$($portName.Replace("'", "''"))'" -ErrorAction SilentlyContinue
+        if ($wmiPort) {
+            Set-CimInstance -InputObject $wmiPort -Property @{ SNMPEnabled = $false } -ErrorAction SilentlyContinue
+        }
+    } catch {}
+
+    if (-not (Get-Printer -Name $printerName -ErrorAction SilentlyContinue)) {
+        Add-Printer -Name $printerName -DriverName $driver -PortName $portName -ErrorAction Stop
+    } else {
+        Set-Printer -Name $printerName -DriverName $driver -PortName $portName -ErrorAction Stop
+    }
+
+    $verified = Get-Printer -Name $printerName -ErrorAction Stop
+    if (-not $verified) {
+        throw "Virtual Printer '$printerName' verification failed after creation."
+    }
+
+    # Clean up legacy Bridge_Port_<spoolPort> once migrated
+    $legacyPort = "Bridge_Port_$spoolPort"
+    if ($legacyPort -ne $portName -and (Get-PrinterPort -Name $legacyPort -ErrorAction SilentlyContinue)) {
+        $inUse = Get-Printer -ErrorAction SilentlyContinue | Where-Object { $_.PortName -eq $legacyPort }
+        if (-not $inUse) {
+            Remove-PrinterPort -Name $legacyPort -ErrorAction SilentlyContinue
+        }
+    }
+
+    try {
+        $pObj = Get-CimInstance Win32_Printer -Filter "Name = '$($printerName.Replace("'", "''"))'" -ErrorAction SilentlyContinue
+        if ($pObj -and $pObj.WorkOffline) {
+            $pObj.WorkOffline = $false
+            Set-CimInstance -InputObject $pObj -ErrorAction SilentlyContinue
+        }
+        Get-PrintJob -PrinterName $printerName -ErrorAction SilentlyContinue | Where-Object { $_.JobStatus -match 'Error|Blocked|Offline|Paused' } | Remove-PrintJob -ErrorAction SilentlyContinue
+    } catch {}
+
+    $registeredPrinters += $printerName
+    Write-Host "Virtual Printer '$printerName' registered on port '$portName' (TCP $spoolPort) for Ctrl+P printing." -ForegroundColor Green
 }
 
 # Remove any virtual printer for THIS device if it was previously created
 $selfPrinterNames = @("Print on $Name", "Print on $env:COMPUTERNAME", "Print on Desktop 1", "Print on Unit 1")
 foreach ($spn in $selfPrinterNames) {
-    if ($spn -ne $printerName) {
+    if ($registeredPrinters -notcontains $spn) {
         Get-Printer -Name $spn -ErrorAction SilentlyContinue | Remove-Printer -ErrorAction SilentlyContinue
     }
 }
 
-# Restore or protect physical default printer
-if ($existingDefault -and -not ($existingDefault -like "Print on *")) {
+# Restore or protect physical default printer using synced virtual printer filter
+$isPhysicalDefault = $false
+if ($existingDefault) {
+    $defObj = Get-CimInstance Win32_Printer -Filter "Name = '$($existingDefault.Replace("'", "''"))'" -ErrorAction SilentlyContinue
+    if ($defObj -and -not (Test-BridgeVirtualPrinter $defObj)) {
+        $isPhysicalDefault = $true
+    }
+}
+if ($isPhysicalDefault) {
     (New-Object -ComObject WScript.Network).SetDefaultPrinter($existingDefault)
 } else {
     $physical = Get-CimInstance Win32_Printer -ErrorAction SilentlyContinue | Where-Object {
-        $_.PortName -notlike 'Bridge_Port_*' -and
-        $_.PortName -ne 'Bridge_TCP_Port' -and
-        $_.PortName -ne 'PORTPROMPT:' -and
-        $_.PortName -ne 'nul:' -and
-        $_.Name -notlike 'Print on *' -and
-        $_.Name -notlike '*PDF*' -and
-        $_.Name -notlike '*XPS*' -and
-        $_.Name -notlike '*AnyDesk*' -and
-        $_.Name -notlike '*Fax*' -and
-        $_.Name -notlike '*OneNote*'
+        -not (Test-BridgeVirtualPrinter $_)
     } | Select-Object -First 1
     if ($physical) {
         (New-Object -ComObject WScript.Network).SetDefaultPrinter($physical.Name)
-    } elseif ($printerName) {
-        (New-Object -ComObject WScript.Network).SetDefaultPrinter($printerName)
+    } elseif ($registeredPrinters.Count -gt 0) {
+        (New-Object -ComObject WScript.Network).SetDefaultPrinter($registeredPrinters[0])
     }
 }
 
@@ -511,22 +690,37 @@ if ($primaryDesktop) {
     $s1.Save()
 }
 
-# Create Windows Explorer "Send To" shortcut
+# Create Windows Explorer "Send To" shortcuts for all paired peers
 $sendToDir = Join-Path $env:APPDATA "Microsoft\Windows\SendTo"
 if (Test-Path $sendToDir) {
-    $sendToShortcut = $wscript.CreateShortcut((Join-Path $sendToDir "Print on $PeerName.lnk"))
-    $sendToShortcut.TargetPath = "C:\BridgeApp\bridge.exe"
-    $sendToShortcut.Arguments = "-send-print -target `"$PeerName`""
-    $sendToShortcut.Description = "Send file to print on $PeerName"
-    $sendToShortcut.Save()
+    foreach ($peer in $peersList) {
+        if (-not $peer.name -or ($peer.name -ieq $Name)) { continue }
+        $sanitizedPeer = Get-SanitizedBridgeName -RawName $peer.name
+        $sendToShortcut = $wscript.CreateShortcut((Join-Path $sendToDir "Print on $sanitizedPeer.lnk"))
+        $sendToShortcut.TargetPath = "C:\BridgeApp\bridge.exe"
+        $sendToShortcut.Arguments = "-send-print -target `"$sanitizedPeer`""
+        $sendToShortcut.Description = "Send file to print on $sanitizedPeer"
+        $sendToShortcut.Save()
+        Write-Host "SendTo right-click shortcut created ('Print on $sanitizedPeer')." -ForegroundColor Green
+    }
 }
 
 Write-Host "Canonical Desktop shortcut created ('Bridge Shared Folder')." -ForegroundColor Green
-Write-Host "Direct Printing ready: Select 'Print on $PeerName' in any print dialog (Ctrl+P)." -ForegroundColor Green
-Write-Host "SendTo right-click shortcut created ('Print on $PeerName')." -ForegroundColor Green
+if ($registeredPrinters.Count -gt 0) {
+    Write-Host "Direct Printing ready: Select any 'Print on <Peer>' in Ctrl+P." -ForegroundColor Green
+}
 
-# Launch bridge.exe in current interactive session with tray icon (Session 1)
-Start-Process "C:\BridgeApp\bridge.exe" -ArgumentList "-autostart"
+# Launch bridge.exe in current interactive session silently (preferring elevated BridgeAppLogon task)
+$launchedViaTask = $false
+if ($logonTaskOk) {
+    try {
+        schtasks /Run /TN "BridgeAppLogon" 2>$null | Out-Null
+        if ($LASTEXITCODE -eq 0) { $launchedViaTask = $true }
+    } catch {}
+}
+if (-not $launchedViaTask) {
+    Start-Process "C:\BridgeApp\bridge.exe" -ArgumentList "-autostart" -WindowStyle Hidden
+}
 
 # 6. Post-Install Verification Report
 Start-Sleep -Seconds 2

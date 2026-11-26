@@ -120,6 +120,16 @@ func InstallVirtualPrinter(peerName string, port int) error {
 	return nil
 }
 
+// IsVirtualPrinterRegistered stub.
+func IsVirtualPrinterRegistered(peerName string) bool {
+	return false
+}
+
+// CheckVirtualPrinters stub.
+func CheckVirtualPrinters(peers []config.PeerDevice) map[string]bool {
+	return make(map[string]bool)
+}
+
 // RemoveVirtualPrinter stub.
 func RemoveVirtualPrinter(peerName string) error {
 	return nil
@@ -137,6 +147,15 @@ func UninstallAllVirtualPrinters() error {
 
 // KillOtherBridgeProcesses stub.
 func KillOtherBridgeProcesses() {}
+
+func startBridgeBackgroundService() error {
+	cmd := exec.Command(TargetExe, "-autostart")
+	return cmd.Start()
+}
+
+func endAndDeleteTask(taskName string) {}
+
+func scheduleSelfDeleteAppDir(appDir string, pid int) {}
 
 // RegisterInteractiveStartup stub.
 func RegisterInteractiveStartup() error {

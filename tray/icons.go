@@ -567,25 +567,39 @@ func EnsureIcons(dir string) (IconPaths, error) {
 	}
 
 	// 1. 🖨️❌ Disconnected: Printer icon with red cross line (0 devices connected)
-	_ = os.WriteFile(paths.PrinterDisconnected, GeneratePrinterIcon(100, 116, 139, true, 0), 0644)
+	if err := os.WriteFile(paths.PrinterDisconnected, GeneratePrinterIcon(100, 116, 139, true, 0), 0644); err != nil {
+		return IconPaths{}, fmt.Errorf("failed to write disconnected icon: %w", err)
+	}
 
 	// 2. 🖨️⚪ Partial: Printer icon in sleek gray, cross removed (1 or more devices connected)
-	_ = os.WriteFile(paths.PrinterGray, GeneratePrinterIcon(148, 163, 184, false, 0), 0644)
+	if err := os.WriteFile(paths.PrinterGray, GeneratePrinterIcon(148, 163, 184, false, 0), 0644); err != nil {
+		return IconPaths{}, fmt.Errorf("failed to write partial icon: %w", err)
+	}
 
 	// 3. 🖨️🟢 All Connected: Printer icon in vibrant emerald green (all devices connected)
-	_ = os.WriteFile(paths.PrinterGreen, GeneratePrinterIcon(34, 197, 94, false, 0), 0644)
+	if err := os.WriteFile(paths.PrinterGreen, GeneratePrinterIcon(34, 197, 94, false, 0), 0644); err != nil {
+		return IconPaths{}, fmt.Errorf("failed to write connected icon: %w", err)
+	}
 
 	// 4. 🖨️🟡 Printing: Printer icon in amber with loading/progress
-	_ = os.WriteFile(paths.PrinterLoading, GeneratePrinterIcon(245, 158, 11, false, 1), 0644)
+	if err := os.WriteFile(paths.PrinterLoading, GeneratePrinterIcon(245, 158, 11, false, 1), 0644); err != nil {
+		return IconPaths{}, fmt.Errorf("failed to write printing icon: %w", err)
+	}
 
 	// 5. 🖨️🔵 Print Complete: Printer icon in electric azure blue
-	_ = os.WriteFile(paths.PrinterBlue, GeneratePrinterIcon(59, 130, 246, false, 0), 0644)
+	if err := os.WriteFile(paths.PrinterBlue, GeneratePrinterIcon(59, 130, 246, false, 0), 0644); err != nil {
+		return IconPaths{}, fmt.Errorf("failed to write print-complete icon: %w", err)
+	}
 
 	// 6. ☁️🟡 Cloud Uploading / Syncing: Cloud icon in amber with upload arrow
-	_ = os.WriteFile(paths.CloudLoading, GenerateCloudIcon(245, 158, 11, 1, false), 0644)
+	if err := os.WriteFile(paths.CloudLoading, GenerateCloudIcon(245, 158, 11, 1, false), 0644); err != nil {
+		return IconPaths{}, fmt.Errorf("failed to write cloud-loading icon: %w", err)
+	}
 
 	// 7. ☁️🔵 Cloud Upload Complete: Cloud icon in electric azure blue with checkmark
-	_ = os.WriteFile(paths.CloudBlue, GenerateCloudIcon(59, 130, 246, -1, true), 0644)
+	if err := os.WriteFile(paths.CloudBlue, GenerateCloudIcon(59, 130, 246, -1, true), 0644); err != nil {
+		return IconPaths{}, fmt.Errorf("failed to write cloud-complete icon: %w", err)
+	}
 
 	// Backward-compatibility dot icons
 	_ = os.WriteFile(paths.Green, paths_or_bytes(paths.PrinterGreen), 0644)
